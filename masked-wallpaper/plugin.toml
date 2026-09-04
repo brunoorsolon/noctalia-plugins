@@ -1,0 +1,116 @@
+id = "magus/masked-wallpaper"
+name = "Masked Wallpaper Backdrop"
+version = "0.1.0"
+plugin_api = 25
+author = "magus"
+license = "MIT"
+dependencies = ["imagemagick"]
+tags = ["wallpaper", "service", "theming"]
+icon = "photo"
+description = "Keeps a blurred, tinted, decorated lockscreen backdrop in sync with the wallpaper."
+
+[[setting]]
+key = "shape"
+type = "file"
+label_key = "settings.shape.label"
+description_key = "settings.shape.description"
+default = ""
+
+[[setting]]
+key = "blur"
+type = "int"
+label_key = "settings.blur.label"
+description_key = "settings.blur.description"
+default = 60
+min = 0
+max = 100
+
+[[setting]]
+key = "tint"
+type = "color"
+label_key = "settings.tint.label"
+description_key = "settings.tint.description"
+default = "on_primary"
+
+[[setting]]
+key = "tint_intensity"
+type = "int"
+label_key = "settings.tint_intensity.label"
+description_key = "settings.tint_intensity.description"
+default = 30
+min = 0
+max = 100
+
+[[setting]]
+key = "decoration_1"
+type = "file"
+label_key = "settings.decoration_1.label"
+description_key = "settings.decoration.description"
+default = ""
+
+[[setting]]
+key = "colorize_1"
+type = "bool"
+label_key = "settings.colorize.label"
+description_key = "settings.colorize.description"
+default = false
+
+[[setting]]
+key = "color_1"
+type = "color"
+label_key = "settings.color.label"
+description_key = "settings.color.description"
+default = "primary"
+
+[[setting]]
+key = "decoration_2"
+type = "file"
+label_key = "settings.decoration_2.label"
+description_key = "settings.decoration.description"
+default = ""
+
+[[setting]]
+key = "colorize_2"
+type = "bool"
+label_key = "settings.colorize.label"
+description_key = "settings.colorize.description"
+default = false
+
+[[setting]]
+key = "color_2"
+type = "color"
+label_key = "settings.color.label"
+description_key = "settings.color.description"
+default = "tertiary"
+
+[[setting]]
+key = "decoration_3"
+type = "file"
+label_key = "settings.decoration_3.label"
+description_key = "settings.decoration.description"
+default = ""
+
+[[setting]]
+key = "colorize_3"
+type = "bool"
+label_key = "settings.colorize.label"
+description_key = "settings.colorize.description"
+default = false
+
+[[setting]]
+key = "color_3"
+type = "color"
+label_key = "settings.color.label"
+description_key = "settings.color.description"
+default = "secondary"
+
+[[setting]]
+key = "dest_dir"
+type = "folder"
+label_key = "settings.dest_dir.label"
+description_key = "settings.dest_dir.description"
+default = ""
+
+[[service]]
+id = "sync"
+entry = "backdrop.luau"
