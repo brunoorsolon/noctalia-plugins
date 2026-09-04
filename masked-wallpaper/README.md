@@ -2,7 +2,7 @@
 
 A Noctalia plugin that keeps a blurred, tinted, decorated lockscreen backdrop in sync with your wallpaper.
 
-The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` does the pixels. The result is one flattened, fully opaque JPEG per output, layered top to bottom as decoration 1, decoration 2, decoration 3, masked blur/tint, original wallpaper. Because it is flattened, nothing has to line up with Noctalia's own wallpaper, and the same shape works on outputs of different resolutions.
+The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` does the pixels. The result is one flattened, fully opaque JPEG per output, layered top to bottom as custom decoration 1, custom decoration 2, custom decoration 3, the preset decoration, masked blur/tint, and the original wallpaper. Because it is flattened, nothing has to line up with Noctalia's own wallpaper, and the same shape works on outputs of different resolutions.
 
 ## Plugin
 
@@ -35,9 +35,9 @@ noctalia msg plugins enable magus/masked-wallpaper
 ## Usage
 
 1. Open **Settings → Plugins → Masked Wallpaper Backdrop**.
-2. Choose **Center glow**, **Left panel**, or **Right panel** under **Mask preset**. Choose **Custom** to reveal a PNG file picker instead.
+2. Choose **Center glow**, **Left panel**, **Right panel**, or **Facet** under **Mask preset**. Each bundled mask includes matching decoration linework. Choose **Custom** to reveal a PNG file picker instead.
 3. Set **Output folder** to an absolute path such as `/home/you/.cache/noctalia/masked-wallpaper`. Generated files use the stable name `masked-wallpaper-<connector>.jpg`. Leaving the setting empty uses the plugin data directory.
-4. Optionally choose up to three transparent decoration PNGs. Decoration 1 is the top layer. Enabling **Recolour** reveals that decoration's colour setting.
+4. Optionally choose up to three transparent custom decoration PNGs. They sit above the preset decoration, with decoration 1 on top, followed by 2 and 3. Enabling **Recolour** reveals that decoration's colour setting.
 5. Complete the palette hooks and lockscreen sticker setup below.
 
 A custom mask uses its alpha channel: opaque pixels get blurred and tinted, while transparent pixels keep the sharp wallpaper. The generator stretches masks and decorations to the output size; align custom assets before selecting them.

@@ -19,6 +19,7 @@ options = [
   { value = "center-glow", label_key = "settings.mask_preset.center_glow" },
   { value = "left-panel", label_key = "settings.mask_preset.left_panel" },
   { value = "right-panel", label_key = "settings.mask_preset.right_panel" },
+  { value = "facet", label_key = "settings.mask_preset.facet" },
   { value = "custom", label_key = "settings.mask_preset.custom" },
 ]
 

@@ -9,6 +9,7 @@ trap 'rm -rf "$work"' EXIT
 
 cat >"$work/magick" <<'FAKE'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"$FAKE_LOG"
 last=${*: -1}
 [[ "$last" == null: ]] && exit 0
 : > "${last#*:}"
@@ -16,11 +17,13 @@ FAKE
 chmod +x "$work/magick"
 : > "$work/wall.png"
 : > "$work/shape.png"
+: > "$work/preset-deco.png"
 : > "$work/deco.png"
 
 run() {
-  PATH="$work:$PATH" ./generate-masked-wallpaper.sh \
+  FAKE_LOG="$work/magick.log" PATH="$work:$PATH" ./generate-masked-wallpaper.sh \
     --wallpaper "$work/wall.png" --shape "$work/shape.png" \
+    --preset-decoration "$work/preset-deco.png" \
     --decoration-1 "$work/deco.png" --decoration-color-1 '#f5f1ed' \
     --width 2560 --height 1440 --connector DP-3 \
     --cache-dir "$work/cache" --dest "$work/out/backdrop.jpg" "$@"
@@ -31,6 +34,9 @@ first=$(run)
 [[ -f "$work/out/backdrop.jpg" ]] || { echo "publish did not reach the dest"; exit 1; }
 grep -qF "image_path = \"$work/out/backdrop.jpg\"" "$work"/cache/*.toml || { echo "snippet points at the cache file, not the dest"; exit 1; }
 grep -qF 'opacity = 1.0' "$work"/cache/*.toml || { echo "snippet lost opacity 1.0"; exit 1; }
+preset_line=$(grep -n 'merged-preset.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
+custom_line=$(grep -n 'merged-0.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
+((preset_line < custom_line)) || { echo "preset decoration must be below custom decorations"; exit 1; }
 
 second=$(run)
 [[ "$second" == cache\ hit:* ]] || { echo "expected a cache hit, got: $second"; exit 1; }

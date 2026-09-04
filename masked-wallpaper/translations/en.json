@@ -1,9 +1,10 @@
 {
   "settings.mask_preset.label": "Mask preset",
-  "settings.mask_preset.description": "Choose which area of the wallpaper gets blurred and tinted.",
+  "settings.mask_preset.description": "Choose which area gets blurred and tinted. Each preset includes matching decoration linework.",
   "settings.mask_preset.center_glow": "Center glow",
   "settings.mask_preset.left_panel": "Left panel",
   "settings.mask_preset.right_panel": "Right panel",
+  "settings.mask_preset.facet": "Facet",
   "settings.mask_preset.custom": "Custom",
   "settings.shape.label": "Custom mask",
   "settings.shape.description": "Transparent PNG. Opaque pixels get blurred and tinted; transparent pixels keep the sharp wallpaper.",
