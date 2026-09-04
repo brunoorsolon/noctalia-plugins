@@ -1,0 +1,20 @@
+{
+  "settings.shape.label": "Shape mask",
+  "settings.shape.description": "Transparent PNG. Opaque pixels get blurred and tinted; transparent pixels keep the sharp wallpaper.",
+  "settings.blur.label": "Blur",
+  "settings.blur.description": "Blur strength inside the shape, 0-100. 100 is a 40px radius.",
+  "settings.tint.label": "Tint colour",
+  "settings.tint.description": "Colour mixed into the blurred area.",
+  "settings.tint_intensity.label": "Tint strength",
+  "settings.tint_intensity.description": "How much of the tint colour to mix in, 0-100.",
+  "settings.decoration_1.label": "Decoration 1 (top)",
+  "settings.decoration_2.label": "Decoration 2",
+  "settings.decoration_3.label": "Decoration 3 (bottom)",
+  "settings.decoration.description": "Optional transparent PNG composited above the blur. Leave empty to skip this layer.",
+  "settings.colorize.label": "Recolour",
+  "settings.colorize.description": "Replace this layer's colours with the colour below, keeping its transparency. Leave off for pre-coloured artwork.",
+  "settings.color.label": "Colour",
+  "settings.color.description": "Applied only when Recolour is on.",
+  "settings.dest_dir.label": "Output folder",
+  "settings.dest_dir.description": "Where the finished images are published. Empty uses the plugin's own data folder."
+}
