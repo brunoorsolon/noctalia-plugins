@@ -1,6 +1,6 @@
 id = "magus/masked-wallpaper"
 name = "Masked Wallpaper Backdrop"
-version = "0.1.0"
+version = "0.2.0"
 plugin_api = 25
 author = "magus"
 license = "MIT"
@@ -10,11 +10,27 @@ icon = "photo"
 description = "Keeps a blurred, tinted, decorated lockscreen backdrop in sync with the wallpaper."
 
 [[setting]]
+key = "mask_preset"
+type = "select"
+label_key = "settings.mask_preset.label"
+description_key = "settings.mask_preset.description"
+default = "center-glow"
+options = [
+  { value = "center-glow", label_key = "settings.mask_preset.center_glow" },
+  { value = "left-panel", label_key = "settings.mask_preset.left_panel" },
+  { value = "right-panel", label_key = "settings.mask_preset.right_panel" },
+  { value = "facet", label_key = "settings.mask_preset.facet" },
+  { value = "custom", label_key = "settings.mask_preset.custom" },
+]
+
+[[setting]]
 key = "shape"
 type = "file"
 label_key = "settings.shape.label"
 description_key = "settings.shape.description"
 default = ""
+extensions = [".png"]
+visible_when = { key = "mask_preset", values = ["custom"] }
 
 [[setting]]
 key = "blur"
@@ -61,6 +77,7 @@ type = "color"
 label_key = "settings.color.label"
 description_key = "settings.color.description"
 default = "primary"
+visible_when = { key = "colorize_1", values = ["true"] }
 
 [[setting]]
 key = "decoration_2"
@@ -82,6 +99,7 @@ type = "color"
 label_key = "settings.color.label"
 description_key = "settings.color.description"
 default = "tertiary"
+visible_when = { key = "colorize_2", values = ["true"] }
 
 [[setting]]
 key = "decoration_3"
@@ -103,6 +121,7 @@ type = "color"
 label_key = "settings.color.label"
 description_key = "settings.color.description"
 default = "secondary"
+visible_when = { key = "colorize_3", values = ["true"] }
 
 [[setting]]
 key = "dest_dir"

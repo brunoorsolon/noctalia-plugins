@@ -2,7 +2,7 @@
 
 A Noctalia plugin that keeps a blurred, tinted, decorated lockscreen backdrop in sync with your wallpaper.
 
-The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` does the pixels. The result is one flattened, fully opaque JPEG per output, layered top to bottom as decoration 1, decoration 2, decoration 3, masked blur/tint, original wallpaper. Because it is flattened, nothing has to line up with Noctalia's own wallpaper, and the same shape works on outputs of different resolutions.
+The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` does the pixels. The result is one flattened, fully opaque JPEG per output, layered top to bottom as decoration 1, decoration 2, decoration 3, masked blur/tint, and the original wallpaper. Because it is flattened, nothing has to line up with Noctalia's own wallpaper, and the same shape works on outputs of different resolutions.
 
 ## Plugin
 
@@ -13,25 +13,34 @@ The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` doe
 
 ## Requirements
 
-Install `imagemagick`.
+Install `imagemagick`. The plugin accepts either its `magick` or `convert` command.
+
+## Installation
+
+Open **Settings → Plugins**, select **Add source**, and add this Git source:
+
+| Field | Value |
+| --- | --- |
+| Name | `magus` |
+| Kind | Git |
+| Location | `https://github.com/brunoorsolon/noctalia-plugins.git` |
+
+Enable **Masked Wallpaper Backdrop** after it appears. The equivalent commands are:
+
+```sh
+noctalia msg plugins source add magus git https://github.com/brunoorsolon/noctalia-plugins.git
+noctalia msg plugins enable magus/masked-wallpaper
+```
 
 ## Usage
 
-The folder must be named `masked-wallpaper`, matching the part of the plugin id after the slash. Noctalia will not find it under any other name.
+1. Open **Settings → Plugins → Masked Wallpaper Backdrop**.
+2. Choose **Center glow**, **Left panel**, **Right panel**, or **Facet** under **Mask preset**. Each bundled mask includes three matching decoration layers. Choose **Custom** to reveal a PNG file picker instead.
+3. Set **Output folder** to an absolute path such as `/home/you/.cache/noctalia/masked-wallpaper`. Generated files use the stable name `masked-wallpaper-<connector>.jpg`. Leaving the setting empty uses the plugin data directory.
+4. The preset supplies decorations 1, 2, and 3 by default. A custom decoration path replaces the matching preset layer. Layer 1 is on top, followed by 2 and 3. Enable **Recolour** on any layer to reveal its independent colour setting.
+5. Complete the palette hooks and lockscreen sticker setup below.
 
-    mkdir -p ~/.local/share/noctalia/plugins
-    cp -r masked-wallpaper ~/.local/share/noctalia/plugins/
-    noctalia msg plugins enable magus/masked-wallpaper
-
-Or add the containing directory as a local source under Settings → Plugins and toggle it on.
-
-## Configure
-
-Settings → Plugins → Masked Wallpaper Backdrop. Set **Output folder** to an absolute path you will retype a few times below, for example `/home/you/.cache/noctalia/masked-wallpaper`. Generated files land there as `masked-wallpaper-<connector>.jpg`. Leaving it empty uses the plugin's own data folder, which works but is harder to point anything at.
-
-Then pick a **Shape mask**: a transparent PNG where opaque pixels get blurred and tinted and transparent pixels keep the sharp wallpaper. Decoration slots 1–3 are optional transparent PNGs composited above the blur, 1 on top. **Recolour** replaces a layer's colours with the colour below while keeping its transparency — leave it off for artwork that is already coloured.
-
-Aligning the shape and the decorations is your job. The generator composites them as given and does not check.
+A custom mask uses its alpha channel: opaque pixels get blurred and tinted, while transparent pixels keep the sharp wallpaper. The generator stretches masks and decorations to the output size; align custom assets before selecting them.
 
 ## Wire up the hooks and the palette
 
@@ -44,10 +53,10 @@ In your own config at `~/.config/noctalia/config.toml` — the hand-edited layer
     colors_changed = "noctalia msg plugin magus/masked-wallpaper:sync all regenerate"
 
     [theme.templates.user.masked_wallpaper]
-    input_path = "$XDG_DATA_HOME/noctalia/plugins/masked-wallpaper/masked-wallpaper-colors.env"
+    input_path = "/home/you/.local/state/noctalia/plugins/materialized/magus/masked-wallpaper/masked-wallpaper-colors.env"
     output_path = "/home/you/.cache/noctalia/masked-wallpaper/palette.env"
 
-If the template never renders, check whether `[theme.templates]` in your state `settings.toml` is shadowing it, and move the block there instead.
+Replace `/home/you` with your home directory. If you chose a source name other than `magus`, replace that path segment too. If the template never renders, check whether `[theme.templates]` in your state `settings.toml` is shadowing it, and move the block there instead.
 
 `output_path` must be your **Output folder** with `/palette.env` on the end; that is where the plugin and the script both look. Both hooks are wanted: `colors_changed` fires after the palette is resolved, and `wallpaper_changed` covers a wallpaper swap that leaves the palette alone. Firing both is harmless — the second one finds nothing changed and does nothing.
 
@@ -90,10 +99,11 @@ No desktop-snapshot backdrop and no animated wallpapers, since the wallpaper is 
 
 ## Updating the plugin
 
-Enabling exports the plugin into `~/.local/state/noctalia/plugins/materialized/`, and the service runs from that copy — `noctalia.pluginDir()` is the runtime copy, not your source folder. The manifest is re-read from the source folder, so `plugin.toml` edits appear at once, but an edited `.luau` or shell script keeps running the exported version. After changing either, force a re-export:
+Noctalia updates enabled Git sources automatically by default. To update immediately:
 
-    noctalia msg plugins disable magus/masked-wallpaper
-    noctalia msg plugins enable magus/masked-wallpaper
+```sh
+noctalia msg plugins update magus
+```
 
 ## Checks
 

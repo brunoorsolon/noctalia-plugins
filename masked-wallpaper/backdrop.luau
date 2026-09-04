@@ -15,6 +15,26 @@ local function destDir()
   return dir
 end
 
+local presets = {
+  ["center-glow"] = { mask = "masks/center-glow.png", decorations = "decorations/center-glow" },
+  ["left-panel"] = { mask = "masks/left-panel.png", decorations = "decorations/left-panel" },
+  ["right-panel"] = { mask = "masks/right-panel.png", decorations = "decorations/right-panel" },
+  ["facet"] = { mask = "masks/facet.png", decorations = "decorations/facet" },
+}
+
+local function presetAssets()
+  local name = str("mask_preset")
+  if name == "custom" then return str("shape"), {} end
+  local pluginDir = noctalia.pluginDir()
+  if not pluginDir then return "", {} end
+  local preset = presets[name] or presets["center-glow"]
+  local decorations = {}
+  for slot = 1, 3 do
+    decorations[slot] = pluginDir .. "/" .. preset.decorations .. "/" .. slot .. ".png"
+  end
+  return pluginDir .. "/" .. preset.mask, decorations
+end
+
 -- Noctalia rewrites this on every theme change, from the template in this plugin.
 local function paletteFile()
   return destDir() .. "/palette.env"
@@ -34,11 +54,11 @@ local function pixels(logical, scale)
   return tostring(math.floor(logical * scale + 0.5))
 end
 
-local function argvFor(output, wallpaper, dest)
+local function argvFor(output, wallpaper, shape, presetDecorations, dest)
   local argv = {
     "bash", noctalia.pluginDir() .. "/generate-masked-wallpaper.sh",
     "--wallpaper", wallpaper,
-    "--shape", str("shape"),
+    "--shape", shape,
     "--connector", output.name,
     "--width", pixels(output.width, output.scale),
     "--height", pixels(output.height, output.scale),
@@ -51,6 +71,7 @@ local function argvFor(output, wallpaper, dest)
   }
   for slot = 1, 3 do
     local image = str("decoration_" .. slot)
+    if image == "" then image = presetDecorations[slot] or "" end
     if image ~= "" then
       table.insert(argv, "--decoration-" .. slot)
       table.insert(argv, image)
@@ -64,7 +85,8 @@ local function argvFor(output, wallpaper, dest)
 end
 
 local function sync()
-  if str("shape") == "" then return end
+  local shape, presetDecorations = presetAssets()
+  if shape == "" then return end
   -- Colours may be palette role names, so the palette's contents belong in the key:
   -- without it a colors_changed event would look like no change at all.
   local palette = noctalia.readFile(paletteFile()) or ""
@@ -72,7 +94,7 @@ local function sync()
     local wallpaper = noctalia.wallpaperPath(output.name)
     if wallpaper then
       local dest = destDir() .. "/masked-wallpaper-" .. output.name .. ".jpg"
-      local argv = argvFor(output, wallpaper, dest)
+      local argv = argvFor(output, wallpaper, shape, presetDecorations, dest)
       local key = table.concat(argv, "\31") .. "\31" .. palette
       local stateKey = "key:" .. output.name
       if noctalia.state[stateKey] ~= key or not noctalia.fileExists(dest) then

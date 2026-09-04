@@ -3,8 +3,8 @@
 [[plugin]]
 id = "magus/masked-wallpaper"
 name = "Masked Wallpaper Backdrop"
-version = "0.1.0"
-updated_at = 1788545383
+version = "0.2.0"
+updated_at = 1788558524
 added_at = 1788545383
 author = "magus"
 license = "MIT"
@@ -13,3 +13,4 @@ description = "Keeps a blurred, tinted, decorated lockscreen backdrop in sync wi
 deprecated = false
 plugin_api = 25
 tags = ["wallpaper", "service", "theming"]
+dependencies = ["imagemagick"]
