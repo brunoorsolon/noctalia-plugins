@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Smoke test for generate-masked-wallpaper.sh with a fake ImageMagick, so it runs
-# anywhere: checks argument handling, cache reuse, atomic publish and the snippet.
+# anywhere: checks argument handling, layer order, cache reuse, atomic publish and the snippet.
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 
@@ -17,14 +17,16 @@ FAKE
 chmod +x "$work/magick"
 : > "$work/wall.png"
 : > "$work/shape.png"
-: > "$work/preset-deco.png"
-: > "$work/deco.png"
+: > "$work/deco-1.png"
+: > "$work/deco-2.png"
+: > "$work/deco-3.png"
 
 run() {
   FAKE_LOG="$work/magick.log" PATH="$work:$PATH" ./generate-masked-wallpaper.sh \
     --wallpaper "$work/wall.png" --shape "$work/shape.png" \
-    --preset-decoration "$work/preset-deco.png" \
-    --decoration-1 "$work/deco.png" --decoration-color-1 '#f5f1ed' \
+    --decoration-1 "$work/deco-1.png" --decoration-color-1 '#f5f1ed' \
+    --decoration-2 "$work/deco-2.png" \
+    --decoration-3 "$work/deco-3.png" \
     --width 2560 --height 1440 --connector DP-3 \
     --cache-dir "$work/cache" --dest "$work/out/backdrop.jpg" "$@"
 }
@@ -34,9 +36,10 @@ first=$(run)
 [[ -f "$work/out/backdrop.jpg" ]] || { echo "publish did not reach the dest"; exit 1; }
 grep -qF "image_path = \"$work/out/backdrop.jpg\"" "$work"/cache/*.toml || { echo "snippet points at the cache file, not the dest"; exit 1; }
 grep -qF 'opacity = 1.0' "$work"/cache/*.toml || { echo "snippet lost opacity 1.0"; exit 1; }
-preset_line=$(grep -n 'merged-preset.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
-custom_line=$(grep -n 'merged-0.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
-((preset_line < custom_line)) || { echo "preset decoration must be below custom decorations"; exit 1; }
+bottom_line=$(grep -n 'merged-2.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
+middle_line=$(grep -n 'merged-1.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
+top_line=$(grep -n 'merged-0.miff' "$work/magick.log" | head -n 1 | cut -d: -f1)
+((bottom_line < middle_line && middle_line < top_line)) || { echo "decorations must be applied 3, 2, 1 so 1 stays on top"; exit 1; }
 
 second=$(run)
 [[ "$second" == cache\ hit:* ]] || { echo "expected a cache hit, got: $second"; exit 1; }

@@ -10,7 +10,6 @@ Usage:
   generate-masked-wallpaper.sh --wallpaper FILE --shape PNG [options]
 
 Options:
-  --preset-decoration PNG Bundled decoration below every custom layer
   --decoration-1 PNG      Optional topmost transparent decoration layer
   --decoration-2 PNG      Optional middle transparent decoration layer
   --decoration-3 PNG      Optional bottom transparent decoration layer
@@ -38,7 +37,6 @@ unit_float() { awk -v n="$1" 'BEGIN { exit !(n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+
 
 wallpaper=
 shape=
-preset_decoration=
 decorations=("" "" "")
 decoration_colors=("" "" "")
 width=2560
@@ -57,7 +55,6 @@ while (($#)); do
   case "$1" in
     --wallpaper) wallpaper=${2:?missing wallpaper path}; shift 2 ;;
     --shape) shape=${2:?missing shape path}; shift 2 ;;
-    --preset-decoration) preset_decoration=${2:?missing preset decoration path}; shift 2 ;;
     --decorations|--decoration-1) decorations[0]=${2:?missing decoration path}; shift 2 ;;
     --decoration-2) decorations[1]=${2:?missing decoration path}; shift 2 ;;
     --decoration-3) decorations[2]=${2:?missing decoration path}; shift 2 ;;
@@ -89,7 +86,6 @@ note "run: ${invocation[*]}"
 
 [[ -f "$wallpaper" ]] || die "wallpaper not found: $wallpaper"
 [[ -f "$shape" ]] || die "shape not found: $shape"
-[[ -z "$preset_decoration" || -f "$preset_decoration" ]] || die "preset decoration not found: $preset_decoration"
 for i in 0 1 2; do
   [[ -z "${decorations[$i]}" || -f "${decorations[$i]}" ]] || die "decoration $((i + 1)) not found: ${decorations[$i]}"
   [[ -z "${decoration_colors[$i]}" || -n "${decorations[$i]}" ]] || die "decoration color $((i + 1)) requires decoration $((i + 1))"
@@ -134,9 +130,7 @@ command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required'
 
 wall_hash=$(sha256sum -- "$wallpaper" | awk '{print $1}')
 shape_hash=$(sha256sum -- "$shape" | awk '{print $1}')
-preset_decoration_hash=none
-[[ -z "$preset_decoration" ]] || preset_decoration_hash=$(sha256sum -- "$preset_decoration" | awk '{print $1}')
-decorations_fingerprint="preset:$preset_decoration_hash|"
+decorations_fingerprint=
 for i in 0 1 2; do
   decoration_hash=none
   [[ -z "${decorations[$i]}" ]] || decoration_hash=$(sha256sum -- "${decorations[$i]}" | awk '{print $1}')
@@ -219,15 +213,7 @@ fi
 "${im[@]}" "$base" "$masked" -compose over -composite "MIFF:$flattened"
 
 current=$flattened
-# The preset decoration sits above the mask but below every custom decoration.
-if [[ -n "$preset_decoration" ]]; then
-  preset_layer="$tmpdir/preset-decoration.miff"
-  preset_merged="$tmpdir/merged-preset.miff"
-  "${im[@]}" "$preset_decoration" -resize "${width}x${height}!" "MIFF:$preset_layer"
-  "${im[@]}" "$current" "$preset_layer" -compose over -composite "MIFF:$preset_merged"
-  current=$preset_merged
-fi
-# Composite custom layers bottom-to-top so decoration 1 remains topmost.
+# Composite bottom-to-top so decoration 1 is the topmost layer.
 for i in 2 1 0; do
   decoration=${decorations[$i]}
   [[ -n "$decoration" ]] || continue
