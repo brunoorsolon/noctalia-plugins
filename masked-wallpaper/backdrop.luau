@@ -15,6 +15,20 @@ local function destDir()
   return dir
 end
 
+local masks = {
+  ["center-glow"] = "masks/center-glow.png",
+  ["left-panel"] = "masks/left-panel.png",
+  ["right-panel"] = "masks/right-panel.png",
+}
+
+local function maskPath()
+  local preset = str("mask_preset")
+  if preset == "custom" then return str("custom_mask") end
+  local pluginDir = noctalia.pluginDir()
+  if not pluginDir then return "" end
+  return pluginDir .. "/" .. (masks[preset] or masks["center-glow"])
+end
+
 -- Noctalia rewrites this on every theme change, from the template in this plugin.
 local function paletteFile()
   return destDir() .. "/palette.env"
@@ -34,11 +48,11 @@ local function pixels(logical, scale)
   return tostring(math.floor(logical * scale + 0.5))
 end
 
-local function argvFor(output, wallpaper, dest)
+local function argvFor(output, wallpaper, shape, dest)
   local argv = {
     "bash", noctalia.pluginDir() .. "/generate-masked-wallpaper.sh",
     "--wallpaper", wallpaper,
-    "--shape", str("shape"),
+    "--shape", shape,
     "--connector", output.name,
     "--width", pixels(output.width, output.scale),
     "--height", pixels(output.height, output.scale),
@@ -64,7 +78,8 @@ local function argvFor(output, wallpaper, dest)
 end
 
 local function sync()
-  if str("shape") == "" then return end
+  local shape = maskPath()
+  if shape == "" then return end
   -- Colours may be palette role names, so the palette's contents belong in the key:
   -- without it a colors_changed event would look like no change at all.
   local palette = noctalia.readFile(paletteFile()) or ""
@@ -72,7 +87,7 @@ local function sync()
     local wallpaper = noctalia.wallpaperPath(output.name)
     if wallpaper then
       local dest = destDir() .. "/masked-wallpaper-" .. output.name .. ".jpg"
-      local argv = argvFor(output, wallpaper, dest)
+      local argv = argvFor(output, wallpaper, shape, dest)
       local key = table.concat(argv, "\31") .. "\31" .. palette
       local stateKey = "key:" .. output.name
       if noctalia.state[stateKey] ~= key or not noctalia.fileExists(dest) then
