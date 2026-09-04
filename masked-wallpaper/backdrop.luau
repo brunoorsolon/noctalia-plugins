@@ -23,7 +23,7 @@ local masks = {
 
 local function maskPath()
   local preset = str("mask_preset")
-  if preset == "custom" then return str("custom_mask") end
+  if preset == "custom" then return str("shape") end
   local pluginDir = noctalia.pluginDir()
   if not pluginDir then return "" end
   return pluginDir .. "/" .. (masks[preset] or masks["center-glow"])

@@ -23,10 +23,10 @@ options = [
 ]
 
 [[setting]]
-key = "custom_mask"
+key = "shape"
 type = "file"
-label_key = "settings.custom_mask.label"
-description_key = "settings.custom_mask.description"
+label_key = "settings.shape.label"
+description_key = "settings.shape.description"
 default = ""
 extensions = [".png"]
 visible_when = { key = "mask_preset", values = ["custom"] }
