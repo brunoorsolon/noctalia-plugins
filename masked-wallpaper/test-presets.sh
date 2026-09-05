@@ -30,6 +30,9 @@ done
 if command -v magick >/dev/null 2>&1; then
   im=(magick); identify_image=(magick identify); compare_image=(magick compare); montage_image=(magick montage)
 elif command -v convert >/dev/null 2>&1; then
+  for command in identify compare montage; do
+    command -v "$command" >/dev/null 2>&1 || { echo "error: ImageMagick $command is required" >&2; exit 1; }
+  done
   im=(convert); identify_image=(identify); compare_image=(compare); montage_image=(montage)
 else
   echo 'error: ImageMagick is required (magick or convert)' >&2; exit 1
@@ -86,24 +89,20 @@ while IFS=$'\t' read -r preset mask decorations mode transforms; do
 done < presets.tsv
 
 ((${#presets[@]} == 20)) || { echo "error: presets.tsv contains ${#presets[@]} presets, expected 20" >&2; exit 1; }
-if command -v "${compare_image[0]}" >/dev/null 2>&1; then
-  for pair in 'masks/left-panel.png masks/right-panel.png' 'masks/right-zoom-cut.png masks/left-zoom-cut.png' 'transforms/left-panel-refraction.png transforms/right-panel-refraction.png' 'transforms/right-zoom-cut-glint.png transforms/left-zoom-cut-glint.png'; do
+for pair in 'masks/left-panel.png masks/right-panel.png' 'masks/right-zoom-cut.png masks/left-zoom-cut.png' 'transforms/left-panel-refraction.png transforms/right-panel-refraction.png' 'transforms/right-zoom-cut-glint.png transforms/left-zoom-cut-glint.png'; do
+  read -r source target <<<"$pair"
+  "${im[@]}" "$source" -flop "$work/mirror.png"
+  [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "$target" null: 2>&1)" == 0 ]] || { echo "error: $source and $target are not exact mirrors" >&2; exit 1; }
+done
+for slot in 1 2 3; do
+  for pair in 'left-panel right-panel' 'right-zoom-cut left-zoom-cut'; do
     read -r source target <<<"$pair"
-    "${im[@]}" "$source" -flop "$work/mirror.png"
-    [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "$target" null: 2>&1)" == 0 ]] || { echo "error: $source and $target are not exact mirrors" >&2; exit 1; }
+    "${im[@]}" "decorations/$source/$slot.png" -flop "$work/mirror.png"
+    [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "decorations/$target/$slot.png" null: 2>&1)" == 0 ]] || { echo "error: decoration $slot for $source and $target is not mirrored" >&2; exit 1; }
   done
-  for slot in 1 2 3; do
-    for pair in 'left-panel right-panel' 'right-zoom-cut left-zoom-cut'; do
-      read -r source target <<<"$pair"
-      "${im[@]}" "decorations/$source/$slot.png" -flop "$work/mirror.png"
-      [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "decorations/$target/$slot.png" null: 2>&1)" == 0 ]] || { echo "error: decoration $slot for $source and $target is not mirrored" >&2; exit 1; }
-    done
-  done
-fi
+done
 rm -f -- "$output_dir/contact-sheet.jpg"
-if command -v "${montage_image[0]}" >/dev/null 2>&1; then
-  images=(); for preset in "${presets[@]}"; do images+=("$output_dir/$preset.jpg"); done
-  "${montage_image[@]}" "${images[@]}" -thumbnail 320x180 -tile 4x5 -geometry +6+24 -background '#10131a' -fill white -set label '%t' "$output_dir/contact-sheet.jpg"
-  [[ -s "$output_dir/contact-sheet.jpg" ]] || { echo 'error: contact sheet was not created' >&2; exit 1; }
-fi
+images=(); for preset in "${presets[@]}"; do images+=("$output_dir/$preset.jpg"); done
+"${montage_image[@]}" "${images[@]}" -thumbnail 320x180 -tile 4x5 -geometry +6+24 -background '#10131a' -fill white -set label '%t' "$output_dir/contact-sheet.jpg"
+[[ -s "$output_dir/contact-sheet.jpg" ]] || { echo 'error: contact sheet was not created' >&2; exit 1; }
 printf 'Rendered 20 presets to %s\n' "$output_dir"
