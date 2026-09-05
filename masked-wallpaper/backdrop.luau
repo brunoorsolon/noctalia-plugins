@@ -29,9 +29,9 @@ end
 
 local function presetAssets()
   local name = str("mask_preset")
-  if name == "custom" then return str("shape"), {}, "stretch", "-", "", "custom" end
   local pluginDir = noctalia.pluginDir()
   if not pluginDir then return "", {}, "stretch", "-", "", "" end
+  if name == "custom" then return str("shape"), {}, "stretch", "-", pluginDir, "custom" end
   local presets = loadPresets(pluginDir)
   local preset = presets[name]
   if not preset then name, preset = "facet", presets.facet end
