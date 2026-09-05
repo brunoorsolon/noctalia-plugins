@@ -170,7 +170,7 @@ for i in 0 1 2; do
   [[ -z "${decorations[$i]}" ]] || decoration_hash=$(sha256sum -- "${decorations[$i]}" | awk '{print $1}')
   decorations_fingerprint+="$decoration_hash:${decoration_colors[$i]}|"
 done
-key=$(printf '%s\n' "$wall_hash" "$shape_hash" "$decorations_fingerprint" "$preset" "$asset_mode" "$transforms_fingerprint" "$width" "$height" "$connector" "$blur" "$tint" "$tint_intensity" 'flattened-jpeg-v6' | sha256sum | cut -c1-16)
+key=$(printf '%s\n' "$wall_hash" "$shape_hash" "$decorations_fingerprint" "$preset" "$asset_mode" "$transforms_fingerprint" "$width" "$height" "$connector" "$blur" "$tint" "$tint_intensity" 'flattened-jpeg-v7' | sha256sum | cut -c1-16)
 safe_connector=${connector//[^A-Za-z0-9_.-]/_}
 stem="masked-wallpaper-${safe_connector}-${width}x${height}-${key}"
 output="$cache_dir/$stem.jpg"
@@ -268,9 +268,13 @@ for index in "${!transform_specs[@]}"; do
   brightness_percent=$(awk -v n="$brightness" 'BEGIN { printf "%.3f", n*100 }')
   saturation_percent=$(awk -v n="$saturation" 'BEGIN { printf "%.3f", n*100 }')
   transformed="$tmpdir/transformed-$index.miff"
-  transform_args=()
-  [[ "$flip" == false ]] || transform_args=(-flop)
-  "${im[@]}" "$base" "${transform_args[@]}" -virtual-pixel edge -set option:distort:viewport "${width}x${height}+0+0" -distort SRT "$cx,$cy $scale 0 $tx,$ty" +repage -modulate "$brightness_percent,$saturation_percent,100" "$transformed"
+  if [[ "$flip" == false ]] && awk -v s="$scale" -v x="$offset_x" -v y="$offset_y" 'BEGIN { exit !(s == 1 && x == 0 && y == 0) }'; then
+    "${im[@]}" "$base" -modulate "$brightness_percent,$saturation_percent,100" "$transformed"
+  else
+    transform_args=()
+    [[ "$flip" == false ]] || transform_args=(-flop)
+    "${im[@]}" "$base" "${transform_args[@]}" -virtual-pixel edge -set option:distort:viewport "${width}x${height}+0+0" -distort SRT "$cx,$cy $scale 0 $tx,$ty" +repage -modulate "$brightness_percent,$saturation_percent,100" "$transformed"
+  fi
   transformed_masked="$tmpdir/transformed-masked-$index.miff"
   merged="$tmpdir/transformed-merged-$index.miff"
   "${im[@]}" "$transformed" "$layer_mask" -alpha off -compose CopyOpacity -composite "$transformed_masked"

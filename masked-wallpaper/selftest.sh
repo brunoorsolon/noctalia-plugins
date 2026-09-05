@@ -64,6 +64,11 @@ printf x >>"$work/transform.png"
 [[ "$(transform_run)" == generated:* ]] || { echo "changing a transform mask must miss the cache"; exit 1; }
 [[ "$(run --asset-root "$work" --transforms 'window,1.2,0,0,false,1,1')" == generated:* ]] || { echo "changing transform metadata must miss the cache"; exit 1; }
 
+: >"$work/magick.log"
+[[ "$(run --preset aligned-panel --asset-root "$work" --transforms 'transform.png,1,0,0,false,1.12,1.4')" == generated:* ]] || { echo "an aligned transform should generate"; exit 1; }
+grep -qF -- '-modulate 112.000,140.000,100' "$work/magick.log" || { echo "an aligned transform must retain color treatment"; exit 1; }
+! grep -qF -- '-distort SRT' "$work/magick.log" || { echo "an aligned transform must not resample the wallpaper"; exit 1; }
+
 before=$(sha256sum "$work/out/backdrop.jpg")
 if run --width nope >/dev/null 2>&1; then echo "invalid arguments must fail"; exit 1; fi
 [[ "$(sha256sum "$work/out/backdrop.jpg")" == "$before" ]] || { echo "a failed run must preserve the published image"; exit 1; }
