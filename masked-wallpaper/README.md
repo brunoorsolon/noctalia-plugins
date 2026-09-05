@@ -35,12 +35,16 @@ noctalia msg plugins enable magus/masked-wallpaper
 ## Usage
 
 1. Open **Settings → Plugins → Masked Wallpaper Backdrop**.
-2. Choose **Center glow**, **Left panel**, **Right panel**, or **Facet** under **Mask preset**. Each bundled mask includes three matching decoration layers. Choose **Custom** to reveal a PNG file picker instead.
+2. Choose one of the 20 bundled presets under **Mask preset**. Each includes a sharp wallpaper window, any required optical transformation, and three matching decoration layers. Choose **Custom** to reveal a PNG file picker instead.
 3. Set **Output folder** to an absolute path such as `/home/you/.cache/noctalia/masked-wallpaper`. Generated files use the stable name `masked-wallpaper-<connector>.jpg`. Leaving the setting empty uses the plugin data directory.
 4. The preset supplies decorations 1, 2, and 3 by default. A custom decoration path replaces the matching preset layer. Layer 1 is on top, followed by 2 and 3. Enable **Recolour** on any layer to reveal its independent colour setting.
 5. Complete the palette hooks and lockscreen sticker setup below.
 
-A custom mask uses its alpha channel: opaque pixels get blurred and tinted, while transparent pixels keep the sharp wallpaper. The generator stretches masks and decorations to the output size; align custom assets before selecting them.
+A custom mask uses its alpha channel: opaque pixels get blurred and tinted, while transparent pixels keep the sharp wallpaper. The generator stretches custom masks and decorations to the output size; align custom assets before selecting them.
+
+## Bundled presets
+
+Facet Window, Facet Aperture, Left Rail, Right Rail, Refracted Ribbon, Shard Gate, Right Zoom Cut, Left Zoom Cut, Panorama Stack, Vertical Slice, Horizontal Slice, Mirror Slash, Signal Tear, Halo Lens, Soft Arch, Tidal Veil, Liquid Lens, Arc Sweep, Soft Cascade, and Canopy Curve are included. Facet Window is the default and fallback for unknown old setting values.
 
 ## Wire up the hooks and the palette
 
@@ -107,6 +111,16 @@ noctalia msg plugins update magus
 
 ## Checks
 
+Run the fast behavior check from this directory:
+
     ./selftest.sh
 
-Runs the generator against a fake ImageMagick to check argument handling, cache reuse, palette resolution and the atomic publish. Works without ImageMagick installed.
+It uses fake ImageMagick to check argument handling, cache reuse, palette resolution, transform invalidation, layer order, and atomic publishing.
+
+Render all 20 presets through the production generator with a deterministic synthetic wallpaper:
+
+    ./test-presets.sh
+
+The command writes 20 named JPEGs and `contact-sheet.jpg` to `/tmp/masked-wallpaper-presets` at 1280×720. Supply a real wallpaper, output directory, or portrait size when needed:
+
+    ./test-presets.sh --wallpaper /path/to/wallpaper.jpg --output-dir /tmp/presets-portrait --width 1080 --height 1920

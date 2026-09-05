@@ -15,24 +15,32 @@ local function destDir()
   return dir
 end
 
-local presets = {
-  ["center-glow"] = { mask = "masks/center-glow.png", decorations = "decorations/center-glow" },
-  ["left-panel"] = { mask = "masks/left-panel.png", decorations = "decorations/left-panel" },
-  ["right-panel"] = { mask = "masks/right-panel.png", decorations = "decorations/right-panel" },
-  ["facet"] = { mask = "masks/facet.png", decorations = "decorations/facet" },
-}
+local function loadPresets(pluginDir)
+  local presets = {}
+  local contents = noctalia.readFile(pluginDir .. "/presets.tsv") or ""
+  for line in contents:gmatch("[^\n]+") do
+    local name, mask, decorations, mode, transforms = line:match("^([^#\t][^\t]*)\t([^\t]+)\t([^\t]+)\t([^\t]+)\t([^\t]+)$")
+    if name then
+      presets[name] = { mask = mask, decorations = decorations, mode = mode, transforms = transforms }
+    end
+  end
+  return presets
+end
 
 local function presetAssets()
   local name = str("mask_preset")
-  if name == "custom" then return str("shape"), {} end
+  if name == "custom" then return str("shape"), {}, "stretch", "-", "", "custom" end
   local pluginDir = noctalia.pluginDir()
-  if not pluginDir then return "", {} end
-  local preset = presets[name] or presets["center-glow"]
+  if not pluginDir then return "", {}, "stretch", "-", "", "" end
+  local presets = loadPresets(pluginDir)
+  local preset = presets[name]
+  if not preset then name, preset = "facet", presets.facet end
+  if not preset then return "", {}, "stretch", "-", pluginDir, "" end
   local decorations = {}
   for slot = 1, 3 do
     decorations[slot] = pluginDir .. "/" .. preset.decorations .. "/" .. slot .. ".png"
   end
-  return pluginDir .. "/" .. preset.mask, decorations
+  return pluginDir .. "/" .. preset.mask, decorations, preset.mode, preset.transforms, pluginDir, name
 end
 
 -- Noctalia rewrites this on every theme change, from the template in this plugin.
@@ -54,11 +62,15 @@ local function pixels(logical, scale)
   return tostring(math.floor(logical * scale + 0.5))
 end
 
-local function argvFor(output, wallpaper, shape, presetDecorations, dest)
+local function argvFor(output, wallpaper, shape, presetDecorations, mode, transforms, assetRoot, presetName, dest)
   local argv = {
     "bash", noctalia.pluginDir() .. "/generate-masked-wallpaper.sh",
     "--wallpaper", wallpaper,
     "--shape", shape,
+    "--asset-mode", mode,
+    "--transforms", transforms,
+    "--asset-root", assetRoot,
+    "--preset", presetName,
     "--connector", output.name,
     "--width", pixels(output.width, output.scale),
     "--height", pixels(output.height, output.scale),
@@ -85,7 +97,7 @@ local function argvFor(output, wallpaper, shape, presetDecorations, dest)
 end
 
 local function sync()
-  local shape, presetDecorations = presetAssets()
+  local shape, presetDecorations, mode, transforms, assetRoot, presetName = presetAssets()
   if shape == "" then return end
   -- Colours may be palette role names, so the palette's contents belong in the key:
   -- without it a colors_changed event would look like no change at all.
@@ -94,7 +106,7 @@ local function sync()
     local wallpaper = noctalia.wallpaperPath(output.name)
     if wallpaper then
       local dest = destDir() .. "/masked-wallpaper-" .. output.name .. ".jpg"
-      local argv = argvFor(output, wallpaper, shape, presetDecorations, dest)
+      local argv = argvFor(output, wallpaper, shape, presetDecorations, mode, transforms, assetRoot, presetName, dest)
       local key = table.concat(argv, "\31") .. "\31" .. palette
       local stateKey = "key:" .. output.name
       if noctalia.state[stateKey] ~= key or not noctalia.fileExists(dest) then
