@@ -88,9 +88,9 @@ while IFS=$'\t' read -r preset mask decorations mode transforms; do
   rm -f -- "$output_dir/$preset.jpg"
   ./generate-masked-wallpaper.sh \
     --wallpaper "$wallpaper" --shape "$mask" --asset-mode "$mode" --transforms "$transforms" --asset-root "$PWD" --preset "$preset" \
-    --decoration-1 "$decorations/1.png" --decoration-color-1 '#ff6b6b' \
-    --decoration-2 "$decorations/2.png" --decoration-color-2 '#f8f7f2' \
-    --decoration-3 "$decorations/3.png" --decoration-color-3 '#4dabf7' \
+    --decoration-1 "$decorations/1.png" --decoration-color-1 '#f0cb75' \
+    --decoration-2 "$decorations/2.png" --decoration-color-2 '#f5f1ed' \
+    --decoration-3 "$decorations/3.png" --decoration-color-3 '#8bc6d8' \
     --width "$width" --height "$height" --connector "$preset" \
     --cache-dir "$work/cache" --dest "$output_dir/$preset.jpg" >/dev/null
   [[ -s "$output_dir/$preset.jpg" ]] || { echo "error: missing output: $preset.jpg" >&2; exit 1; }
