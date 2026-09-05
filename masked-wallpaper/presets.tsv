@@ -17,5 +17,5 @@ soft-arch	masks/soft-arch.png	decorations/soft-arch	stretch	window,1.1,0,0.04,fa
 tidal-veil	masks/tidal-veil.png	decorations/tidal-veil	stretch	window,1.08,0.05,0,false,1,1.28
 liquid-lens	masks/liquid-lens.png	decorations/liquid-lens	stretch	window,1.18,-0.03,0.02,false,1,1.3
 arc-sweep	masks/arc-sweep.png	decorations/arc-sweep	stretch	window,1.14,-0.04,0.03,false,1,1.25
-soft-cascade	masks/soft-cascade.png	decorations/soft-cascade	stretch	transforms/soft-cascade-1.png,1.12,-0.06,0,false,1,1;transforms/soft-cascade-2.png,1.14,0.06,0,false,1,1.25;transforms/soft-cascade-3.png,1.1,-0.03,0,false,1,0.82
+soft-cascade	masks/soft-cascade.png	decorations/soft-cascade	stretch	-
 canopy-curve	masks/canopy-curve.png	decorations/canopy-curve	stretch	window,1.1,0,0.05,false,1,1.24
