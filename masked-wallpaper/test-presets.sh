@@ -70,7 +70,7 @@ while IFS=$'\t' read -r preset mask decorations mode transforms; do
   [[ -n "$preset" && "$preset" != \#* ]] || continue
   presets+=("$preset")
   [[ -f "$mask" ]] || { echo "error: missing mask: $mask" >&2; exit 1; }
-  [[ "$("${identify_image[@]}" -format '%[opaque]' "$mask")" == false ]] || { echo "error: mask has no transparent sharp region: $mask" >&2; exit 1; }
+  [[ "$("${identify_image[@]}" -format '%[opaque]' "$mask" | tr '[:upper:]' '[:lower:]')" == false ]] || { echo "error: mask has no transparent sharp region: $mask" >&2; exit 1; }
   for slot in 1 2 3; do
     [[ -f "$decorations/$slot.png" ]] || { echo "error: missing decoration: $decorations/$slot.png" >&2; exit 1; }
     "${identify_image[@]}" "$decorations/$slot.png" >/dev/null
