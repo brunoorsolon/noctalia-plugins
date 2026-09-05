@@ -1,0 +1,21 @@
+# preset	mask	decorations	asset-mode	transforms
+facet	masks/facet.png	decorations/facet	stretch	-
+facet-aperture	masks/facet-aperture.png	decorations/facet-aperture	stretch	-
+left-panel	masks/left-panel.png	decorations/left-panel	stretch	transforms/left-panel-refraction.png,1,0,0,false,1.12,1.4
+right-panel	masks/right-panel.png	decorations/right-panel	stretch	transforms/right-panel-refraction.png,1,0,0,false,1.12,1.4
+refracted-ribbon	masks/refracted-ribbon.png	decorations/refracted-ribbon	stretch	window,1.08,0,0.03,false,1,1.28;transforms/refracted-ribbon-glint.png,1.08,0,0.03,false,1.35,1.6
+shard-gate	masks/shard-gate.png	decorations/shard-gate	stretch	transforms/shard-gate-1.png,1.04,-0.02,0,false,1,1.3;transforms/shard-gate-2.png,1.12,0,-0.02,false,1,0.82;transforms/shard-gate-3.png,1.06,0.03,0,false,1.08,1.45
+right-zoom-cut	masks/right-zoom-cut.png	decorations/right-zoom-cut	stretch	window,1.32,-0.08,0.02,false,1,1.35;transforms/right-zoom-cut-glint.png,1.32,-0.08,0.02,false,1.5,1.7
+left-zoom-cut	masks/left-zoom-cut.png	decorations/left-zoom-cut	stretch	window,1.32,0.08,0.02,false,1,1.35;transforms/left-zoom-cut-glint.png,1.32,0.08,0.02,false,1.5,1.7
+panorama-stack	masks/panorama-stack.png	decorations/panorama-stack	stretch	-
+vertical-slice	masks/vertical-slice.png	decorations/vertical-slice	stretch	-
+horizontal-slice	masks/horizontal-slice.png	decorations/horizontal-slice	stretch	-
+mirror-slash	masks/mirror-slash.png	decorations/mirror-slash	stretch	window,1.12,-0.02,0,true,1,1.35;transforms/mirror-slash-glint.png,1.12,-0.02,0,true,1.4,1.6
+signal-tear	masks/signal-tear.png	decorations/signal-tear	stretch	window,1.1,0.04,0,false,1,1.55;transforms/signal-tear-glint.png,1.1,0.04,0,false,1.55,1.8
+halo-lens	masks/halo-lens.png	decorations/halo-lens	halo	window,1.2,0,-0.02,false,1,1.3
+soft-arch	masks/soft-arch.png	decorations/soft-arch	stretch	window,1.1,0,0.04,false,1.05,1.22
+tidal-veil	masks/tidal-veil.png	decorations/tidal-veil	stretch	window,1.08,0.05,0,false,1,1.28
+liquid-lens	masks/liquid-lens.png	decorations/liquid-lens	stretch	window,1.18,-0.03,0.02,false,1,1.3
+arc-sweep	masks/arc-sweep.png	decorations/arc-sweep	stretch	window,1.14,-0.04,0.03,false,1,1.25
+soft-cascade	masks/soft-cascade.png	decorations/soft-cascade	stretch	-
+canopy-curve	masks/canopy-curve.png	decorations/canopy-curve	stretch	window,1.1,0,0.05,false,1,1.24

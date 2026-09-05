@@ -17,6 +17,10 @@ Options:
   --decoration-color-2 C  Replace decoration 2 RGB with C; preserve alpha
   --decoration-color-3 C  Replace decoration 3 RGB with C; preserve alpha
   --decorations PNG       Alias for --decoration-1
+  --asset-mode MODE       Asset sizing: stretch or halo (default: stretch)
+  --transforms SPECS      Bundled transformed-wallpaper layer metadata
+  --asset-root DIR        Root for transform masks in SPECS
+  --preset NAME           Preset identity for cache isolation (default: custom)
   --width PX              Output width (default: 2560)
   --height PX             Output height (default: 1440)
   --connector NAME        Noctalia output name (default: DP-3)
@@ -34,11 +38,17 @@ EOF
 note() { [[ -n "${log:-}" ]] && printf '%s %s\n' "$(date -Is)" "$*" >>"$log"; return 0; }
 die() { note "FAILED: $*"; printf 'error: %s\n' "$*" >&2; exit 1; }
 unit_float() { awk -v n="$1" 'BEGIN { exit !(n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && n >= 0 && n <= 1) }'; }
+positive_float() { awk -v n="$1" 'BEGIN { exit !(n ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/ && n > 0) }'; }
+signed_float() { awk -v n="$1" 'BEGIN { exit !(n ~ /^-?([0-9]+([.][0-9]*)?|[.][0-9]+)$/) }'; }
 
 wallpaper=
 shape=
 decorations=("" "" "")
 decoration_colors=("" "" "")
+asset_mode=stretch
+transforms=-
+asset_root=
+preset=custom
 width=2560
 height=1440
 connector=DP-3
@@ -61,6 +71,10 @@ while (($#)); do
     --decoration-color-1) decoration_colors[0]=${2:?missing decoration color}; shift 2 ;;
     --decoration-color-2) decoration_colors[1]=${2:?missing decoration color}; shift 2 ;;
     --decoration-color-3) decoration_colors[2]=${2:?missing decoration color}; shift 2 ;;
+    --asset-mode) asset_mode=${2:?missing asset mode}; shift 2 ;;
+    --transforms) transforms=${2:?missing transforms}; shift 2 ;;
+    --asset-root) asset_root=${2:?missing asset root}; shift 2 ;;
+    --preset) preset=${2:?missing preset name}; shift 2 ;;
     --width) width=${2:?missing width}; shift 2 ;;
     --height) height=${2:?missing height}; shift 2 ;;
     --connector) connector=${2:?missing connector}; shift 2 ;;
@@ -92,8 +106,29 @@ for i in 0 1 2; do
 done
 [[ "$width" =~ ^[1-9][0-9]*$ ]] || die 'width must be a positive integer'
 [[ "$height" =~ ^[1-9][0-9]*$ ]] || die 'height must be a positive integer'
+[[ "$asset_mode" == stretch || "$asset_mode" == halo ]] || die 'asset mode must be stretch or halo'
 unit_float "$blur" || die 'blur must be between 0 and 1'
 unit_float "$tint_intensity" || die 'tint intensity must be between 0 and 1'
+
+command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required'
+transform_specs=()
+transforms_fingerprint=$transforms
+if [[ "$transforms" != - ]]; then
+  IFS=';' read -ra transform_specs <<<"$transforms"
+  for spec in "${transform_specs[@]}"; do
+    IFS=',' read -ra fields <<<"$spec"
+    ((${#fields[@]} == 7)) || die "invalid transform metadata: $spec"
+    transform_mask=${fields[0]}
+    [[ "$transform_mask" == window || -f "$asset_root/$transform_mask" ]] || die "transform mask not found: $asset_root/$transform_mask"
+    positive_float "${fields[1]}" || die "invalid transform scale: ${fields[1]}"
+    signed_float "${fields[2]}" && signed_float "${fields[3]}" || die "invalid transform offset: ${fields[2]},${fields[3]}"
+    [[ "${fields[4]}" == true || "${fields[4]}" == false ]] || die "invalid transform flip: ${fields[4]}"
+    positive_float "${fields[5]}" && positive_float "${fields[6]}" || die "invalid transform color adjustment: ${fields[5]},${fields[6]}"
+    if [[ "$transform_mask" != window ]]; then
+      transforms_fingerprint+="$(sha256sum -- "$asset_root/$transform_mask" | awk '{print $1}')"
+    fi
+  done
+fi
 
 if command -v magick >/dev/null 2>&1; then
   im=(magick)
@@ -126,7 +161,6 @@ for i in 0 1 2; do
   color=${decoration_colors[$i]}
   [[ -z "$color" ]] || "${im[@]}" -size 1x1 "xc:$color" null: 2>/dev/null || die "ImageMagick does not recognize decoration color $((i + 1)): $color"
 done
-command -v sha256sum >/dev/null 2>&1 || die 'sha256sum is required'
 
 wall_hash=$(sha256sum -- "$wallpaper" | awk '{print $1}')
 shape_hash=$(sha256sum -- "$shape" | awk '{print $1}')
@@ -136,7 +170,7 @@ for i in 0 1 2; do
   [[ -z "${decorations[$i]}" ]] || decoration_hash=$(sha256sum -- "${decorations[$i]}" | awk '{print $1}')
   decorations_fingerprint+="$decoration_hash:${decoration_colors[$i]}|"
 done
-key=$(printf '%s\n' "$wall_hash" "$shape_hash" "$decorations_fingerprint" "$width" "$height" "$connector" "$blur" "$tint" "$tint_intensity" 'flattened-jpeg-v5' | sha256sum | cut -c1-16)
+key=$(printf '%s\n' "$wall_hash" "$shape_hash" "$decorations_fingerprint" "$preset" "$asset_mode" "$transforms_fingerprint" "$width" "$height" "$connector" "$blur" "$tint" "$tint_intensity" 'flattened-jpeg-v7' | sha256sum | cut -c1-16)
 safe_connector=${connector//[^A-Za-z0-9_.-]/_}
 stem="masked-wallpaper-${safe_connector}-${width}x${height}-${key}"
 output="$cache_dir/$stem.jpg"
@@ -208,24 +242,65 @@ else
 fi
 
 # The shape's alpha is the affected area: opaque = blurred/tinted, transparent = original wallpaper.
-"${im[@]}" "$shape" -resize "${width}x${height}!" -alpha extract "$mask"
+if [[ "$asset_mode" == halo ]]; then
+  halo_side=$(awk -v w="$width" -v h="$height" 'BEGIN { a=w*.58; b=h*.77; printf "%d", (a < b ? a : b) + .5 }')
+  "${im[@]}" "$shape" -resize "${halo_side}x${halo_side}!" -alpha extract -gravity center -background white -extent "${width}x${height}" "$mask"
+else
+  "${im[@]}" "$shape" -resize "${width}x${height}!" -alpha extract "$mask"
+fi
 "${im[@]}" "$processed" "$mask" -alpha off -compose CopyOpacity -composite "MIFF:$masked"
 "${im[@]}" "$base" "$masked" -compose over -composite "MIFF:$flattened"
+"${im[@]}" "$mask" -negate "$tmpdir/window-mask.miff"
 
 current=$flattened
+for index in "${!transform_specs[@]}"; do
+  IFS=',' read -r transform_mask scale offset_x offset_y flip brightness saturation <<<"${transform_specs[$index]}"
+  layer_mask="$tmpdir/transform-mask-$index.miff"
+  if [[ "$transform_mask" == window ]]; then
+    layer_mask="$tmpdir/window-mask.miff"
+  else
+    "${im[@]}" "$asset_root/$transform_mask" -resize "${width}x${height}!" -alpha extract "$layer_mask"
+  fi
+  cx=$(awk -v n="$width" 'BEGIN { printf "%.3f", n/2 }')
+  cy=$(awk -v n="$height" 'BEGIN { printf "%.3f", n/2 }')
+  tx=$(awk -v c="$cx" -v n="$width" -v x="$offset_x" 'BEGIN { printf "%.3f", c+n*x }')
+  ty=$(awk -v c="$cy" -v n="$height" -v y="$offset_y" 'BEGIN { printf "%.3f", c+n*y }')
+  brightness_percent=$(awk -v n="$brightness" 'BEGIN { printf "%.3f", n*100 }')
+  saturation_percent=$(awk -v n="$saturation" 'BEGIN { printf "%.3f", n*100 }')
+  transformed="$tmpdir/transformed-$index.miff"
+  if [[ "$flip" == false ]] && awk -v s="$scale" -v x="$offset_x" -v y="$offset_y" 'BEGIN { exit !(s == 1 && x == 0 && y == 0) }'; then
+    "${im[@]}" "$base" -modulate "$brightness_percent,$saturation_percent,100" "$transformed"
+  else
+    transform_args=()
+    [[ "$flip" == false ]] || transform_args=(-flop)
+    "${im[@]}" "$base" "${transform_args[@]}" -virtual-pixel edge -set option:distort:viewport "${width}x${height}+0+0" -distort SRT "$cx,$cy $scale 0 $tx,$ty" +repage -modulate "$brightness_percent,$saturation_percent,100" "$transformed"
+  fi
+  transformed_masked="$tmpdir/transformed-masked-$index.miff"
+  merged="$tmpdir/transformed-merged-$index.miff"
+  "${im[@]}" "$transformed" "$layer_mask" -alpha off -compose CopyOpacity -composite "$transformed_masked"
+  "${im[@]}" "$current" "$transformed_masked" -compose over -composite "$merged"
+  current=$merged
+done
+
 # Composite bottom-to-top so decoration 1 is the topmost layer.
 for i in 2 1 0; do
   decoration=${decorations[$i]}
   [[ -n "$decoration" ]] || continue
+  resized="$tmpdir/decoration-resized-$i.miff"
+  if [[ "$asset_mode" == halo ]]; then
+    "${im[@]}" "$decoration" -resize "${halo_side}x${halo_side}!" -gravity center -background none -extent "${width}x${height}" "$resized"
+  else
+    "${im[@]}" "$decoration" -resize "${width}x${height}!" "$resized"
+  fi
   layer="$tmpdir/decoration-$i.miff"
   merged="$tmpdir/merged-$i.miff"
   color=${decoration_colors[$i]}
   if [[ -n "$color" ]]; then
     decoration_alpha="$tmpdir/decoration-alpha-$i.miff"
-    "${im[@]}" "$decoration" -resize "${width}x${height}!" -alpha extract "$decoration_alpha"
+    "${im[@]}" "$resized" -alpha extract "$decoration_alpha"
     "${im[@]}" -size "${width}x${height}" "xc:$color" "$decoration_alpha" -alpha off -compose CopyOpacity -composite "MIFF:$layer"
   else
-    "${im[@]}" "$decoration" -resize "${width}x${height}!" "MIFF:$layer"
+    cp -- "$resized" "$layer"
   fi
   "${im[@]}" "$current" "$layer" -compose over -composite "MIFF:$merged"
   current=$merged

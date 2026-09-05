@@ -20,6 +20,7 @@ chmod +x "$work/magick"
 : > "$work/deco-1.png"
 : > "$work/deco-2.png"
 : > "$work/deco-3.png"
+: > "$work/transform.png"
 
 run() {
   FAKE_LOG="$work/magick.log" PATH="$work:$PATH" ./generate-masked-wallpaper.sh \
@@ -50,6 +51,27 @@ run >/dev/null
 
 [[ -z "$(find "$work/out" -name '.publish.*')" ]] || { echo "left a temporary publish file behind"; exit 1; }
 [[ "$(run --blur 0.9)" == generated:* ]] || { echo "changing blur must miss the cache"; exit 1; }
+[[ "$(run --preset facet)" == generated:* ]] || { echo "selecting a preset must miss the custom cache"; exit 1; }
+[[ "$(run --preset facet)" == cache\ hit:* ]] || { echo "an unchanged preset should hit the cache"; exit 1; }
+[[ "$(run --preset facet-aperture)" == generated:* ]] || { echo "changing the preset identity must miss the cache"; exit 1; }
+
+transform_run() {
+  run --asset-root "$work" --transforms 'transform.png,1.1,0.04,0,false,1.2,1.3' "$@"
+}
+[[ "$(transform_run)" == generated:* ]] || { echo "adding a transform must miss the cache"; exit 1; }
+[[ "$(transform_run)" == cache\ hit:* ]] || { echo "an unchanged transform should hit the cache"; exit 1; }
+printf x >>"$work/transform.png"
+[[ "$(transform_run)" == generated:* ]] || { echo "changing a transform mask must miss the cache"; exit 1; }
+[[ "$(run --asset-root "$work" --transforms 'window,1.2,0,0,false,1,1')" == generated:* ]] || { echo "changing transform metadata must miss the cache"; exit 1; }
+
+: >"$work/magick.log"
+[[ "$(run --preset aligned-panel --asset-root "$work" --transforms 'transform.png,1,0,0,false,1.12,1.4')" == generated:* ]] || { echo "an aligned transform should generate"; exit 1; }
+grep -qF -- '-modulate 112.000,140.000,100' "$work/magick.log" || { echo "an aligned transform must retain color treatment"; exit 1; }
+! grep -qF -- '-distort SRT' "$work/magick.log" || { echo "an aligned transform must not resample the wallpaper"; exit 1; }
+
+before=$(sha256sum "$work/out/backdrop.jpg")
+if run --width nope >/dev/null 2>&1; then echo "invalid arguments must fail"; exit 1; fi
+[[ "$(sha256sum "$work/out/backdrop.jpg")" == "$before" ]] || { echo "a failed run must preserve the published image"; exit 1; }
 
 # Palette role names resolve through the file Noctalia renders, and a repainted
 # palette must invalidate the cache even though the arguments never changed.

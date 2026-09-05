@@ -3,8 +3,8 @@
 [[plugin]]
 id = "magus/masked-wallpaper"
 name = "Masked Wallpaper Backdrop"
-version = "0.2.0"
-updated_at = 1788558524
+version = "0.3.0"
+updated_at = 1788596714
 added_at = 1788545383
 author = "magus"
 license = "MIT"
