@@ -4,7 +4,8 @@ cd -- "$(dirname -- "$0")"
 
 usage() {
   cat <<'EOF'
-Usage: ./test-presets.sh [--wallpaper FILE] [--output-dir DIR] [--width PX] [--height PX]
+Usage: ./test-presets.sh [WALLPAPER] [OUTPUT_DIR] [--width PX] [--height PX]
+       ./test-presets.sh [--wallpaper FILE] [--output-dir DIR] [--width PX] [--height PX]
 
 Renders all 20 bundled presets through generate-masked-wallpaper.sh.
 Defaults: synthetic wallpaper, /tmp/masked-wallpaper-presets, 1280x720.
@@ -13,16 +14,25 @@ EOF
 
 wallpaper=
 output_dir=${TMPDIR:-/tmp}/masked-wallpaper-presets
+wallpaper_set=false
+output_dir_set=false
 width=1280
 height=720
 while (($#)); do
   case "$1" in
-    --wallpaper) wallpaper=${2:?missing wallpaper path}; shift 2 ;;
-    --output-dir) output_dir=${2:?missing output directory}; shift 2 ;;
+    --wallpaper) wallpaper=${2:?missing wallpaper path}; wallpaper_set=true; shift 2 ;;
+    --output-dir) output_dir=${2:?missing output directory}; output_dir_set=true; shift 2 ;;
     --width) width=${2:?missing width}; shift 2 ;;
     --height) height=${2:?missing height}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
-    *) printf 'error: unknown option: %s\n' "$1" >&2; exit 1 ;;
+    -*) printf 'error: unknown option: %s\n' "$1" >&2; exit 1 ;;
+    *)
+      if [[ "$wallpaper_set" == false ]]; then wallpaper=$1; wallpaper_set=true
+      elif [[ "$output_dir_set" == false ]]; then output_dir=$1; output_dir_set=true
+      else printf 'error: unexpected argument: %s\n' "$1" >&2; exit 1
+      fi
+      shift
+      ;;
   esac
 done
 [[ "$width" =~ ^[1-9][0-9]*$ && "$height" =~ ^[1-9][0-9]*$ ]] || { echo 'error: width and height must be positive integers' >&2; exit 1; }
