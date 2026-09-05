@@ -92,13 +92,13 @@ done < presets.tsv
 for pair in 'masks/left-panel.png masks/right-panel.png' 'masks/right-zoom-cut.png masks/left-zoom-cut.png' 'transforms/left-panel-refraction.png transforms/right-panel-refraction.png' 'transforms/right-zoom-cut-glint.png transforms/left-zoom-cut-glint.png'; do
   read -r source target <<<"$pair"
   "${im[@]}" "$source" -flop "$work/mirror.png"
-  [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "$target" null: 2>&1)" == 0 ]] || { echo "error: $source and $target are not exact mirrors" >&2; exit 1; }
+  "${compare_image[@]}" -metric AE "$work/mirror.png" "$target" null: >/dev/null 2>&1 || { echo "error: $source and $target are not exact mirrors" >&2; exit 1; }
 done
 for slot in 1 2 3; do
   for pair in 'left-panel right-panel' 'right-zoom-cut left-zoom-cut'; do
     read -r source target <<<"$pair"
     "${im[@]}" "decorations/$source/$slot.png" -flop "$work/mirror.png"
-    [[ "$("${compare_image[@]}" -metric AE "$work/mirror.png" "decorations/$target/$slot.png" null: 2>&1)" == 0 ]] || { echo "error: decoration $slot for $source and $target is not mirrored" >&2; exit 1; }
+    "${compare_image[@]}" -metric AE "$work/mirror.png" "decorations/$target/$slot.png" null: >/dev/null 2>&1 || { echo "error: decoration $slot for $source and $target is not mirrored" >&2; exit 1; }
   done
 done
 rm -f -- "$output_dir/contact-sheet.jpg"
