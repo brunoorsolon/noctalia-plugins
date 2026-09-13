@@ -49,6 +49,8 @@ noctalia msg plugins enable magus/dictation
 
 A relative path resolves against Noctalia's working directory, so use an absolute path or a `~` path. Settings changes take effect on the next job; a running job keeps the arguments it started with.
 
+Verification is a record, not a lock: **Transcribe** stays available while setup is unverified or stale, and the helper re-checks the engine's flags on every run. Nothing is repaired silently — an unverified or replaced executable or model fails the job with a named outcome instead of being rebuilt, downloaded, or guessed around.
+
 ## Usage
 
 Open the panel from the bar widget glyph or with:
@@ -59,7 +61,7 @@ noctalia msg panel-toggle magus/dictation:panel
 
 - **Transcribe** imports the selected recording as one job. Only one job runs at a time, and the buttons stay responsive while it runs — the elapsed time keeps counting.
 - **Cancel** asks the helper to stop the engine this job started. If no engine has started yet, the cancel is honoured anyway instead of being discarded. Only this plugin's own process is stopped.
-- The transcript appears in a selectable multiline field once the job has written its files.
+- The transcript appears in a selectable multiline field once the engine has returned text. Text is shown even when the outcome is an error or a review, so a partial result is readable; only a usable transcript enables **Copy transcript**.
 - **Copy transcript** copies the text that is shown. Nothing is pasted automatically: put the text where you want it yourself.
 - **Verify and record** repeats setup verification and re-hashes the files, for example after replacing the model.
 
@@ -100,13 +102,13 @@ Each job ends in exactly one outcome. The plugin never reports success for text 
 | `cancelled` | You asked for the job to stop. |
 | `invalid_wav` | The recording is missing or is not 16 kHz mono signed-16-bit WAV. |
 | `engine_incompatible` | The selected executable does not accept the flags this plugin needs. |
-| `engine_unavailable` | The selected executable could not be run or reported its own usage error. |
+| `engine_unavailable` | The engine could not be started, or running it to check its flags failed. |
 | `setup_required` | The executable or the model is missing or not executable. |
-| `invalid_threads` | The thread count is not a positive integer. |
+| `invalid_threads` | The thread count is outside 1–64. |
 | `internal` | The helper failed, or the plugin could not start it. |
 | `interrupted` | A plugin reload replaced the controller while the job was still running. The job's files are kept. |
 
-Nothing is repaired automatically: an incompatible engine or a malformed recording is reported as it is, with the class of problem named.
+Nothing is repaired automatically: an incompatible engine or a malformed recording is reported as it is, with the class of problem named. A failed run also carries the last lines the engine wrote to standard error, so a model the engine cannot load is reported with the engine's own reason rather than a bare exit status.
 
 ## How the engine is called
 
@@ -144,7 +146,9 @@ Run the behavior check from this directory:
 ./selftest.sh
 ```
 
-It uses a fake engine and generated WAV fixtures to check the argument vector, thread limits and niceness, every outcome the helper can report, the watchdog, cancellation before and during a job, file permissions, and that the imported recording is left untouched. If `luau-compile` is on `PATH` it also compiles every entry script.
+It uses a fake engine and generated WAV fixtures to check the argument vector, thread limits and niceness, the helper's outcomes (including `engine_unavailable` and `internal`), the log excerpt a failing run carries, the watchdog, cancellation before and during a job, file permissions, and that the imported recording is left untouched. If `luau-compile` is on `PATH` it also compiles every entry script.
+
+The controller, panel and widget are exercised through a disposable Luau harness with a stubbed `noctalia`/`ui` API during development: one-job-at-a-time, cancel routing, copy gating, the `interrupted` reload path and the widget glyph per state. That harness is scratch tooling and is not part of this repository, so `./selftest.sh` alone only compiles those three files.
 
 ## Updating the plugin
 

@@ -65,10 +65,14 @@ def emit(payload):
     sys.stdout.flush()
     if not SUMMARY_PATH:
         return
-    private_dir(os.path.dirname(SUMMARY_PATH))
-    temporary = SUMMARY_PATH + ".tmp"
-    private_write(temporary, line + "\n")
-    os.replace(temporary, SUMMARY_PATH)
+    try:
+        private_dir(os.path.dirname(SUMMARY_PATH))
+        temporary = SUMMARY_PATH + ".tmp"
+        private_write(temporary, line + "\n")
+        os.replace(temporary, SUMMARY_PATH)
+    except OSError:
+        # The plugin keeps its own stall guard; the verdict on stdout is what matters.
+        pass
 
 
 def sha256_file(path):
@@ -97,12 +101,29 @@ def private_write(path, text):
     os.chmod(path, 0o600)
 
 
+def private_open(path):
+    """Binary handle for a file the engine writes into, with private permissions."""
+    return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
+
+
+def log_tail(path, limit=240):
+    """The last engine output, so a failing run explains itself in the outcome."""
+    try:
+        with open(path, "rb") as handle:
+            text = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    return " ".join(lines[-2:])[-limit:]
+
+
 def safe_id(value):
     return SAFE_ID.sub("_", str(value))[:120] or "job"
 
 
-def missing_flags(engine):
-    """Return the required engine flags its own --help does not advertise."""
+def probe_flags(engine):
+    """Return (required flags the engine's --help omits, failure to run --help)."""
     try:
         completed = subprocess.run(
             [engine, "--help"],
@@ -111,9 +132,9 @@ def missing_flags(engine):
             timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return list(REQUIRED_FLAGS) + ["(could not run --help: %s)" % exc]
+        return [], "%s --help failed: %s" % (engine, exc)
     text = completed.stdout.decode("utf-8", "replace").lower()
-    return [flag for flag in REQUIRED_FLAGS if flag not in text]
+    return [flag for flag in REQUIRED_FLAGS if flag not in text], None
 
 
 def validate_wav(path):
@@ -160,7 +181,10 @@ def command_probe(args):
     if problems:
         verdict("setup_required", "error", "Setup required: " + "; ".join(problems) + ".")
         return
-    missing = missing_flags(engine)
+    missing, failure = probe_flags(engine)
+    if failure:
+        verdict("engine_unavailable", "error", "Setup required: the recognition engine could not be run: %s." % failure)
+        return
     if missing:
         verdict(
             "engine_incompatible",
@@ -208,7 +232,10 @@ def command_run(args):
     if not os.path.isfile(args.model):
         verdict("setup_required", "error", "Setup required: the Model GGUF is missing.")
         return
-    missing = missing_flags(args.engine)
+    missing, failure = probe_flags(args.engine)
+    if failure:
+        verdict("engine_unavailable", "error", "The recognition engine could not be run: %s." % failure)
+        return
     if missing:
         verdict(
             "engine_incompatible",
@@ -283,7 +310,7 @@ def transcribe(args):
 
     started = time.time()
     killed = None
-    with open(raw_path, "wb") as out, open(log_path, "wb") as err:
+    with private_open(raw_path) as out, private_open(log_path) as err:
         try:
             proc = subprocess.Popen(
                 argv,
@@ -328,6 +355,10 @@ def transcribe(args):
     private_write(transcript_path, text)
 
     outcome, severity, message = classify(killed, exit_code, parsed)
+    if severity == "error":
+        detail = log_tail(log_path)
+        if detail:
+            message = message + " Engine output: " + detail
     result = {
         "jobId": args.job_id,
         "attempt": attempt,

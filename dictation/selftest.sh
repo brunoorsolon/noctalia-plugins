@@ -75,6 +75,9 @@ elif mode == "unknown_token":
     emit(HEADER, row("hi <|endoftext|> there"))
 elif mode == "missing_result":
     emit(HEADER)
+elif mode == "fail_log":
+    print("error: failed to load model: unknown tensor type", file=sys.stderr, flush=True)
+    sys.exit(1)
 elif mode == "slow":
     time.sleep(60)
 else:
@@ -203,6 +206,29 @@ WAV="$work/good.wav"
 out=$(FAKE_DROP=--threads MODE=ok helper_run job-flag)
 check "engine flag check at run" engine_incompatible "$(printf '%s' "$out" | field outcome)"
 
+# An executable that cannot run at all is not "incompatible": its flags were
+# never read, so it is reported as unavailable instead.
+printf 'not a real binary\n' >"$work/broken-engine"
+chmod +x "$work/broken-engine"
+out=$(python3 "$helper" probe --engine "$work/broken-engine" --model "$MODEL" --data-dir "$data" || true)
+check "unrunnable engine probe" engine_unavailable "$(printf '%s' "$out" | field outcome)"
+RECORD=; out=$(MODE=ok python3 "$helper" run --engine "$work/broken-engine" --model "$MODEL" \
+  --threads 4 --wav "$work/good.wav" --job-id job-broken --data-dir "$data" || true)
+check "unrunnable engine run" engine_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# A failing engine's own reason reaches the outcome, not only its exit status.
+RECORD=; MODE=fail_log helper_run job-log >"$work/log.json"
+check "engine reason in outcome" True \
+  "$(grep -q 'failed to load model' <<<"$(field message <"$work/log.json")" && echo True || echo False)"
+
+# A crash still reports an outcome, because the plugin would otherwise wait for it.
+: >"$work/not-a-dir"
+MODE=ok python3 "$helper" run --engine "$engine" --model "$MODEL" --threads 4 \
+  --wav "$work/good.wav" --job-id job-internal --data-dir "$work/not-a-dir" \
+  >"$work/internal.json" 2>"$work/internal.err" && internal_exit=0 || internal_exit=$?
+check "crash reports internal" internal "$(field outcome <"$work/internal.json")"
+check "crash exits nonzero" 3 "$internal_exit"
+
 # The helper owns the watchdog; a slow engine is stopped.
 start=$(date +%s)
 RECORD=; MODE=slow TIMEOUT=1 helper_run job-timeout >"$work/timeout.json"
@@ -225,6 +251,7 @@ sleep 0.5
 printf 1 >"$data/jobs/job-cancel.cancel"
 wait "$pid"
 check "cancel outcome" cancelled "$(field outcome <"$work/cancel.json")"
+check "cancel copyable" False "$(field copyable <"$work/cancel.json")"
 check "cancel summary persisted" cancelled "$(field outcome <"$data/jobs/job-cancel/summary.json")"
 
 # A retry opens a new attempt instead of overwriting the previous one.
@@ -240,6 +267,8 @@ after=$(sha256sum "$work/good.wav" | cut -d' ' -f1)
 check "original untouched" "$before" "$after"
 check "result persisted" True "$([[ -f "$data/jobs/job-persist/attempt-1/result.json" ]] && echo True || echo False)"
 check "transcript private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/transcript.txt")"
+check "raw jsonl private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/engine.jsonl")"
+check "engine log private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/engine.log")"
 check "attempt dir private" 700 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1")"
 
 # Luau syntax is checked when a compiler is available; the entry scripts are the

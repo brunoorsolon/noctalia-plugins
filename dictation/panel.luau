@@ -75,7 +75,7 @@ local function setupBanner(s)
 end
 
 local function transcriptArea(s)
-  if not s.copyable or type(s.transcript) ~= "string" or s.transcript == "" then
+  if type(s.transcript) ~= "string" or s.transcript == "" then
     return ui.column({ gap = 8, flexGrow = 1, align = "center", justify = "center" }, {
       ui.label({ text = "No transcript yet.", color = "on_surface_variant", maxWidth = LABEL_WIDTH }),
     })
@@ -121,8 +121,10 @@ end
 local function render()
   local s = state()
   local recording = configPath("recording")
+  local threads = noctalia.getConfig("threads")
+  if type(threads) ~= "number" then threads = 4 end
   local info = string.format("Backend CPU only. %d threads. Recording: %s",
-    math.max(1, math.floor(tonumber(noctalia.getConfig("threads")) or 4)),
+    math.floor(threads),
     recording ~= "" and recording or "none selected")
   panel.render(ui.column({ gap = 10, padding = 16 }, {
     ui.label({ text = "Dictation", fontSize = 16, fontWeight = "bold" }),

@@ -48,10 +48,7 @@ end
 local function configThreads()
   local value = noctalia.getConfig("threads")
   if type(value) ~= "number" then return 4 end
-  value = math.floor(value)
-  if value < 1 then return 1 end
-  if value > 64 then return 64 end
-  return value
+  return math.floor(value)
 end
 
 local function shortHash(hash)
@@ -145,6 +142,13 @@ local function startJob()
     fail("Could not locate the bundled recognition helper.", "internal")
     return
   end
+  -- The settings picker already bounds this; a value outside it is reported
+  -- rather than quietly changed, because the thread count is a real choice.
+  local threads = configThreads()
+  if threads < 1 or threads > 64 then
+    fail("Setup required: the inference thread count must be between 1 and 64.", "invalid_threads")
+    return
+  end
 
   local jobId = newJobId()
   local path = JOBS .. "/" .. jobId .. "/summary.json"
@@ -158,7 +162,7 @@ local function startJob()
     "--model",
     configPath("model"),
     "--threads",
-    tostring(configThreads()),
+    tostring(threads),
     "--wav",
     configPath("recording"),
     "--job-id",
@@ -240,14 +244,17 @@ local function finishJob(summary)
   local paths = type(summary.paths) == "table" and summary.paths or {}
   local transcriptPath = type(paths.transcript) == "string" and paths.transcript or ""
   local resultPath = type(paths.result) == "string" and paths.result or ""
-  -- Copy is offered only once both persisted files are really on disk.
-  local copyable = summary.copyable == true
-    and transcriptPath ~= ""
-    and resultPath ~= ""
-    and noctalia.fileExists(transcriptPath)
-    and noctalia.fileExists(resultPath)
+  -- Copy is offered only once both persisted files are really on disk, but any
+  -- text the engine did return is still shown, including a partial result whose
+  -- outcome was an error or a review.
   local transcript = ""
-  if copyable then transcript = noctalia.readFile(transcriptPath) or "" end
+  if transcriptPath ~= "" and noctalia.fileExists(transcriptPath) then
+    transcript = noctalia.readFile(transcriptPath) or ""
+  end
+  local copyable = summary.copyable == true
+    and transcript ~= ""
+    and resultPath ~= ""
+    and noctalia.fileExists(resultPath)
 
   resetActivity()
   S.outcome = summary.outcome
