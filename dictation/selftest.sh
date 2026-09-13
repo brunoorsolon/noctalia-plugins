@@ -27,6 +27,8 @@ HELP = """usage: fake-engine [options] audio.wav
 """
 
 if "--help" in sys.argv:
+    if os.environ.get("FAKE_HELP_FAIL"):
+        sys.exit(2)
     drop = os.environ.get("FAKE_DROP", "")
     print("\n".join(line for line in HELP.splitlines() if not (drop and drop in line)))
     sys.exit(0)
@@ -215,6 +217,18 @@ check "unrunnable engine probe" engine_unavailable "$(printf '%s' "$out" | field
 RECORD=; out=$(MODE=ok python3 "$helper" run --engine "$work/broken-engine" --model "$MODEL" \
   --threads 4 --wav "$work/good.wav" --job-id job-broken --data-dir "$data" || true)
 check "unrunnable engine run" engine_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# An engine whose --help exits nonzero without answering is unavailable, not
+# incompatible: its flags were never reported.
+out=$(FAKE_HELP_FAIL=1 python3 "$helper" probe --engine "$engine" --model "$MODEL" --data-dir "$data" || true)
+check "silent failing help" engine_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# A thread count outside the supported range is reported, not passed to the engine.
+for bad in 0 100; do
+  RECORD=; out=$(MODE=ok python3 "$helper" run --engine "$engine" --model "$MODEL" --threads "$bad" \
+    --wav "$work/good.wav" --job-id "job-threads-$bad" --data-dir "$data")
+  check "threads $bad" invalid_threads "$(printf '%s' "$out" | field outcome)"
+done
 
 # A failing engine's own reason reaches the outcome, not only its exit status.
 RECORD=; MODE=fail_log helper_run job-log >"$work/log.json"

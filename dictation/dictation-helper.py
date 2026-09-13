@@ -134,7 +134,10 @@ def probe_flags(engine):
     except (OSError, subprocess.SubprocessError) as exc:
         return [], "%s --help failed: %s" % (engine, exc)
     text = completed.stdout.decode("utf-8", "replace").lower()
-    return [flag for flag in REQUIRED_FLAGS if flag not in text], None
+    missing = [flag for flag in REQUIRED_FLAGS if flag not in text]
+    if completed.returncode != 0 and len(missing) == len(REQUIRED_FLAGS):
+        return [], "%s --help exited with status %d and printed no usage" % (engine, completed.returncode)
+    return missing, None
 
 
 def validate_wav(path):
@@ -223,8 +226,8 @@ def command_run(args):
     SUMMARY_PATH = os.path.join(
         args.data_dir, "jobs", safe_id(args.job_id), "summary.json"
     )
-    if args.threads < 1:
-        verdict("invalid_threads", "error", "Setup required: the thread count must be a positive integer.")
+    if args.threads < 1 or args.threads > 64:
+        verdict("invalid_threads", "error", "Setup required: the inference thread count must be between 1 and 64.")
         return
     if not os.path.isfile(args.engine) or not os.access(args.engine, os.X_OK):
         verdict("setup_required", "error", "Setup required: the recognition engine is missing or not executable.")
@@ -341,8 +344,13 @@ def transcribe(args):
                     break
                 time.sleep(0.25)
             exit_code = proc.wait()
-            if killed == "cancelled" and os.path.exists(cancel_file):
-                os.remove(cancel_file)
+    # A cancel that raced the engine's own exit is still this job's request, so the
+    # file never outlives the job.
+    if os.path.exists(cancel_file):
+        try:
+            os.remove(cancel_file)
+        except OSError:
+            pass
 
     if killed == "failed":
         verdict("engine_unavailable", "error", "Could not start the engine: %s." % failure)
