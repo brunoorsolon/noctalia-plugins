@@ -49,7 +49,7 @@ noctalia msg plugins enable magus/dictation
 
 A relative path resolves against Noctalia's working directory, so use an absolute path or a `~` path. Settings changes take effect on the next job; a running job keeps the arguments it started with.
 
-Verification is a record, not a lock: **Transcribe** stays available while setup is unverified or stale, and the helper re-checks the engine's flags on every run. Nothing is repaired silently — an unverified or replaced executable or model fails the job with a named outcome instead of being rebuilt, downloaded, or guessed around.
+Verification is a record, not a lock: **Transcribe** stays available while setup is unverified or stale, and the helper re-checks the engine's flags on every run. The recorded paths, hashes and sizes describe the files you verified: if either file moves or changes size, the banner asks you to verify again instead of claiming the old record. Nothing is repaired silently — an engine that cannot load the model fails with the engine's own reason in the outcome, and no executable, model or source file is ever replaced, rebuilt, or downloaded.
 
 ## Usage
 
@@ -137,6 +137,7 @@ The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callba
 - CPU only: the engine is always called with `--backend cpu`.
 - One job at a time, and no queue.
 - Only 16 kHz mono signed-16-bit WAV is accepted, and no resampling is attempted.
+- Stale setup detection compares each recorded file's path and size, so a replacement that keeps the same size is only reported by the run that fails on it.
 
 ## Checks
 

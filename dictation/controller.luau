@@ -56,6 +56,15 @@ local function shortHash(hash)
   return hash:sub(1, 8) .. "..." .. hash:sub(#hash - 3)
 end
 
+-- A recorded file that changed size is no longer the file the recorded hash
+-- describes. A file that cannot be inspected is left to the run-time check.
+local function sameSize(entry)
+  if type(entry) ~= "table" or type(entry.size) ~= "number" then return true end
+  local info = noctalia.fileInfo(entry.path)
+  if type(info) ~= "table" then return true end
+  return info.size == entry.size
+end
+
 -- Cheap half of setup: it never starts a process, so it is safe on every config
 -- change. The explicit probe is what records hashes and engine capabilities.
 local function refreshSetup()
@@ -89,6 +98,10 @@ local function refreshSetup()
   local recordedModel = type(record.model) == "table" and record.model.path or ""
   if recordedEngine ~= engine or recordedModel ~= model then
     S.setup = { state = "stale", message = "Setup recorded a different executable or model. Verify and record again." }
+    return
+  end
+  if not (sameSize(record.engine) and sameSize(record.model)) then
+    S.setup = { state = "stale", message = "The recorded executable or model changed. Verify and record again." }
     return
   end
   S.setup = {
