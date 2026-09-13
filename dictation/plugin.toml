@@ -1,0 +1,59 @@
+id = "magus/dictation"
+name = "Dictation"
+version = "0.1.0"
+plugin_api = 24
+author = "magus"
+license = "MIT"
+dependencies = ["python3", "transcribe-cli"]
+tags = ["audio", "dictation", "service", "panel"]
+icon = "microphone"
+description = "Transcribes a saved 16 kHz WAV with an installed recognition engine and GGUF model."
+
+[[setting]]
+key = "engine"
+type = "file"
+label_key = "settings.engine.label"
+description_key = "settings.engine.description"
+default = ""
+
+[[setting]]
+key = "model"
+type = "file"
+label_key = "settings.model.label"
+description_key = "settings.model.description"
+default = ""
+extensions = [".gguf"]
+
+[[setting]]
+key = "recording"
+type = "file"
+label_key = "settings.recording.label"
+description_key = "settings.recording.description"
+default = ""
+extensions = [".wav"]
+
+[[setting]]
+key = "threads"
+type = "int"
+label_key = "settings.threads.label"
+description_key = "settings.threads.description"
+default = 4
+min = 1
+max = 64
+
+[[service]]
+id = "controller"
+entry = "controller.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 460
+height = 520
+placement = "floating"
+position = "center"
+open_near_click = true
+
+[[widget]]
+id = "widget"
+entry = "widget.luau"

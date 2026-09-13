@@ -15,6 +15,7 @@ Or run:
 ```sh
 noctalia msg plugins source add magus git https://github.com/brunoorsolon/noctalia-plugins.git
 noctalia msg plugins enable magus/masked-wallpaper
+noctalia msg plugins enable magus/dictation
 ```
 
 ## Plugins
@@ -22,5 +23,6 @@ noctalia msg plugins enable magus/masked-wallpaper
 | Plugin | Description |
 | --- | --- |
 | [Masked Wallpaper Backdrop](masked-wallpaper/) | Keeps a blurred, tinted, decorated lockscreen backdrop in sync with the wallpaper. |
+| [Dictation](dictation/) | Transcribes a saved 16 kHz WAV with an installed recognition engine and GGUF model. |
 
 Each plugin documents its own requirements, setup, and usage in its directory.
