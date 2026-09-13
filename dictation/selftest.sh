@@ -77,6 +77,10 @@ elif mode == "unknown_token":
     emit(HEADER, row("hi <|endoftext|> there"))
 elif mode == "missing_result":
     emit(HEADER)
+elif mode == "bad_type":
+    entry = json.loads(row("hello"))
+    entry["text"] = {"not": "recognized speech"}
+    emit(HEADER, json.dumps(entry))
 elif mode == "fail_log":
     print("error: failed to load model: unknown tensor type", file=sys.stderr, flush=True)
     sys.exit(1)
@@ -187,6 +191,9 @@ expect_outcome() { # expect_outcome <mode> <outcome> <copyable> <job>
 }
 expect_outcome empty empty False job-empty
 expect_outcome malformed malformed_row False job-malformed
+# A result field of the wrong type is a malformed row, never text to copy.
+expect_outcome bad_type malformed_row False job-bad-type
+check "bad type transcript empty" "" "$(cat "$data/jobs/job-bad-type/attempt-1/transcript.txt")"
 expect_outcome nonzero nonzero_exit False job-nonzero
 expect_outcome per_file_error per_file_error False job-per-file
 expect_outcome truncated truncated True job-truncated
@@ -247,6 +254,8 @@ check "crash exits nonzero" 3 "$internal_exit"
 start=$(date +%s)
 RECORD=; MODE=slow TIMEOUT=1 helper_run job-timeout >"$work/timeout.json"
 check "watchdog" timeout "$(field outcome <"$work/timeout.json")"
+check "heartbeat written" True "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ts"] > 0)' "$data/jobs/job-timeout/heartbeat.json")"
+check "heartbeat private" 600 "$(stat -c '%a' "$data/jobs/job-timeout/heartbeat.json")"
 (( $(date +%s) - start < 30 )) || { echo "FAIL: watchdog did not stop the engine promptly" >&2; exit 1; }
 
 # A cancel that arrives before any engine work is honoured instead of discarded.

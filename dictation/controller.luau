@@ -9,9 +9,14 @@ local HELPER = type(PLUGIN_DIR) == "string" and (PLUGIN_DIR .. "/dictation-helpe
 local DATA = noctalia.pluginDataDir()
 if type(DATA) ~= "string" then DATA = nil end
 local JOBS = DATA and (DATA .. "/jobs") or nil
+-- Names the one job this plugin currently owns. It lives on disk because the
+-- plugin's own state does not survive a reload, and a detached helper does.
+local JOB_POINTER = DATA and (DATA .. "/current-job") or nil
 
 -- Longest a helper may stay silent before the controller stops waiting. The
--- helper's own watchdog stops inference after 30 minutes.
+-- helper's own watchdog stops inference after 30 minutes, and it rewrites its
+-- heartbeat every few seconds, so silence this long means it is gone.
+local RUN_SILENT_SECONDS = 60
 local RUN_STALL_SECONDS = 35 * 60
 local PROBE_STALL_SECONDS = 10 * 60
 
@@ -112,13 +117,18 @@ local function refreshSetup()
   }
 end
 
+-- Ends the current activity without losing the record of the job it belonged to;
+-- `activity` is what makes a job live, and `S.job` is what the panel reports on.
 local function resetActivity()
   S.activity = "idle"
-  S.job = nil
   summaryPath = nil
+  if JOB_POINTER then noctalia.removeFile(JOB_POINTER) end
 end
 
 local function fail(message, outcome)
+  if S.job then
+    S.job.elapsedSeconds = math.floor((noctalia.nowMs() - S.job.startedAtMs) / 1000)
+  end
   resetActivity()
   S.outcome = outcome or "internal"
   S.severity = "error"
@@ -138,6 +148,27 @@ local function newJobId()
     candidate = stamp .. "-" .. tostring(index)
   end
   return candidate
+end
+
+local function summaryPathFor(jobId)
+  return JOBS .. "/" .. jobId .. "/summary.json"
+end
+
+-- The helper rewrites its heartbeat every few seconds; nil means it never wrote
+-- one, so the plugin cannot tell a live helper from a dead one.
+local function heartbeatAge(jobId)
+  local raw = noctalia.readFile(JOBS .. "/" .. jobId .. "/heartbeat.json")
+  local beat = type(raw) == "string" and noctalia.json.decode(raw) or nil
+  if type(beat) ~= "table" or type(beat.ts) ~= "number" then return nil end
+  return os.time() - beat.ts
+end
+
+local function helperSilent()
+  if S.activity ~= "running" or not S.job then return false end
+  -- Give a freshly started or newly adopted job time to report at all.
+  if (noctalia.nowMs() - activityStartedAtMs) / 1000 < RUN_SILENT_SECONDS then return false end
+  local age = heartbeatAge(S.job.id)
+  return age == nil or age > RUN_SILENT_SECONDS
 end
 
 local function startJob()
@@ -164,7 +195,19 @@ local function startJob()
   end
 
   local jobId = newJobId()
-  local path = JOBS .. "/" .. jobId .. "/summary.json"
+  local path = summaryPathFor(jobId)
+  -- Reject storage this job cannot write into before anything is launched: the
+  -- helper could only fail where the plugin would never see it.
+  local prepared, prepareError = noctalia.mkdirAll(JOBS .. "/" .. jobId)
+  if not prepared then
+    fail("Could not prepare the job directory: " .. tostring(prepareError), "internal")
+    return
+  end
+  local recorded, recordError = noctalia.writeFile(JOB_POINTER, jobId)
+  if not recorded then
+    fail("Could not record the running job: " .. tostring(recordError), "internal")
+    return
+  end
   -- Argument vector, never a shell string: paths are passed through verbatim.
   local argv = {
     "python3",
@@ -184,6 +227,7 @@ local function startJob()
     DATA,
   }
   if not noctalia.runAsync(argv) then
+    resetActivity()
     fail("Could not start the recognition helper.", "internal")
     return
   end
@@ -311,6 +355,10 @@ function update()
   local path = summaryPath
   local summary = path and noctalia.fileExists(path) and readSummary(path) or nil
   if not summary then
+    if helperSilent() then
+      fail("The recognition helper stopped reporting, so the job is no longer tracked. Its files stay in the plugin data directory.", "internal")
+      return
+    end
     if stopWaiting() then return end
     if S.activity == "running" and S.job then
       S.job.elapsedSeconds = math.floor((noctalia.nowMs() - S.job.startedAtMs) / 1000)
@@ -339,20 +387,35 @@ function onExit(_signal, reason)
   end
 end
 
+-- The plugin's own state is process-lifetime, so a reload forgets a job that is
+-- still running on disk. The job pointer does not: adopt whatever job the last
+-- runtime recorded, so a reload can neither start a second job nor lose Cancel.
+local function restoreJob()
+  if not JOB_POINTER or not JOBS then return end
+  local raw = noctalia.readFile(JOB_POINTER)
+  local jobId = type(raw) == "string" and noctalia.string.trim(raw) or ""
+  if not jobId:match("^job%-[%w%-]+$") then return end
+  local path = summaryPathFor(jobId)
+  local summary = noctalia.fileExists(path) and readSummary(path) or nil
+  if summary then
+    finishJob(summary)
+    return
+  end
+  S.activity = "running"
+  S.job = { id = jobId, startedAtMs = noctalia.nowMs(), elapsedSeconds = 0 }
+  S.outcome, S.severity = nil, nil
+  S.message = "Tracking the recognition job that was already running."
+  summaryPath = path
+  activityStartedAtMs = noctalia.nowMs()
+  publish()
+end
+
 noctalia.setUpdateInterval(1000)
 if JOBS then noctalia.mkdirAll(JOBS) end
 
--- state is process-lifetime, so a reload can leave a job recorded as running that
--- this fresh runtime is not watching. Never render that as live work.
-local previous = noctalia.state.get("dictation")
 refreshSetup()
+restoreJob()
 publish()
-if type(previous) == "table" and (previous.activity == "running" or previous.activity == "verifying") then
-  S.outcome, S.severity = "interrupted", "error"
-  S.message = "A plugin reload interrupted tracking of the previous job. Its files are kept in the plugin data directory."
-  publish()
-  noctalia.notifyError("Dictation", S.message)
-end
 
 noctalia.state.watch("dictation.command", function(command)
   if type(command) ~= "table" then return end

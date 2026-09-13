@@ -60,6 +60,8 @@ noctalia msg panel-toggle magus/dictation:panel
 ```
 
 - **Transcribe** imports the selected recording as one job. Only one job runs at a time, and the buttons stay responsive while it runs — the elapsed time keeps counting.
+- The plugin writes the id of the running job to disk and reads it back when it starts, so reloading or updating the plugin adopts the job that is already running instead of forgetting it: **Cancel** keeps addressing that job, and another import is refused until it ends.
+- The helper rewrites a heartbeat while it runs. If it stops reporting for a minute — a crash, a killed process, a full disk — the job is reported as no longer tracked instead of staying on screen as live work, and its files stay in the plugin data directory.
 - **Cancel** asks the helper to stop the engine this job started. If no engine has started yet, the cancel is honoured anyway instead of being discarded. Only this plugin's own process is stopped.
 - The transcript appears in a selectable multiline field once the engine has returned text. Text is shown even when the outcome is an error or a review, so a partial result is readable; only a usable transcript enables **Copy transcript**.
 - **Copy transcript** copies the text that is shown. Nothing is pasted automatically: put the text where you want it yourself.
@@ -72,7 +74,9 @@ Everything is under the plugin data directory, normally `~/.local/state/noctalia
 ```
 setup.json                                  recorded setup: paths, sizes, hashes, engine flags
 setup-summary.json                          outcome of the last verification
+current-job                                 the job this plugin currently owns
 jobs/<jobId>.cancel                         cancellation request, while a job is running
+jobs/<jobId>/heartbeat.json                 rewritten while the helper runs, so a dead helper is noticed
 jobs/<jobId>/summary.json                   outcome the panel reads
 jobs/<jobId>/attempt-1/argv.json            the exact argument vector, as a list
 jobs/<jobId>/attempt-1/input-list.txt       the engine's --batch input list
@@ -94,7 +98,7 @@ Each job ends in exactly one outcome. The plugin never reports success for text 
 | `truncated` | The engine's result said the audio was truncated. The partial text is kept. |
 | `unknown_token` | The transcript contains a control token such as `<\|endoftext\|>`. The text is kept for review. |
 | `empty` | The engine completed but produced no text. |
-| `malformed_row` | The engine's JSONL output could not be parsed. |
+| `malformed_row` | The engine's JSONL output could not be parsed, or a result field was not a string. |
 | `missing_result` | The engine wrote no result row. |
 | `per_file_error` | The engine reported a per-file error. |
 | `nonzero_exit` | The engine exited with a nonzero status and no result. |
@@ -105,8 +109,7 @@ Each job ends in exactly one outcome. The plugin never reports success for text 
 | `engine_unavailable` | The engine could not be started, or running it to check its flags failed. |
 | `setup_required` | The executable or the model is missing or not executable. |
 | `invalid_threads` | The thread count is outside 1–64. |
-| `internal` | The helper failed, or the plugin could not start it. |
-| `interrupted` | A plugin reload replaced the controller while the job was still running. The job's files are kept. |
+| `internal` | The helper failed, the plugin could not start it, or it stopped reporting. |
 
 Nothing is repaired automatically: an incompatible engine or a malformed recording is reported as it is, with the class of problem named. A failed run also carries the last lines the engine wrote to standard error, so a model the engine cannot load is reported with the engine's own reason rather than a bare exit status.
 
@@ -136,6 +139,7 @@ The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callba
 - Recognition only. Recording audio and pasting the result into the focused window are later work; nothing is pasted for you.
 - CPU only: the engine is always called with `--backend cpu`.
 - One job at a time, and no queue.
+- Adopting the running job after a reload restarts its elapsed timer, because the plugin's clock does not survive a reload. The job id, its files and **Cancel** are unaffected.
 - Only 16 kHz mono signed-16-bit WAV is accepted, and no resampling is attempted.
 - Stale setup detection compares each recorded file's path and size, so a replacement that keeps the same size is only reported by the run that fails on it.
 
@@ -147,9 +151,9 @@ Run the behavior check from this directory:
 ./selftest.sh
 ```
 
-It uses a fake engine and generated WAV fixtures to check the argument vector, thread limits and niceness, the helper's outcomes (including `engine_unavailable` and `internal`), the log excerpt a failing run carries, the watchdog, cancellation before and during a job, file permissions, and that the imported recording is left untouched. If `luau-compile` is on `PATH` it also compiles every entry script.
+It uses a fake engine and generated WAV fixtures to check the argument vector, thread limits and niceness, the helper's outcomes (including `engine_unavailable` and `internal`), the log excerpt a failing run carries, the watchdog, cancellation before and during a job, file permissions, the heartbeat it rewrites while the engine runs, result rows whose fields have the wrong type, and that the imported recording is left untouched. If `luau-compile` is on `PATH` it also compiles every entry script.
 
-The controller, panel and widget are exercised through a disposable Luau harness with a stubbed `noctalia`/`ui` API during development: one-job-at-a-time, cancel routing, copy gating, the `interrupted` reload path and the widget glyph per state. That harness is scratch tooling and is not part of this repository, so `./selftest.sh` alone only compiles those three files.
+The controller, panel and widget are exercised through a disposable Luau harness with a stubbed `noctalia`/`ui` API during development: one-job-at-a-time, cancel routing, copy gating, adopting the running job after a reload, giving up on a helper that stopped reporting, refusing storage it cannot write, and the widget glyph per state. That harness is scratch tooling and is not part of this repository, so `./selftest.sh` alone only compiles those three files.
 
 ## Updating the plugin
 

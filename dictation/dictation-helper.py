@@ -36,6 +36,7 @@ REQUIRED_FLAGS = (
 )
 
 DEFAULT_TIMEOUT_SECONDS = 1800  # the 30-minute inference watchdog lives here
+HEARTBEAT_SECONDS = 5  # how often the helper tells the plugin it is still alive
 NICE = 10
 CONTROL_TOKEN = re.compile(r"<\|[^|>]*\|>")
 TRUNCATION_MARK = "truncat"
@@ -120,6 +121,15 @@ def log_tail(path, limit=240):
 
 def safe_id(value):
     return SAFE_ID.sub("_", str(value))[:120] or "job"
+
+
+def write_heartbeat(path):
+    """Tell the plugin this helper is still alive, for as long as it is."""
+    try:
+        private_write(path, json.dumps({"ts": int(time.time()), "pid": os.getpid()}) + "\n")
+    except OSError:
+        # Losing the heartbeat only shortens how long a stuck plugin waits.
+        pass
 
 
 def probe_flags(engine):
@@ -223,9 +233,12 @@ def command_run(args):
     if args.wav != "":
         args.wav = os.path.abspath(args.wav)
     args.data_dir = os.path.abspath(args.data_dir)
-    SUMMARY_PATH = os.path.join(
-        args.data_dir, "jobs", safe_id(args.job_id), "summary.json"
-    )
+    job_dir = private_dir(os.path.join(args.data_dir, "jobs", safe_id(args.job_id)))
+    SUMMARY_PATH = os.path.join(job_dir, "summary.json")
+    # The plugin watches this file, so a helper that dies is noticed in seconds
+    # instead of waiting out the inference stall guard.
+    heartbeat_path = os.path.join(job_dir, "heartbeat.json")
+    write_heartbeat(heartbeat_path)
     if args.threads < 1 or args.threads > 64:
         verdict("invalid_threads", "error", "Setup required: the inference thread count must be between 1 and 64.")
         return
@@ -251,7 +264,7 @@ def command_run(args):
     if wav_problem:
         verdict("invalid_wav", "error", wav_problem, wav=args.wav)
         return
-    transcribe(args)
+    transcribe(args, heartbeat_path)
 
 
 def terminate(proc):
@@ -263,7 +276,7 @@ def terminate(proc):
         proc.wait()
 
 
-def transcribe(args):
+def transcribe(args, heartbeat_path):
     private_dir(args.data_dir)
     jobs_dir = private_dir(os.path.join(args.data_dir, "jobs"))
     job_name = safe_id(args.job_id)
@@ -330,6 +343,7 @@ def transcribe(args):
         else:
             failure = None
             deadline = time.monotonic() + args.timeout
+            last_beat = time.monotonic()
             while True:
                 code = proc.poll()
                 if code is not None:
@@ -342,6 +356,9 @@ def transcribe(args):
                     killed = "timeout"
                     terminate(proc)
                     break
+                if time.monotonic() - last_beat >= HEARTBEAT_SECONDS:
+                    write_heartbeat(heartbeat_path)
+                    last_beat = time.monotonic()
                 time.sleep(0.25)
             exit_code = proc.wait()
     # A cancel that raced the engine's own exit is still this job's request, so the
@@ -419,6 +436,22 @@ def write_result(result):
     private_write(result["paths"]["result"], json.dumps(result, indent=2) + "\n")
 
 
+def row_problem(row):
+    """The engine's result schema: a string file, and string text and error fields.
+
+    A field of the wrong type is the engine misbehaving, not text to copy: a table
+    or a number here would otherwise reach the user as a stringified structure.
+    """
+    if "file" not in row:
+        return "the row has no file field"
+    if not isinstance(row["file"], str):
+        return "the file field is not a string"
+    for field in ("text", "error"):
+        if field in row and row[field] is not None and not isinstance(row[field], str):
+            return "the %s field is not a string" % field
+    return None
+
+
 def parse_jsonl(raw, wav):
     malformed = []
     rows = []
@@ -428,17 +461,18 @@ def parse_jsonl(raw, wav):
         try:
             row = json.loads(line)
         except ValueError:
-            malformed.append(number)
+            malformed.append((number, "the line is not valid JSON"))
             continue
         if not isinstance(row, dict):
-            malformed.append(number)
+            malformed.append((number, "the line is not a JSON object"))
             continue
         if row.get("type") == "batch_header":
             continue
-        if "file" in row:
-            rows.append(row)
-        else:
-            malformed.append(number)
+        problem = row_problem(row)
+        if problem:
+            malformed.append((number, problem))
+            continue
+        rows.append(row)
     result = next(
         (row for row in rows if os.path.abspath(str(row.get("file", ""))) == wav),
         None,
@@ -463,11 +497,12 @@ def classify(killed, exit_code, parsed):
     if killed == "timeout":
         return "timeout", "error", "Inference exceeded the 30-minute limit and was stopped."
     if parsed["malformed_lines"]:
+        line, reason = parsed["malformed_lines"][0]
         return (
             "malformed_row",
             "error",
-            "The engine emitted a line that is not a valid result row (line %d)."
-            % parsed["malformed_lines"][0],
+            "The engine emitted a result row the plugin cannot trust: %s (line %d)."
+            % (reason, line),
         )
     row = parsed["row"]
     if row is None:
