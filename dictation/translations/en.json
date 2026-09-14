@@ -1,0 +1,10 @@
+{
+  "settings.engine.label": "Recognition executable",
+  "settings.engine.description": "The installed recognition engine to run. It is used as it is: the plugin never rebuilds or replaces it.",
+  "settings.model.label": "Model GGUF",
+  "settings.model.description": "The GGUF model the engine loads for every recognition job.",
+  "settings.recording.label": "Recording to transcribe",
+  "settings.recording.description": "A saved 16 kHz mono signed-16-bit WAV. It is validated before inference and never modified.",
+  "settings.threads.label": "Inference threads",
+  "settings.threads.description": "Thread count passed to the engine. The OpenMP and OpenBLAS limits follow it."
+}

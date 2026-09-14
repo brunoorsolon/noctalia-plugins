@@ -14,3 +14,18 @@ deprecated = false
 plugin_api = 25
 tags = ["wallpaper", "service", "theming"]
 dependencies = ["imagemagick"]
+
+[[plugin]]
+id = "magus/dictation"
+name = "Dictation"
+version = "0.1.0"
+updated_at = 1789334575
+added_at = 1789334575
+author = "magus"
+license = "MIT"
+icon = "microphone"
+description = "Transcribes a saved 16 kHz WAV with an installed recognition engine and GGUF model."
+deprecated = false
+plugin_api = 24
+tags = ["audio", "dictation", "service", "panel"]
+dependencies = ["python3", "transcribe-cli"]
