@@ -61,6 +61,21 @@ local markerWriteFails = false
 local clipboardWriteFails = false
 local missingCommands = {}
 
+-- The shortcut setup writes into the host's own Hyprland configuration, so the
+-- stub carries the environment the lookup reads, the file the host would load, the
+-- compositor's bind table, and the ways a write or a reload can go wrong.
+local ENV = { HOME = "/home/user", XDG_CONFIG_HOME = "/home/user/.config" }
+local CONFIG_DIR = "/home/user/.config/hypr"
+local CONF_PATH = CONFIG_DIR .. "/hyprland.conf"
+local LUA_PATH = CONFIG_DIR .. "/hyprland.lua"
+local bindTable = ""
+local reloadExitCode = 0
+local reloadSilent = false
+local fixtureBinds = {}
+local bindsIgnoreConfig = false
+local configWriteFails = false
+local backupWriteFails = false
+
 local SOURCE_LIST = {
   { id = "alsa_input.internal-mic", name = "alsa_input.internal-mic", description = "Built-in Microphone" },
   { id = "alsa_input.usb-mic", name = "alsa_input.usb-mic", description = "USB Microphone" },
@@ -120,6 +135,12 @@ function noctalia.writeFile(path, contents)
   if markerWriteFails and type(path) == "string" and string.find(path, "/delivery.json", 1, true) then
     return false, "No space left on device"
   end
+  if backupWriteFails and type(path) == "string" and string.find(path, ".magus-dictation.bak", 1, true) then
+    return false, "Read-only file system"
+  end
+  if configWriteFails and (path == CONF_PATH or path == LUA_PATH) then
+    return false, "Read-only file system"
+  end
   fs[path] = contents
   return true
 end
@@ -176,6 +197,59 @@ noctalia.state = {
   end,
 }
 function noctalia.getConfig(key) return CONFIG[key] end
+function noctalia.getenv(name) return ENV[name] end
+
+-- The compositor's bind table, derived from the active configuration file the way
+-- a reload would: whatever the plugin's delimited block declares becomes a
+-- registered bind, and a fixture bind can hold the chord instead.
+local MOD_BITS = { SHIFT = 1, CAPS = 2, CTRL = 4, ALT = 8, MOD2 = 16, MOD3 = 32, SUPER = 64, META = 64, MOD4 = 64, MOD5 = 128 }
+local function chordModmask(chord)
+  local mask = 0
+  for word in chord:upper():gmatch("[%u%d]+") do
+    -- The bits are distinct, so addition is the union.
+    mask = mask + (MOD_BITS[word] or 0)
+  end
+  return mask
+end
+
+local function rebuildBinds()
+  local binds = {}
+  for _, bind in ipairs(fixtureBinds) do table.insert(binds, bind) end
+  local active = fs[LUA_PATH] ~= nil and LUA_PATH or (fs[CONF_PATH] ~= nil and CONF_PATH or nil)
+  local format = active == LUA_PATH and "lua" or "conf"
+  local content = nil
+  if not bindsIgnoreConfig then content = active and fs[active] or nil end
+  local block = type(content) == "string"
+    and content:match("magus/dictation:recording%-shortcut:begin(.-)magus/dictation:recording%-shortcut:end")
+  if block then
+    local line = block:match("(bindd[^\n]*)")
+    local mods, key, description, arg
+    if format == "lua" then
+      local chord = block:match('hl%.bind%("([^"]*)"') or ""
+      local tokens = {}
+      for token in chord:gmatch("[^%s+]+") do table.insert(tokens, token) end
+      mods, key = chord, tokens[#tokens] or ""
+      description = block:match('description%s*=%s*"([^"]*)"')
+      arg = block:match('exec_cmd%("([^"]*)"%)')
+    else
+      if line then
+        mods, key, description = line:match("bindd%s*=%s*([^,]+),%s*([^,]+),%s*([^,]+),")
+      end
+      arg = line and line:match("exec,%s*(.-)%s*$")
+      mods, key = mods and noctalia.string.trim(mods), key and noctalia.string.trim(key)
+    end
+    table.insert(binds, {
+      modmask = chordModmask(mods or ""),
+      key = key or "",
+      has_description = description ~= nil and description ~= "",
+      description = description and noctalia.string.trim(description) or "",
+      dispatcher = format == "lua" and "__lua" or "exec",
+      arg = arg or "",
+    })
+  end
+  bindTable = encode(binds)
+  decoded[bindTable] = binds
+end
 
 local sourceStdout = '{"outcome":"ok","severity":"ok","message":"Found 2 capture sources.","sources":"@sources"}'
 decoded[sourceStdout] = {
@@ -209,6 +283,22 @@ function noctalia.runAsync(argv, onResult)
   -- The compositor is asked which window is focused, and it is handed the chord:
   -- the query answers with a window, the dispatch answers with its own reply.
   if argv[1] == "hyprctl" then
+    -- Setup reads the live bind table before it writes anything, and reloads the
+    -- compositor after, so a written block has to come back as a registered bind.
+    if argv[2] == "-j" and argv[3] == "binds" then
+      if type(onResult) == "function" then
+        rebuildBinds()
+        onResult({ exitCode = 0, stdout = bindTable, stderr = "" })
+      end
+      return true
+    end
+    if argv[2] == "reload" then
+      -- A reload is answered normally, refused with a nonzero status, or accepted
+      -- without ever reporting back.
+      if reloadSilent then return true end
+      if type(onResult) == "function" then onResult({ exitCode = reloadExitCode, stdout = "ok", stderr = "" }) end
+      return true
+    end
     if argv[2] == "dispatch" then
       -- The setup probe asks for a chord with no arguments, so it is answered by
       -- the dispatcher's own argument error and sends nothing.
@@ -280,6 +370,16 @@ local function findByHandler(tree, handler)
   return nil
 end
 
+local function findText(tree, needle)
+  if type(tree) ~= "table" then return nil end
+  if tree.kind == "label" and type(tree.props.text) == "string" and string.find(tree.props.text, needle, 1, true) then return tree end
+  for _, child in ipairs(tree.children or {}) do
+    local found = findText(child, needle)
+    if found then return found end
+  end
+  return nil
+end
+
 local seq = 0
 local function command(action, extra)
   seq = seq + 1
@@ -292,10 +392,13 @@ end
 
 local function state() return stateStore["dictation"] end
 local function lastLaunch()
-  -- The focused-window query is not a job launch: it is what the last recording
-  -- start or the last delivery check leaves behind. A chord dispatch is one.
+  -- The query that reads the focused window and the reads and reloads that belong
+  -- to shortcut setup are not job launches: they are what the last recording start
+  -- or the last delivery check leaves behind. A chord dispatch is one.
   for index = #launches, 1, -1 do
-    if not (launches[index][1] == "hyprctl" and launches[index][2] == "-j") then return table.concat(launches[index], ",") end
+    local launch = launches[index]
+    local management = launch[1] == "hyprctl" and (launch[2] == "-j" or launch[2] == "reload")
+    if not management then return table.concat(launch, ",") end
   end
   return ""
 end
@@ -325,6 +428,23 @@ local function pasteLaunches()
     if argv[2] == "dispatch" and argv[4] ~= nil then count = count + 1 end
   end
   return count
+end
+
+-- Reads of the compositor's bind table. Shortcut setup makes them; delivery must
+-- not, because the paste chord's safety does not depend on which key invoke the job.
+local function bindsReads()
+  local count = 0
+  for _, argv in ipairs(launches) do
+    if argv[1] == "hyprctl" and argv[2] == "-j" and argv[3] == "binds" then count = count + 1 end
+  end
+  return count
+end
+
+local function launched(wanted)
+  for _, argv in ipairs(launches) do
+    if table.concat(argv, " ") == wanted then return true end
+  end
+  return false
 end
 
 -- The speech is never typed as keystrokes and no extra key rides along: every
@@ -742,9 +862,9 @@ mkdirFails = false
 local beforePanel = panelsOpened
 onOpen({})
 check("panel rendered", "column", lastTree.kind)
-local select = find(lastTree, "select")
-check("panel lists the microphones", 2, #select.props.options)
-check("panel marks the chosen microphone", 1, select.props.selectedIndex)
+local picker = find(lastTree, "select")
+check("panel lists the microphones", 2, #picker.props.options)
+check("panel marks the chosen microphone", 1, picker.props.selectedIndex)
 check("panel names the chosen microphone", true, find(lastTree, "label", "Recording from: USB Microphone") ~= nil)
 check("panel record enabled", true, findByHandler(lastTree, "onRecord").props.enabled)
 check("panel offers no stop while idle", nil, findByHandler(lastTree, "onStop"))
@@ -860,7 +980,10 @@ check("panel stays rendered", "column", lastTree.kind)
 -- Delivery is the only place the plugin touches the clipboard and the keyboard, so
 -- every check drives it through the interface the panel and the bar use and then
 -- reads what the runtime was really asked to do: which window was queried, whether
--- the clipboard was written, and which keys were injected.
+-- the clipboard was written, and which keys were injected. It also never asks the
+-- compositor which binding invoked the job; that question belongs to shortcut
+-- setup, and this section's read count is compared again at its end.
+local bindsBeforeDelivery = bindsReads()
 onClose()
 clipboard, clipboardMime = nil, nil
 CONFIG.delivery = "auto"
@@ -1396,9 +1519,246 @@ check("a recovered job keeps its transcript", "recovered text", state().transcri
 -- typed as keystrokes, no extra key, and no injected Return.
 check("every injection is the ordinary paste chord", true, chordOnly())
 
--- The chord's safety is a property of the mechanism, so nothing in the run may
--- ask which shortcut invoked the job. A bind table read would come back here.
-check("no launch in the run asks for the bind table", nil, string.find(launchesFrom(0), "binds", 1, true))
+-- The chord's safety is a property of the mechanism, so delivery never asks which
+-- shortcut invoked the job. Shortcut setup is the only reader of the bind table.
+check("delivery asks nothing about the bind table", bindsBeforeDelivery, bindsReads())
+
+-- ── Recording shortcut ───────────────────────────────────────────────────────
+
+-- The recording shortcut is the user's own compositor binding, so setup reads the
+-- live bind table before proposing anything, writes one delimited block in the file
+-- the host actually loads, copies that file aside first, and undoes by removing
+-- exactly that block. Every check here drives the panel's own buttons through the
+-- command channel, then reads the file and the launches the runtime really saw.
+fs[CONFIG_DIR] = "@dir"
+fixtureBinds = {}
+putFile(CONF_PATH, "# user config\nbind = SUPER, Return, exec, terminal\n")
+
+command("shortcut-refresh")
+check("a free chord is offered", "available", state().shortcut.state)
+check("a free chord is named", "Super+Alt+D", state().shortcut.chord)
+check("a free chord can be installed", true, state().shortcut.canInstall)
+check("a free chord has nothing to undo", false, state().shortcut.canRemove)
+
+-- A bind defined inside a submap only fires while that submap is active, so it
+-- does not occupy the chord in the default submap.
+fixtureBinds = { { modmask = 72, key = "D", submap = "resize", has_description = true, description = "resize mode" } }
+command("shortcut-refresh")
+check("a submap binding is not a conflict", "available", state().shortcut.state)
+fixtureBinds = {}
+
+command("shortcut-install")
+check("install reports the effective binding", "installed", state().shortcut.state)
+check("install writes the proposed chord", true, string.find(fs[CONF_PATH], "bindd = SUPER ALT, D,", 1, true) ~= nil)
+check("install invokes the controller IPC", true, string.find(fs[CONF_PATH], "noctalia msg plugin magus/dictation:controller all toggle", 1, true) ~= nil)
+check("install writes one delimited block", 1, select(2, string.gsub(fs[CONF_PATH], "magus/dictation:recording%-shortcut:begin", "")))
+check("install keeps the user's lines", true, string.find(fs[CONF_PATH], "bind = SUPER, Return, exec, terminal", 1, true) ~= nil)
+check("install writes the block above the user's lines", true, string.find(fs[CONF_PATH], "recording-shortcut:begin", 1, true) < string.find(fs[CONF_PATH], "# user config", 1, true))
+check("install backs the file up first", "# user config\nbind = SUPER, Return, exec, terminal\n", fs[CONF_PATH .. ".magus-dictation.bak"])
+check("install reloads the compositor", true, launched("hyprctl reload"))
+check("install offers undo", true, state().shortcut.canRemove)
+check("install reports the copy", true, string.find(state().shortcut.message, ".magus-dictation.bak", 1, true) ~= nil)
+
+-- A no-change retry converges: the second install writes the same file and leaves
+-- one block, not two.
+local installedOnce = fs[CONF_PATH]
+command("shortcut-install")
+check("a repeated install converges", installedOnce, fs[CONF_PATH])
+check("a repeated install adds no second block", 1, select(2, string.gsub(fs[CONF_PATH], "magus/dictation:recording%-shortcut:begin", "")))
+check("a repeated install stays installed", "installed", state().shortcut.state)
+
+-- A chord somebody else already holds is never overwritten.
+fixtureBinds = { { modmask = 72, key = "D", has_description = true, description = "my launcher" } }
+command("shortcut-refresh")
+check("an already used chord is a conflict", "conflict", state().shortcut.state)
+check("an already used chord offers no install", false, state().shortcut.canInstall)
+check("a conflict names who holds the chord", true, string.find(state().shortcut.message, "my launcher", 1, true) ~= nil)
+check("a conflict still offers undo", true, state().shortcut.canRemove)
+local beforeConflict = fs[CONF_PATH]
+command("shortcut-install")
+check("installing over a conflict writes nothing", beforeConflict, fs[CONF_PATH])
+check("installing over a conflict stays a conflict", "conflict", state().shortcut.state)
+
+fixtureBinds = {}
+command("shortcut-refresh")
+check("the installed chord is recognised as this setup's", "installed", state().shortcut.state)
+
+-- The user keeps editing after setup wrote its block. Undo takes the block and
+-- leaves everything else, including the edits made after the copy was taken.
+putFile(CONF_PATH, fs[CONF_PATH] .. "\nbind = SUPER SHIFT, Q, exit\n")
+command("shortcut-remove")
+check("undo removes the block", nil, string.find(fs[CONF_PATH], "magus/dictation:recording-shortcut:begin", 1, true))
+check("undo keeps later user edits", true, string.find(fs[CONF_PATH], "bind = SUPER SHIFT, Q, exit", 1, true) ~= nil)
+check("undo keeps the user's original lines", true, string.find(fs[CONF_PATH], "bind = SUPER, Return, exec, terminal", 1, true) ~= nil)
+check("undo does not restore the older copy over them", nil, string.find(fs[CONF_PATH], "magus/dictation", 1, true))
+check("undo restores the file exactly", "# user config\nbind = SUPER, Return, exec, terminal\n\nbind = SUPER SHIFT, Q, exit\n", fs[CONF_PATH])
+check("undo copies the current file aside", true, string.find(fs[CONF_PATH .. ".magus-dictation.bak"], "bind = SUPER SHIFT, Q, exit", 1, true) ~= nil)
+check("undo reloads the compositor", true, launched("hyprctl reload"))
+check("undo leaves the chord free", "available", state().shortcut.state)
+check("undo has nothing left to remove", false, state().shortcut.canRemove)
+
+-- A host that runs the Lua configuration never loads a hyprland.conf fragment, so
+-- the same setup writes the form that host reads, and a top-level return stays
+-- last because a Lua chunk may end there.
+fs[CONF_PATH] = nil
+putFile(LUA_PATH, "hl.config({ general = {} })\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+check("the lua configuration is found", "available", state().shortcut.state)
+check("the lua configuration is named", LUA_PATH, state().shortcut.path)
+command("shortcut-install")
+check("lua install is effective", "installed", state().shortcut.state)
+check("lua install binds through hl", true, string.find(fs[LUA_PATH], 'hl.bind("SUPER + ALT + D"', 1, true) ~= nil)
+check("lua install invokes the controller IPC", true, string.find(fs[LUA_PATH], 'exec_cmd("noctalia msg plugin magus/dictation:controller all toggle")', 1, true) ~= nil)
+check("lua install keeps the user's configuration", true, string.find(fs[LUA_PATH], "hl.config({ general = {} })", 1, true) ~= nil)
+check("lua install writes no hyprlang bind", nil, string.find(fs[LUA_PATH], "bindd =", 1, true))
+
+putFile(LUA_PATH, "local opts = {}\nreturn opts\n")
+command("shortcut-refresh")
+command("shortcut-install")
+check("the lua block precedes a top-level return", true, string.find(fs[LUA_PATH], "hl.bind", 1, true) < string.find(fs[LUA_PATH], "return opts", 1, true))
+check("the lua block is written once", 1, select(2, string.gsub(fs[LUA_PATH], "magus/dictation:recording%-shortcut:begin", "")))
+command("shortcut-remove")
+check("undo restores the short lua file", "local opts = {}\nreturn opts\n", fs[LUA_PATH])
+
+-- A write that fails leaves the configuration alone and says what to look at.
+putFile(LUA_PATH, "hl.config({})\n")
+command("shortcut-refresh")
+backupWriteFails = true
+command("shortcut-install")
+check("a failed copy writes no binding", "hl.config({})\n", fs[LUA_PATH])
+check("a failed copy is reported", "error", state().shortcut.state)
+check("a failed copy can be retried", true, state().shortcut.canInstall)
+backupWriteFails = false
+configWriteFails = true
+command("shortcut-install")
+check("a failed write leaves the configuration", "hl.config({})\n", fs[LUA_PATH])
+check("a failed write is reported", "error", state().shortcut.state)
+check("a failed write names the copy", true, string.find(state().shortcut.message, ".magus-dictation.bak", 1, true) ~= nil)
+check("a failed write can be retried", true, state().shortcut.canInstall)
+configWriteFails = false
+
+-- An undo whose copy cannot be written leaves the block in place rather than
+-- removing something it could not record first.
+command("shortcut-install")
+check("undo setup installed the block", "installed", state().shortcut.state)
+backupWriteFails = true
+command("shortcut-remove")
+check("a failed undo copy is reported", "error", state().shortcut.state)
+check("a failed undo copy leaves the block", true, string.find(fs[LUA_PATH], "recording-shortcut:begin", 1, true) ~= nil)
+check("a failed undo copy can be retried", true, state().shortcut.canRemove)
+backupWriteFails = false
+command("shortcut-remove")
+check("the retried undo removes the block", "available", state().shortcut.state)
+
+-- A binding that was written but not registered is reported truthfully, and undo is
+-- offered because the block really is on disk.
+fixtureBinds = {}
+bindsIgnoreConfig = true
+command("shortcut-install")
+check("an unregistered binding is reported", "error", state().shortcut.state)
+check("an unregistered binding is on disk", true, string.find(fs[LUA_PATH], "magus/dictation:recording-shortcut:begin", 1, true) ~= nil)
+check("an unregistered binding offers undo", true, state().shortcut.canRemove)
+check("an unregistered binding says so", true, string.find(state().shortcut.message, "did not register", 1, true) ~= nil)
+bindsIgnoreConfig = false
+command("shortcut-remove")
+check("undo clears the unregistered binding", "available", state().shortcut.state)
+check("undo leaves the rest of the file", "hl.config({})\n", fs[LUA_PATH])
+
+-- A reload that fails leaves a truthful status without a second write: the block is
+-- on disk, so undo is still the recovery action.
+putFile(LUA_PATH, "hl.config({})\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+reloadExitCode = 1
+command("shortcut-install")
+check("a failed reload is reported", "error", state().shortcut.state)
+check("a failed reload keeps the binding on disk", true, string.find(fs[LUA_PATH], "magus/dictation:recording-shortcut:begin", 1, true) ~= nil)
+check("a failed reload offers undo", true, state().shortcut.canRemove)
+check("a failed reload names the copy", true, string.find(state().shortcut.message, ".magus-dictation.bak", 1, true) ~= nil)
+reloadExitCode = 0
+command("shortcut-remove")
+check("undo clears a failed reload", "available", state().shortcut.state)
+
+-- An undo whose reload fails says the chord may still be active rather than
+-- claiming it is gone.
+fixtureBinds = {}
+command("shortcut-install")
+reloadExitCode = 1
+command("shortcut-remove")
+check("a failed undo reload is reported", "error", state().shortcut.state)
+check("a failed undo reload removed the block", nil, string.find(fs[LUA_PATH], "magus/dictation:recording%-shortcut:begin"))
+check("a failed undo reload says the chord may be active", true, string.find(state().shortcut.message, "may still be active", 1, true) ~= nil)
+reloadExitCode = 0
+command("shortcut-refresh")
+
+-- A compositor that accepts the reload and never answers must not leave the row
+-- busy forever: the wait is bounded and the row comes back with an action.
+putFile(LUA_PATH, "hl.config({})\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+reloadSilent = true
+command("shortcut-install")
+check("an unanswered reload is busy", "working", state().shortcut.state)
+clockMs = clockMs + 31000
+update()
+check("an unanswered reload is bounded", "error", state().shortcut.state)
+check("an unanswered reload comes back with a recheck", true, state().shortcut.canInstall)
+reloadSilent = false
+command("shortcut-refresh")
+check("the bounded wait recovers", "installed", state().shortcut.state)
+
+-- A block the user half-deleted by hand is neither overwritten nor claimed as
+-- removed: writing beside it would add a second binding, and stripping it would
+-- report a removal that never happened.
+putFile(LUA_PATH, "-- magus/dictation:recording-shortcut:begin\nhl.bind(\"SUPER + ALT + D\", nil)\n")
+local halfDeleted = fs[LUA_PATH]
+command("shortcut-refresh")
+check("a half-deleted block is reported", "error", state().shortcut.state)
+check("a half-deleted block is not installable", false, state().shortcut.canInstall)
+check("a half-deleted block is not removable", false, state().shortcut.canRemove)
+check("a half-deleted block names its marker", true, string.find(state().shortcut.message, "recording-shortcut:end", 1, true) ~= nil)
+command("shortcut-install")
+check("a half-deleted block is left alone on install", halfDeleted, fs[LUA_PATH])
+command("shortcut-remove")
+check("a half-deleted block is left alone on undo", halfDeleted, fs[LUA_PATH])
+
+-- The panel shows the shortcut in the ordinary native widgets and its buttons are
+-- the only way to change the binding. A host without the compositor tool keeps
+-- recording usable, so the shortcut row is a limitation and not a dead end.
+putFile(LUA_PATH, "hl.config({})\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+onOpen({})
+check("the panel names the proposed chord", true, find(lastTree, "label", "Recording shortcut (Super+Alt+D)") ~= nil)
+check("the panel offers the install action", true, findByHandler(lastTree, "onInstallShortcut") ~= nil)
+check("the panel offers the undo action", true, findByHandler(lastTree, "onRemoveShortcut") ~= nil)
+check("the panel offers a recheck", true, findByHandler(lastTree, "onCheckShortcut") ~= nil)
+check("the install action is enabled while the chord is free", true, findByHandler(lastTree, "onInstallShortcut").props.enabled)
+command("shortcut-install")
+onOpen({})
+check("the panel reports the effective binding", true, findText(lastTree, "starts and stops recording") ~= nil)
+check("the panel offers undo once installed", true, findByHandler(lastTree, "onRemoveShortcut").props.enabled)
+check("the panel stops offering the first install", nil, find(lastTree, "button", "Install shortcut"))
+command("shortcut-remove")
+missingCommands.hyprctl = true
+command("shortcut-refresh")
+check("a missing compositor tool is unsupported", "unsupported", state().shortcut.state)
+check("a missing compositor tool cannot install", false, state().shortcut.canInstall)
+check("a missing compositor tool still names a chord", "Super+Alt+D", state().shortcut.chord)
+onOpen({})
+check("the panel still offers recording", true, findByHandler(lastTree, "onRecord") ~= nil)
+check("the install action is disabled while unsupported", false, findByHandler(lastTree, "onInstallShortcut").props.enabled)
+check("the undo action is disabled while unsupported", false, findByHandler(lastTree, "onRemoveShortcut").props.enabled)
+onClose()
+missingCommands.hyprctl = nil
+
+-- With nothing to write to at all, the setup says where it looked instead of
+-- pretending it can install.
+fs[CONF_PATH], fs[LUA_PATH] = nil, nil
+command("shortcut-refresh")
+check("no configuration file is unsupported", "unsupported", state().shortcut.state)
+check("no configuration file cannot install", false, state().shortcut.canInstall)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
