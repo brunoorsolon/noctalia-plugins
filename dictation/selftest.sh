@@ -267,6 +267,29 @@ check "early cancel outcome" cancelled "$(field outcome <"$work/early-cancel.jso
 check "early cancel ran no engine" False "$([[ -d "$data/jobs/job-early-cancel/attempt-1" ]] && echo True || echo False)"
 
 # Cancel stops the owned engine and only that work.
+UNRELATED_ENGINE="$work/unrelated-engine.pid"
+printf '%s\n' "$work/good.wav" >"$work/unrelated-list.txt"
+python3 - "$engine" "$work/unrelated-list.txt" "$UNRELATED_ENGINE" <<'PY'
+import os, subprocess, sys
+engine, batch, pid_file = sys.argv[1], sys.argv[2], sys.argv[3]
+proc = subprocess.Popen(
+    [engine, "--model", "/dev/null", "--threads", "1", "--batch", batch],
+    env=dict(os.environ, FAKE_MODE="slow"),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+with open(pid_file, "w") as handle:
+    handle.write(str(proc.pid))
+PY
+unrelated_engine_state() {
+    python3 - "$UNRELATED_ENGINE" 2>/dev/null <<'PY' || echo dead
+import os, sys
+os.kill(int(open(sys.argv[1]).read()), 0)
+print("alive")
+PY
+}
+
 MODE=slow TIMEOUT=60 helper_run job-cancel >"$work/cancel.json" &
 pid=$!
 for _ in $(seq 1 100); do [[ -f "$data/jobs/job-cancel/attempt-1/engine.jsonl" ]] && break; sleep 0.1; done
@@ -276,6 +299,13 @@ wait "$pid"
 check "cancel outcome" cancelled "$(field outcome <"$work/cancel.json")"
 check "cancel copyable" False "$(field copyable <"$work/cancel.json")"
 check "cancel summary persisted" cancelled "$(field outcome <"$data/jobs/job-cancel/summary.json")"
+# Ownership is the engine this helper launched, never a process name, so an
+# unrelated recognizer the user is already running has to survive the cancel.
+check "unrelated recognizer survives cancel" alive "$(unrelated_engine_state)"
+python3 - "$UNRELATED_ENGINE" <<'PY'
+import os, signal, sys
+os.kill(int(open(sys.argv[1]).read()), signal.SIGKILL)
+PY
 
 # A retry opens a new attempt instead of overwriting the previous one.
 RECORD=; MODE=ok helper_run job-retry >/dev/null
@@ -289,13 +319,429 @@ RECORD=; MODE=ok helper_run job-persist >/dev/null
 after=$(sha256sum "$work/good.wav" | cut -d' ' -f1)
 check "original untouched" "$before" "$after"
 check "result persisted" True "$([[ -f "$data/jobs/job-persist/attempt-1/result.json" ]] && echo True || echo False)"
+check "import becomes the play target" "$WAV" "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["paths"]["recording"])' "$data/jobs/job-persist/summary.json")"
 check "transcript private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/transcript.txt")"
 check "raw jsonl private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/engine.jsonl")"
 check "engine log private" 600 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1/engine.log")"
 check "attempt dir private" 700 "$(stat -c '%a' "$data/jobs/job-persist/attempt-1")"
 
-# Luau syntax is checked when a compiler is available; the entry scripts are the
-# plugin's only untested surface otherwise.
+# ── Live recording ───────────────────────────────────────────────────────────
+
+# PipeWire is not available in every check environment, so the capture side runs
+# against fakes that behave like the real tools: pw-dump emits the structured
+# graph, pw-record writes a WAV and finalizes it on SIGINT/SIGTERM, and pw-play
+# records how it was called.
+bin="$work/bin"
+mkdir -p "$bin"
+cat >"$bin/pw-dump" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+
+mode = os.environ.get("FAKE_PWDUMP_MODE", "ok")
+if mode == "fail":
+    print("pw-dump: connect: Connection refused", file=sys.stderr)
+    sys.exit(1)
+if mode == "badjson":
+    print("pw-dump is not speaking JSON today")
+    sys.exit(0)
+if mode == "empty":
+    print(json.dumps([]))
+    sys.exit(0)
+
+
+def node(node_id, name, description, media_class="Audio/Source"):
+    return {
+        "id": node_id,
+        "type": "PipeWire:Interface:Node",
+        "info": {"props": {"media.class": media_class, "node.name": name, "node.description": description}},
+    }
+
+
+print(json.dumps([
+    node(41, "alsa_input.usb-mic", "USB Microphone"),
+    node(42, "alsa_output.hdmi", "HDMI Output", media_class="Audio/Sink"),
+    node(43, "alsa_input.loopback", "Monitor of HDMI Output"),
+    node(44, "alsa_output.hdmi.monitor", "HDMI Loopback"),
+    node(45, "alsa_input.internal-mic", "Built-in Microphone"),
+    {"id": 46, "type": "PipeWire:Interface:Client", "info": {"props": {}}},
+]))
+PY
+
+cat >"$bin/pw-record" <<'PY'
+#!/usr/bin/env python3
+"""Writes the WAV the way pw-record does, and records how it was called."""
+import json, os, signal, struct, sys, time
+
+argv = sys.argv
+mode = os.environ.get("FAKE_PWRECORD_MODE", "ok")
+
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+rate = int(flag("--rate") or 16000)
+channels = int(flag("--channels") or 1)
+if mode == "bad_rate":
+    rate = 44100
+elif mode == "bad_channels":
+    channels = 2
+path = argv[-1]
+
+record_path = os.environ.get("FAKE_PWRECORD_RECORD")
+if record_path:
+    with open(record_path, "w") as handle:
+        json.dump({
+            "argv": argv,
+            "pid": os.getpid(),
+            "own_group": os.getpgid(0) == os.getpid(),
+        }, handle)
+
+if mode == "exit_early":
+    sys.exit(1)
+
+
+def header(data_bytes):
+    block = channels * 2
+    return b"".join([
+        b"RIFF", struct.pack("<I", 36 + data_bytes), b"WAVE",
+        b"fmt ", struct.pack("<IHHIIHH", 16, 1, channels, rate, rate * block, block, 16),
+        b"data", struct.pack("<I", data_bytes),
+    ])
+
+
+handle = open(path, "wb")
+handle.write(header(0))
+handle.flush()
+
+stopping = []
+
+
+def on_signal(_number, _frame):
+    stopping.append(True)
+
+
+signal.signal(signal.SIGINT, on_signal)
+if mode == "ignore_int":
+    # Will not stop on the graceful signal, so the helper's grace runs out, the
+    # recorder is killed, and its WAV is left unfinalized.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+if mode == "ignore_signals":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGTERM, on_signal)
+
+block = b"\x00" * ((rate // 20) * channels * 2)
+frames = 0
+while not stopping:
+    if mode != "no_data":
+        handle.write(block)
+        handle.flush()
+        frames += rate // 20
+    time.sleep(0.05)
+
+handle.seek(0)
+handle.write(header(frames * channels * 2))
+handle.flush()
+handle.close()
+sys.exit(0)
+PY
+
+cat >"$bin/pw-play" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys, time
+
+record_path = os.environ.get("FAKE_PWPLAY_RECORD")
+if record_path:
+    with open(record_path, "w") as handle:
+        json.dump({"argv": sys.argv}, handle)
+mode = os.environ.get("FAKE_PWPLAY_MODE", "ok")
+if mode == "fail":
+    print("pw-play: no such device", file=sys.stderr)
+    sys.exit(1)
+if mode == "hang":
+    time.sleep(60)
+sys.exit(0)
+PY
+chmod +x "$bin/pw-dump" "$bin/pw-record" "$bin/pw-play"
+PATH="$bin:$PATH"
+
+# A PATH with python3 but none of the PipeWire tools, for the missing-tool cases.
+bare="$work/bare"
+mkdir -p "$bare"
+ln -sf "$(command -v python3)" "$bare/python3"
+# A PATH with pw-dump but no pw-record or pw-play, to tell "no microphone graph"
+# apart from "the capture tool is not installed".
+norec="$work/norec"
+mkdir -p "$norec"
+ln -sf "$(command -v python3)" "$norec/python3"
+ln -sf "$bin/pw-dump" "$norec/pw-dump"
+
+SRC=alsa_input.usb-mic
+DUMP=ok
+REC_MODE=ok
+REC_JSON=
+LEASE=60
+TIMEOUT=60
+
+# The controller, not the helper, keeps the lease fresh. These checks play that
+# part unless the case is about the lease itself.
+helper_record() { # helper_record <job-id>
+  [[ -d "$data/jobs" ]] || mkdir -p "$data/jobs"
+  python3 -c 'import json,sys,time; open(sys.argv[1],"w").write(json.dumps({"ts": time.time()}))' "$data/jobs/$1.lease"
+  FAKE_PWDUMP_MODE="$DUMP" FAKE_PWRECORD_MODE="$REC_MODE" FAKE_PWRECORD_RECORD="$REC_JSON" \
+    FAKE_MODE="$MODE" python3 "$helper" record \
+    --engine "$engine" --model "$MODEL" --threads "$THREADS" \
+    --source "${REC_SOURCE:-$SRC}" --job-id "$1" --data-dir "$data" \
+    --timeout "$TIMEOUT" --lease-seconds "$LEASE"
+}
+
+wait_for_recording() { # wait_for_recording <job-id>
+  for _ in $(seq 1 200); do
+    if [[ -f "$data/jobs/$1/status.json" ]] && grep -q '"phase": "recording"' "$data/jobs/$1/status.json"; then
+      return 0
+    fi
+    sleep 0.05
+  done
+  echo "FAIL: job $1 never reported that it was recording" >&2
+  exit 1
+}
+
+# Capture sources come from the structured graph: sinks and both kinds of monitor
+# are excluded, so no output loopback is ever offered as a microphone.
+out=$(python3 "$helper" sources --data-dir "$data")
+check "sources outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "sources persist" ok "$(field outcome <"$data/sources.json")"
+python3 - "$data/sources.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert [source["id"] for source in doc["sources"]] == ["alsa_input.internal-mic", "alsa_input.usb-mic"], doc
+assert doc["sources"][0]["description"] == "Built-in Microphone", doc
+assert doc["capturedAt"] > 0, doc
+PY
+
+out=$(FAKE_PWDUMP_MODE=empty python3 "$helper" sources --data-dir "$data" || true)
+check "no capture sources" no_sources "$(printf '%s' "$out" | field outcome)"
+out=$(FAKE_PWDUMP_MODE=fail python3 "$helper" sources --data-dir "$data" || true)
+check "unreadable graph" sources_unavailable "$(printf '%s' "$out" | field outcome)"
+out=$(FAKE_PWDUMP_MODE=badjson python3 "$helper" sources --data-dir "$data" || true)
+check "graph without JSON" sources_unavailable "$(printf '%s' "$out" | field outcome)"
+out=$(PATH="$bare" python3 "$helper" sources --data-dir "$data" || true)
+check "pw-dump missing" sources_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# Stop: the helper finalizes the WAV itself and only then runs the engine.
+REC_JSON="$work/recorder.json" helper_record job-rec >"$work/rec-ok.json" &
+pid=$!
+wait_for_recording job-rec
+printf 'stop\n' >"$data/jobs/job-rec.stop"
+printf 'stop\n' >"$data/jobs/job-rec.stop"
+wait "$pid"
+check "record outcome" ok "$(field outcome <"$work/rec-ok.json")"
+check "record summary persisted" ok "$(field outcome <"$data/jobs/job-rec/summary.json")"
+check "record transcript" "hello world" "$(cat "$data/jobs/job-rec/attempt-1/transcript.txt")"
+check "record heartbeat" True "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ts"] > 0)' "$data/jobs/job-rec/heartbeat.json")"
+check "record job record" record "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["mode"])' "$data/jobs/job-rec/job.json")"
+check "recording private" 600 "$(stat -c '%a' "$data/jobs/job-rec/recording.wav")"
+check "job dir private" 700 "$(stat -c '%a' "$data/jobs/job-rec")"
+check "duplicate stop cleared" False "$([[ -f "$data/jobs/job-rec.stop" ]] && echo True || echo False)"
+check "one attempt for one stop" False "$([[ -d "$data/jobs/job-rec/attempt-2" ]] && echo True || echo False)"
+python3 - "$work/recorder.json" "$data/jobs/job-rec/recording.wav" <<'PY'
+import json, os, sys, wave
+record = json.load(open(sys.argv[1]))
+argv, wav = record["argv"], sys.argv[2]
+assert os.path.basename(argv[0]) == "pw-record", argv
+assert argv[argv.index("--target") + 1] == "alsa_input.usb-mic", argv
+assert argv[argv.index("--rate") + 1] == "16000", argv
+assert argv[argv.index("--channels") + 1] == "1", argv
+assert argv[argv.index("--format") + 1] == "s16", argv
+assert argv[-1] == wav, argv
+assert record["own_group"], record
+with wave.open(wav, "rb") as handle:
+    assert handle.getframerate() == 16000, handle.getframerate()
+    assert handle.getnchannels() == 1, handle.getnchannels()
+    assert handle.getsampwidth() == 2, handle.getsampwidth()
+    assert handle.getnframes() > 0, handle.getnframes()
+try:
+    os.kill(record["pid"], 0)
+except ProcessLookupError:
+    pass
+else:
+    raise AssertionError("the recorder outlived the job: %r" % record)
+PY
+
+# One recorder this job never started stays alive through Cancel and controller
+# loss: ownership is the process group the helper created, never a process name,
+# so a broad pkill or a name match would be caught here.
+UNRELATED_JSON="$work/unrelated.json"
+python3 - "$UNRELATED_JSON" "$work/unrelated.wav" <<'PY'
+import os, subprocess, sys, time
+record, wav = sys.argv[1], sys.argv[2]
+subprocess.Popen(
+    ["pw-record", "--target", "alsa_input.usb-mic", "--rate", "16000",
+     "--channels", "1", "--format", "s16", wav],
+    env=dict(os.environ, FAKE_PWRECORD_RECORD=record),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+deadline = time.time() + 5
+while not os.path.exists(record) and time.time() < deadline:
+    time.sleep(0.05)
+PY
+unrelated_state() {
+    python3 - "$UNRELATED_JSON" 2>/dev/null <<'PY' || echo dead
+import json, os, sys
+os.kill(json.load(open(sys.argv[1]))["pid"], 0)
+print("alive")
+PY
+}
+
+# Cancel during capture keeps the audio and starts no recognition.
+REC_JSON= helper_record job-cancel-rec >"$work/rec-cancel.json" &
+pid=$!
+wait_for_recording job-cancel-rec
+printf 'cancel\n' >"$data/jobs/job-cancel-rec.cancel"
+wait "$pid"
+check "cancel while recording" cancelled "$(field outcome <"$work/rec-cancel.json")"
+check "cancel keeps usable audio" True "$(field usableAudio <"$work/rec-cancel.json")"
+check "cancel runs no engine" False "$([[ -d "$data/jobs/job-cancel-rec/attempt-1" ]] && echo True || echo False)"
+check "cancel request cleared" False "$([[ -f "$data/jobs/job-cancel-rec.cancel" ]] && echo True || echo False)"
+check "cancelled audio preserved" True "$(python3 -c 'import sys,wave; print(wave.open(sys.argv[1]).getnframes() > 0)' "$data/jobs/job-cancel-rec/recording.wav")"
+
+# A recorder that ignores the graceful signal is killed, and the audio it left
+# behind is reported as unusable instead of being transcribed.
+REC_MODE=ignore_signals REC_JSON="$work/killed.json" helper_record job-kill >"$work/rec-kill.json" &
+pid=$!
+wait_for_recording job-kill
+start=$(date +%s)
+printf 'cancel\n' >"$data/jobs/job-kill.cancel"
+wait "$pid"
+(( $(date +%s) - start < 30 )) || { echo "FAIL: cancel escalation was not bounded" >&2; exit 1; }
+check "cancel escalates" cancelled "$(field outcome <"$work/rec-kill.json")"
+check "unfinalized audio not usable" False "$(field usableAudio <"$work/rec-kill.json")"
+check "escalation ran no engine" False "$([[ -d "$data/jobs/job-kill/attempt-1" ]] && echo True || echo False)"
+python3 - "$work/killed.json" <<'PY'
+import json, os, sys
+record = json.load(open(sys.argv[1]))
+try:
+    os.kill(record["pid"], 0)
+except ProcessLookupError:
+    pass
+else:
+    raise AssertionError("SIGKILL never reached the recorder: %r" % record)
+PY
+check "unrelated recorder survives cancel" alive "$(unrelated_state)"
+
+# A Cancel that arrives while the WAV is being finalized wins over the Stop: the
+# recording is cancelled and no recognition is started.
+REC_MODE=ignore_int REC_JSON= helper_record job-stop-cancel >"$work/rec-stop-cancel.json" &
+pid=$!
+wait_for_recording job-stop-cancel
+printf 'stop\n' >"$data/jobs/job-stop-cancel.stop"
+sleep 0.5
+printf 'cancel\n' >"$data/jobs/job-stop-cancel.cancel"
+wait "$pid"
+check "cancel while finalizing" cancelled "$(field outcome <"$work/rec-stop-cancel.json")"
+check "cancel while finalizing reports the audio honestly" False "$(field usableAudio <"$work/rec-stop-cancel.json")"
+check "cancel while finalizing runs no engine" False "$([[ -d "$data/jobs/job-stop-cancel/attempt-1" ]] && echo True || echo False)"
+check "cancel while finalizing cleared" False "$([[ -f "$data/jobs/job-stop-cancel.cancel" ]] && echo True || echo False)"
+check "unrelated recorder survives finalizing cancel" alive "$(unrelated_state)"
+REC_MODE=ok
+
+# A controller that stops refreshing the lease releases the microphone by itself.
+LEASE=6 REC_JSON= helper_record job-lease >"$work/rec-lease.json" &
+pid=$!
+wait_for_recording job-lease
+sleep 0.3
+# The lease was fresh when the recorder started and goes stale here, which is
+# what a plugin that died or lost the job looks like from the helper side.
+python3 -c 'import json,sys,time; open(sys.argv[1],"w").write(json.dumps({"ts": time.time() - 600}))' "$data/jobs/job-lease.lease"
+wait "$pid"
+check "controller loss releases the microphone" interrupted "$(field outcome <"$work/rec-lease.json")"
+check "controller loss keeps usable audio" True "$(field usableAudio <"$work/rec-lease.json")"
+check "controller loss runs no engine" False "$([[ -d "$data/jobs/job-lease/attempt-1" ]] && echo True || echo False)"
+check "unrelated recorder survives controller loss" alive "$(unrelated_state)"
+python3 - "$UNRELATED_JSON" <<'PY'
+import json, os, signal, sys
+os.kill(json.load(open(sys.argv[1]))["pid"], signal.SIGTERM)
+PY
+
+# A microphone that is gone is a named failure; nothing is substituted for it.
+out=$(REC_SOURCE=alsa_input.gone helper_record job-gone)
+check "missing microphone" source_missing "$(printf '%s' "$out" | field outcome)"
+check "missing microphone starts no recorder" False "$([[ -f "$data/jobs/job-gone/recorder.log" ]] && echo True || echo False)"
+out=$(DUMP=fail helper_record job-nograph || true)
+check "unreadable graph blocks recording" sources_unavailable "$(printf '%s' "$out" | field outcome)"
+out=$(PATH="$norec" helper_record job-nopw || true)
+check "pw-record missing" recorder_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# A recorder that exits on its own is reported with its own status, not success.
+REC_MODE=exit_early
+out=$(REC_JSON= helper_record job-died)
+check "recorder stopped on its own" recorder_failed "$(printf '%s' "$out" | field outcome)"
+REC_MODE=ok
+
+# Audio the microphone never produced is rejected before any recognition.
+for mode in bad_rate bad_channels no_data; do
+  REC_MODE="$mode" helper_record "job-wav-$mode" >"$work/rec-$mode.json" &
+  pid=$!
+  wait_for_recording "job-wav-$mode"
+  printf 'stop\n' >"$data/jobs/job-wav-$mode.stop"
+  wait "$pid"
+  check "recording $mode" invalid_recording "$(field outcome <"$work/rec-$mode.json")"
+  check "recording $mode runs no engine" False "$([[ -d "$data/jobs/job-wav-$mode/attempt-1" ]] && echo True || echo False)"
+  check "recording $mode kept" True "$([[ -f "$data/jobs/job-wav-$mode/recording.wav" ]] && echo True || echo False)"
+done
+REC_MODE=ok
+
+# Playback goes through the helper, plays the saved file and touches no clipboard.
+out=$(FAKE_PWPLAY_RECORD="$work/play.json" python3 "$helper" play --wav "$data/jobs/job-rec/recording.wav")
+check "playback outcome" ok "$(printf '%s' "$out" | field outcome)"
+python3 - "$work/play.json" "$data/jobs/job-rec/recording.wav" <<'PY'
+import json, os, sys
+argv = json.load(open(sys.argv[1]))["argv"]
+assert os.path.basename(argv[0]) == "pw-play", argv
+assert argv[1] == sys.argv[2], argv
+PY
+out=$(FAKE_PWPLAY_MODE=fail python3 "$helper" play --wav "$data/jobs/job-rec/recording.wav" || true)
+check "playback failure" playback_failed "$(printf '%s' "$out" | field outcome)"
+out=$(python3 "$helper" play --wav "$work/absent.wav" || true)
+check "playback without a recording" missing_recording "$(printf '%s' "$out" | field outcome)"
+out=$(PATH="$bare" python3 "$helper" play --wav "$data/jobs/job-rec/recording.wav" || true)
+check "pw-play missing" playback_unavailable "$(printf '%s' "$out" | field outcome)"
+
+# The controller drives this helper, so the options and subcommands it passes
+# must be the ones the helper actually defines. Without this, the two sides can
+# drift apart and their separate checks still pass.
+python3 - "$helper" controller.luau <<'PY'
+import re, subprocess, sys
+
+helper, controller = sys.argv[1], sys.argv[2]
+defined = set()
+for command in ("probe", "sources", "record", "run", "play"):
+    usage = subprocess.run(["python3", helper, command, "--help"], stdout=subprocess.PIPE).stdout.decode()
+    defined.update(re.findall(r"--[a-z][a-z-]*", usage))
+source = open(controller).read()
+passed = set(re.findall(r'"(--[a-z][a-z-]*)"', source))
+commands = set(re.findall(r'HELPER,\s*"([a-z]+)"', source))
+assert commands, "no helper command found in controller.luau"
+unknown = sorted(commands - {"probe", "sources", "record", "run", "play"})
+assert not unknown, "controller runs unknown helper commands: %r" % unknown
+assert {"record", "sources", "run", "play"} <= commands, sorted(commands)
+missing = sorted(passed - defined)
+assert not missing, "controller passes options the helper does not define: %r" % missing
+assert passed, "no helper option found in controller.luau"
+PY
+
+# Recording and playback must never paste: no entry drives a clipboard writer, and
+# only the panel's explicit Copy button touches the clipboard at all.
+check "helper pastes nothing" False \
+  "$(grep -qE 'wl-copy|xclip|xsel|wl-paste|wtype|ydotool|dotool' "$helper" && echo True || echo False)"
+for entry in controller widget; do
+  check "$entry touches no clipboard" False "$(grep -q 'copyToClipboard' "$entry.luau" && echo True || echo False)"
+done
+check "panel copy is explicit" True "$(grep -q 'copyToClipboard' panel.luau && echo True || echo False)"
+
 if command -v luau-compile >/dev/null 2>&1; then
   for script in ./*.luau; do
     luau-compile --binary "$script" >/dev/null || { echo "FAIL: $script does not compile" >&2; exit 1; }
