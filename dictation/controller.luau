@@ -37,6 +37,7 @@ local S = {
 
 local summaryPath = nil
 local activityStartedAtMs = 0
+local silenceReported = false
 
 local function publish()
   noctalia.state.set("dictation", S)
@@ -122,6 +123,7 @@ end
 local function resetActivity()
   S.activity = "idle"
   summaryPath = nil
+  silenceReported = false
   if JOB_POINTER then noctalia.removeFile(JOB_POINTER) end
 end
 
@@ -350,16 +352,35 @@ local function stopWaiting()
   return true
 end
 
+-- Silence is not an exit. The engine may still be running, so reporting the lost
+-- contact must not release the job: a second import would overlap the first, and
+-- Cancel would lose its target. Ownership is handed back only when the helper
+-- reports an outcome, or when the stall window beyond its own 30-minute watchdog
+-- proves the engine had to be stopped even with no report.
+local function reportSilence()
+  if silenceReported then return end
+  silenceReported = true
+  S.outcome = "internal"
+  S.severity = "error"
+  S.message = "Lost contact with the recognition helper. The job is still owned: Cancel stops it, and another import waits until it exits."
+  publish()
+  noctalia.notifyError("Dictation", S.message)
+end
+
 function update()
   if S.activity == "idle" then return end
   local path = summaryPath
   local summary = path and noctalia.fileExists(path) and readSummary(path) or nil
   if not summary then
-    if helperSilent() then
-      fail("The recognition helper stopped reporting, so the job is no longer tracked. Its files stay in the plugin data directory.", "internal")
-      return
-    end
     if stopWaiting() then return end
+    if helperSilent() then
+      reportSilence()
+    elseif silenceReported then
+      -- Contact resumed before any result: the job is live again, so stop
+      -- showing the lost-contact error.
+      silenceReported = false
+      S.outcome, S.severity, S.message = nil, nil, "Transcribing."
+    end
     if S.activity == "running" and S.job then
       S.job.elapsedSeconds = math.floor((noctalia.nowMs() - S.job.startedAtMs) / 1000)
       publish()

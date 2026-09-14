@@ -61,7 +61,7 @@ noctalia msg panel-toggle magus/dictation:panel
 
 - **Transcribe** imports the selected recording as one job. Only one job runs at a time, and the buttons stay responsive while it runs — the elapsed time keeps counting.
 - The plugin writes the id of the running job to disk and reads it back when it starts, so reloading or updating the plugin adopts the job that is already running instead of forgetting it: **Cancel** keeps addressing that job, and another import is refused until it ends.
-- The helper rewrites a heartbeat while it runs. If it stops reporting for a minute — a crash, a killed process, a full disk — the job is reported as no longer tracked instead of staying on screen as live work, and its files stay in the plugin data directory.
+- The helper rewrites a heartbeat while it runs. If it stops reporting for a minute — a crash, a killed process, a full disk — the panel says contact was lost and keeps the job owned, so **Cancel** still reaches it and another import is refused. The job is released once the helper reports, or after the window beyond the helper's own 30-minute watchdog has passed; its files stay in the plugin data directory.
 - **Cancel** asks the helper to stop the engine this job started. If no engine has started yet, the cancel is honoured anyway instead of being discarded. Only this plugin's own process is stopped.
 - The transcript appears in a selectable multiline field once the engine has returned text. Text is shown even when the outcome is an error or a review, so a partial result is readable; only a usable transcript enables **Copy transcript**.
 - **Copy transcript** copies the text that is shown. Nothing is pasted automatically: put the text where you want it yourself.
@@ -76,7 +76,7 @@ setup.json                                  recorded setup: paths, sizes, hashes
 setup-summary.json                          outcome of the last verification
 current-job                                 the job this plugin currently owns
 jobs/<jobId>.cancel                         cancellation request, while a job is running
-jobs/<jobId>/heartbeat.json                 rewritten while the helper runs, so a dead helper is noticed
+jobs/<jobId>/heartbeat.json                 rewritten while the helper runs, so lost contact is noticed
 jobs/<jobId>/summary.json                   outcome the panel reads
 jobs/<jobId>/attempt-1/argv.json            the exact argument vector, as a list
 jobs/<jobId>/attempt-1/input-list.txt       the engine's --batch input list
@@ -153,7 +153,7 @@ Run the behavior check from this directory:
 
 It uses a fake engine and generated WAV fixtures to check the argument vector, thread limits and niceness, the helper's outcomes (including `engine_unavailable` and `internal`), the log excerpt a failing run carries, the watchdog, cancellation before and during a job, file permissions, the heartbeat it rewrites while the engine runs, result rows whose fields have the wrong type, and that the imported recording is left untouched. If `luau-compile` is on `PATH` it also compiles every entry script.
 
-The controller, panel and widget are exercised through a disposable Luau harness with a stubbed `noctalia`/`ui` API during development: one-job-at-a-time, cancel routing, copy gating, adopting the running job after a reload, giving up on a helper that stopped reporting, refusing storage it cannot write, and the widget glyph per state. That harness is scratch tooling and is not part of this repository, so `./selftest.sh` alone only compiles those three files.
+The controller, panel and widget are exercised through a disposable Luau harness with a stubbed `noctalia`/`ui` API during development: one-job-at-a-time, cancel routing, copy gating, adopting the running job after a reload, keeping the job owned when a helper stops reporting, refusing storage it cannot write, and the widget glyph per state. That harness is scratch tooling and is not part of this repository, so `./selftest.sh` alone only compiles those three files.
 
 ## Updating the plugin
 

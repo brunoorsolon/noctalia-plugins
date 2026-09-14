@@ -13,7 +13,16 @@ local function render()
   local s = noctalia.state.get("dictation")
   local activity = type(s) == "table" and s.activity or "idle"
   local severity = type(s) == "table" and s.severity or nil
-  local status = activity ~= "idle" and STATUS[activity] or (severity and STATUS[severity]) or nil
+  local status
+  if activity == "running" and severity == "error" then
+    -- The job is still owned but its helper stopped reporting: show the error,
+    -- not a spinner, because nothing is confirmed to be progressing.
+    status = STATUS.error
+  elseif activity ~= "idle" then
+    status = STATUS[activity]
+  else
+    status = severity and STATUS[severity] or nil
+  end
 
   barWidget.setGlyph(status and status.glyph or "microphone")
   barWidget.setText("")

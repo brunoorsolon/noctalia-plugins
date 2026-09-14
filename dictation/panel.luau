@@ -37,6 +37,11 @@ end
 
 local function statusText(s)
   if s.activity == "running" then
+    -- A job whose helper went silent is still owned, so the panel reports the
+    -- lost contact instead of claiming the inference is progressing normally.
+    if s.severity == "error" and type(s.message) == "string" and s.message ~= "" then
+      return s.message
+    end
     local elapsed = 0
     local job = s.job
     if type(job) == "table" and type(job.elapsedSeconds) == "number" then
