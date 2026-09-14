@@ -529,15 +529,16 @@ local function shortcutOccupants(binds)
       local universal = bind.submap_universal == true or bind.submap_universal == "true"
       if bind.submap == nil or bind.submap == "" or universal then
         local key = type(bind.key) == "string" and string.upper(bind.key) or ""
-        -- A keycode bind's keycode is positional for the compositor's own keymap,
-        -- which the bind table does not report: on a Dvorak layout the D keysym
-        -- sits on a different keycode than on QWERTY. Which keycode a bind needs
-        -- cannot be resolved from here, so every nameless bind on the chord's
-        -- modifiers is treated as an occupant — refusing installation, never
-        -- overwriting.
-        local keycode = key == "" and type(bind.keycode) == "number" and bind.keycode ~= 0
+        -- A nameless bind is an occupant whatever its reported keycode, and
+        -- refusing it costs nothing but an install. The key it presses cannot be
+        -- established from here: the keycode is positional for the compositor's
+        -- own keymap, which the bind table does not report (a Dvorak layout puts
+        -- the D keysym on a different keycode than QWERTY), and a Lua numeric
+        -- chord like code:40 never fills the legacy keycode at all — it lives in
+        -- the multi-key list, while the bind table reports key "" and keycode 0.
+        local nameless = key == ""
         local catchall = bind.catch_all == true or bind.catch_all == "true"
-        if key == SHORTCUT_KEY or keycode or catchall then
+        if key == SHORTCUT_KEY or nameless or catchall then
           table.insert(found, bind)
         end
       end

@@ -1602,6 +1602,16 @@ fixtureBinds = { { modmask = 72, key = "", keycode = 43, dispatcher = "exec", ar
 command("shortcut-refresh")
 check("a keycode bind on another layout is still a conflict", "conflict", state().shortcut.state)
 
+-- A Lua chord written as a numeric key never fills the legacy keycode field: the
+-- key lives in the multi-key list, so the bind table reports key "" and keycode
+-- 0 with a reference number in arg. It is just as unresolvable as a keycode bind.
+fixtureBinds = { { modmask = 72, key = "", keycode = 0, submap = "", dispatcher = "__lua", arg = "42", catch_all = false } }
+command("shortcut-refresh")
+check("a Lua numeric-key bind of the chord is a conflict", "conflict", state().shortcut.state)
+local beforeLuaNumeric = fs[LUA_PATH]
+command("shortcut-install")
+check("a Lua numeric-key conflict writes nothing", beforeLuaNumeric, fs[LUA_PATH])
+
 -- A catchall bind runs on every key in the default submap, so it holds this chord
 -- too, and the compositor would run both bindings on one press.
 fixtureBinds = { { modmask = 72, key = "", catch_all = "true", dispatcher = "exec", arg = "existing-launcher" } }
