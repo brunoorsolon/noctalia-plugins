@@ -71,6 +71,8 @@ local LUA_PATH = CONFIG_DIR .. "/hyprland.lua"
 local bindTable = ""
 local reloadExitCode = 0
 local reloadSilent = false
+local bindsSilent = false
+local duringBindsQuery = nil
 local fixtureBinds = {}
 local bindsIgnoreConfig = false
 local configWriteFails = false
@@ -287,8 +289,17 @@ function noctalia.runAsync(argv, onResult)
     -- compositor after, so a written block has to come back as a registered bind.
     if argv[2] == "-j" and argv[3] == "binds" then
       if type(onResult) == "function" then
-        rebuildBinds()
-        onResult({ exitCode = 0, stdout = bindTable, stderr = "" })
+        -- One test edits the configuration while the compositor is answering, and
+        -- one accepts the query without ever reporting back.
+        if duringBindsQuery then
+          local hook = duringBindsQuery
+          duringBindsQuery = nil
+          hook()
+        end
+        if not bindsSilent then
+          rebuildBinds()
+          onResult({ exitCode = 0, stdout = bindTable, stderr = "" })
+        end
       end
       return true
     end
@@ -1707,6 +1718,44 @@ check("an unanswered reload comes back with a recheck", true, state().shortcut.c
 reloadSilent = false
 command("shortcut-refresh")
 check("the bounded wait recovers", "installed", state().shortcut.state)
+
+-- A bind query that never answers is bounded too, so the row cannot stay busy.
+bindsSilent = true
+command("shortcut-refresh")
+check("an unanswered check is busy", "working", state().shortcut.state)
+clockMs = clockMs + 31000
+update()
+check("an unanswered check is bounded", "error", state().shortcut.state)
+check("an unanswered check comes back with a recheck", true, state().shortcut.canInstall)
+bindsSilent = false
+command("shortcut-refresh")
+
+-- An edit made while the compositor is answering is not written over: the file is
+-- read again after the answer.
+putFile(LUA_PATH, "hl.config({})\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+duringBindsQuery = function() putFile(LUA_PATH, "hl.config({})\n-- user edit during the query\n") end
+command("shortcut-install")
+duringBindsQuery = nil
+check("an edit during the query survives install", true, string.find(fs[LUA_PATH], "user edit during the query", 1, true) ~= nil)
+check("an edit during the query still gets the binding", true, string.find(fs[LUA_PATH], "magus/dictation:recording-shortcut:begin", 1, true) ~= nil)
+command("shortcut-remove")
+check("undo clears an install beside a concurrent edit", "available", state().shortcut.state)
+
+-- A bind that only shares this setup's wording is somebody else's until the block
+-- on disk says otherwise, so it is refused instead of claimed as this setup's.
+fixtureBinds = { {
+  modmask = 72, key = "D", has_description = true,
+  description = "Dictation: start or stop recording", dispatcher = "exec", arg = "their-own-dictation-script",
+} }
+command("shortcut-refresh")
+check("a foreign binding that shares the wording is a conflict", "conflict", state().shortcut.state)
+command("shortcut-install")
+check("a foreign binding that shares the wording is not written", nil, string.find(fs[LUA_PATH], "recording-shortcut:begin", 1, true))
+check("a foreign binding that shares the wording names who holds it", true, string.find(state().shortcut.message, "their-own-dictation-script", 1, true) ~= nil)
+fixtureBinds = {}
+command("shortcut-refresh")
 
 -- A block the user half-deleted by hand is neither overwritten nor claimed as
 -- removed: writing beside it would add a second binding, and stripping it would

@@ -432,19 +432,26 @@ local function occupyingBind(binds)
   return nil
 end
 
-local function bindIsOurs(bind)
+local function bindIsOurs(bind, installed)
   if type(bind) ~= "table" then return false end
-  if bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
+  -- The block on disk is what proves a matching description is this setup's, so a
+  -- bind that only shares the wording is somebody else's and is refused, not claimed.
+  if installed and bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
   return type(bind.arg) == "string" and string.find(bind.arg, SHORTCUT_COMMAND, 1, true) ~= nil
 end
 
 local function bindLabel(bind)
   if type(bind) ~= "table" then return "another binding" end
-  if type(bind.description) == "string" and bind.description ~= "" then return bind.description end
+  local description = type(bind.description) == "string" and bind.description or ""
   local dispatcher = type(bind.dispatcher) == "string" and bind.dispatcher or ""
   local arg = type(bind.arg) == "string" and bind.arg or ""
-  local text = noctalia.string.trim(dispatcher .. " " .. arg)
-  return text ~= "" and text or "another binding"
+  -- A Lua bind reports a reference number in place of the command, so only a real
+  -- dispatcher string is named beside the description.
+  local command = (dispatcher ~= "" and dispatcher ~= "__lua") and noctalia.string.trim(dispatcher .. " " .. arg) or ""
+  if description ~= "" and command ~= "" then return description .. " (" .. command .. ")" end
+  if description ~= "" then return description end
+  if command ~= "" then return command end
+  return "another binding"
 end
 
 local shortcutPendingAtMs = nil
@@ -481,7 +488,7 @@ end
 -- anything else is free to install.
 local function applyShortcutStatus(path, format, installed, binds)
   local occupying = occupyingBind(binds)
-  if occupying and not bindIsOurs(occupying) then
+  if occupying and not bindIsOurs(occupying, installed) then
     setShortcut("conflict", {
       path = path, format = format, installed = installed, canRemove = installed,
       message = string.format("%s is already bound to %s, so nothing was changed. Free that chord in %s, then check again.",
@@ -528,6 +535,10 @@ local function refreshShortcut()
     return
   end
   local installed = block == "complete"
+  setShortcut("working", {
+    path = path, format = format, installed = installed, canInstall = not installed,
+    message = "Checking what the compositor holds for " .. SHORTCUT_CHORD .. ".",
+  })
   queryBinds(function(binds, reason)
     if not binds then
       setShortcut("error", { path = path, format = format, installed = installed, canRemove = installed, message = reason })
@@ -552,7 +563,7 @@ local function confirmInstalledShortcut(path, backup)
       return
     end
     local occupying = occupyingBind(binds)
-    if occupying and bindIsOurs(occupying) then
+    if occupying and bindIsOurs(occupying, true) then
       setShortcut("installed", {
         path = path, installed = true, canInstall = true, canRemove = true,
         message = string.format("%s now starts and stops recording while another window is focused. The backup is %s; Undo removes the block.", SHORTCUT_CHORD, backup),
@@ -568,7 +579,24 @@ local function confirmInstalledShortcut(path, backup)
   end)
 end
 
-local function writeShortcut(path, format, content)
+local function writeShortcut(path, format)
+  -- The file is read again here, after the bind query answered, so an edit made
+  -- while the compositor was answering is not written over.
+  local content = noctalia.readFile(path)
+  local block = shortcutBlockState(content)
+  if block == "broken" then
+    setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  if type(content) ~= "string" then
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "The Hyprland configuration could not be read: " .. path,
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
   local backup = path .. ".magus-dictation.bak"
   if not noctalia.writeFile(backup, content) then
     setShortcut("error", {
@@ -637,12 +665,12 @@ local function installShortcut()
       return
     end
     local occupying = occupyingBind(binds)
-    if occupying and not bindIsOurs(occupying) then
+    if occupying and not bindIsOurs(occupying, installed) then
       applyShortcutStatus(path, format, installed, binds)
       noctalia.notifyError("Dictation", S.shortcut.message)
       return
     end
-    writeShortcut(path, format, content)
+    writeShortcut(path, format)
   end)
 end
 
