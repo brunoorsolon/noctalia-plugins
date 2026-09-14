@@ -52,6 +52,8 @@ local availability = "ok"
 -- virtual keyboard.
 local activeWindow = nil
 local activeWindowExitCode = 0
+local bindsAnswer = nil
+local bindsExitCode = 0
 local pasteExitCode = 0
 local pasteStartRefused = false
 local pasteSilent = false
@@ -201,14 +203,33 @@ end
 putActiveWindow("0x1", "TextEditor", "notes.txt")
 local EDITOR = activeWindow
 
+-- The compositor's bind table. The stub decodes by lookup, so the bind table is
+-- registered the way a durable file is. Automatic paste is gated on a
+-- release-triggered dictation shortcut, so the table can report a press bind too.
+local function putBinds(binds)
+  bindsAnswer = encode(binds)
+  decoded[bindsAnswer] = binds
+end
+putBinds({
+  { release = false, modmask = 64, key = "P", dispatcher = "exec", arg = "noctalia msg panel-toggle magus/dictation:panel" },
+  { release = true, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" },
+  { release = false, modmask = 0, key = "XF86AudioMicMute", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all stop" },
+})
+-- The same shortcut as a press bind, for the release gate.
+local PRESS_BIND = { release = false, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" }
+local RELEASE_BIND = { release = true, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" }
+
 -- Every helper invocation and every key injection the controller makes, in order.
 function noctalia.runAsync(argv, onResult)
   table.insert(launches, argv)
   -- The compositor is asked which window is focused; the answer is what the
   -- controller is allowed to paste into.
   if argv[1] == "hyprctl" then
+    local forBinds = argv[3] == "binds"
+    local exitCode = forBinds and bindsExitCode or activeWindowExitCode
+    local stdout = forBinds and bindsAnswer or activeWindow
     if type(onResult) == "function" then
-      onResult({ exitCode = activeWindowExitCode, stdout = activeWindowExitCode == 0 and activeWindow or "", stderr = "" })
+      onResult({ exitCode = exitCode, stdout = exitCode == 0 and stdout or "", stderr = "" })
     end
     return true
   end
@@ -1065,6 +1086,54 @@ check("an unrecordable attempt says why", true, string.find(state().delivery.mes
 check("an unrecordable attempt is notified", "error", notifications[#notifications].kind)
 check("an unrecordable attempt leaves no marker", nil, fs[jobDir(unwritableJob) .. "/delivery.json"])
 markerWriteFails = false
+
+-- Automatic paste is release-gated: the compositor dispatches a `bindr` command
+-- when the shortcut key is released, so a press-triggered dictation shortcut has
+-- no observed release and is held instead of pasted into.
+putBinds({ PRESS_BIND })
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local pressJob = state().job.id
+finishSummary(pressJob, "ok", "ok", "Transcription complete.", { transcript = "press text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforePress = pasteLaunches()
+update()
+check("a press-triggered shortcut is held", "held", state().delivery.state)
+check("a press-triggered shortcut sends no keys", beforePress, pasteLaunches())
+check("a press-triggered shortcut copies nothing", nil, clipboard)
+check("the release gate names the bind to add", true, string.find(state().delivery.message, "bindr") ~= nil)
+check("a gated attempt writes no marker", nil, fs[jobDir(pressJob) .. "/delivery.json"])
+
+-- A bind table the compositor cannot report is a hold, not a guess.
+bindsExitCode = 1
+clipboard = nil
+onWidgetRecord()
+local unreadableBindsJob = state().job.id
+finishSummary(unreadableBindsJob, "ok", "ok", "Transcription complete.", { transcript = "unreadable text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeUnreadable = pasteLaunches()
+update()
+check("an unreadable bind table is held", "held", state().delivery.state)
+check("an unreadable bind table sends no keys", beforeUnreadable, pasteLaunches())
+check("an unreadable bind table says why", true, string.find(state().delivery.message, "keybinds") ~= nil)
+bindsExitCode = 0
+
+-- The release bind is what allows the automatic route at all.
+putBinds({ RELEASE_BIND })
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local releasedJob = state().job.id
+finishSummary(releasedJob, "ok", "ok", "Transcription complete.", { transcript = "released text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeReleased = pasteLaunches()
+update()
+check("a release-triggered shortcut pastes", beforeReleased + 1, pasteLaunches())
+check("the released shortcut carries its transcript", "released text", clipboard)
 
 -- A paste tool that accepts the chord and never reports back must not leave the
 -- plugin saying "pasting" for the rest of the session, and must not be asked a

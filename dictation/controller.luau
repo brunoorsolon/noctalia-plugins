@@ -33,11 +33,19 @@ local PASTE_CHORD = { PASTE_TOOL, "-M", "ctrl", "-k", "v", "-m", "ctrl" }
 -- The focused window is read from the compositor; its address is the identity a
 -- paste is checked against.
 local WINDOW_QUERY = { "hyprctl", "-j", "activewindow" }
--- The chord is sent no sooner than this after a job finished, so a modifier still
--- held from the shortcut that ended the recording is not part of it. Hyprland
--- publishes no held-modifier state - `hyprctl devices` reports the lock keys, not
--- ctrl/alt/shift/super - so the release is waited out rather than observed, and a
--- modifier the user is holding for another reason can still reach the paste.
+-- The bind table is how the plugin checks that its own shortcut was released
+-- before the paste chord was sent: a `bindr` command is dispatched by the
+-- compositor when the shortcut key is released, so a release-triggered shortcut
+-- is an observed release rather than a wait. Hyprland publishes no held-modifier
+-- state at all - `hyprctl devices` reports the lock keys, not ctrl/alt/shift/super
+-- - so the modifier itself cannot be observed by any rootless client.
+local BINDS_QUERY = { "hyprctl", "-j", "binds" }
+local SHORTCUT_TOKEN = "magus/dictation"
+local SHORTCUT_ACTIONS = { "toggle", "stop" }
+-- The chord is sent no sooner than this after a job finished, so a modifier that
+-- is still held when the release-triggered shortcut has already been dispatched is
+-- not part of it. The wait covers the modifier's own release, which no rootless
+-- client can observe.
 local PASTE_SETTLE_MS = 500
 -- A compositor answer that never arrives must not leave the panel saying
 -- "checking" for the rest of the session.
@@ -589,17 +597,60 @@ local function queryDestination(callback)
   end
 end
 
--- At record start the user is still in the window the dictation belongs to, so
--- that is the one window the automatic paste is allowed to reach.
-local function captureDestination(jobId)
-  destination = nil
-  queryDestination(function(found, reason)
-    if not S.job or S.job.id ~= jobId then return end
-    if not found then
-      destination = { jobId = jobId, problem = reason }
+-- A release-triggered dictation shortcut is the release gate: the compositor
+-- dispatches a `bindr` command when the shortcut key is released, so automatic
+-- paste is only allowed when such a bind exists. A press-triggered shortcut, an
+-- unreadable bind table and a missing compositor are all held with the reason, and
+-- the explicit Paste now route is never gated this way.
+local function queryShortcutRelease(callback)
+  if not noctalia.commandExists("hyprctl") then
+    callback(false, "The shortcut's release could not be confirmed: hyprctl is not installed.")
+    return
+  end
+  local accepted = noctalia.runAsync(BINDS_QUERY, function(result)
+    if type(result) ~= "table" or result.exitCode ~= 0 then
+      callback(false, "The shortcut's release could not be confirmed: hyprctl could not report the keybinds.")
       return
     end
-    destination = { jobId = jobId, address = found.address, class = found.class }
+    local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+    local binds = text ~= "" and noctalia.json.decode(text) or nil
+    if type(binds) ~= "table" then
+      callback(false, "The shortcut's release could not be confirmed: hyprctl reported no readable keybinds.")
+      return
+    end
+    for _, bind in ipairs(binds) do
+      local arg = type(bind) == "table" and type(bind.arg) == "string" and bind.arg or ""
+      if bind.release == true and string.find(arg, SHORTCUT_TOKEN, 1, true) then
+        for _, action in ipairs(SHORTCUT_ACTIONS) do
+          if string.find(arg, action, 1, true) then
+            callback(true, nil)
+            return
+          end
+        end
+      end
+    end
+    callback(false, "The dictation shortcut is not release-triggered.")
+  end)
+  if accepted == false then
+    callback(false, "The shortcut's release could not be confirmed: hyprctl could not be run.")
+  end
+end
+
+-- At record start the user is still in the window the dictation belongs to, so
+-- that is the one window the automatic paste is allowed to reach. The same moment
+-- records whether the shortcut that will end the recording is release-triggered.
+local function captureDestination(jobId)
+  destination = nil
+  queryShortcutRelease(function(released, releaseReason)
+    if not S.job or S.job.id ~= jobId then return end
+    queryDestination(function(found, reason)
+      if not S.job or S.job.id ~= jobId then return end
+      if not found then
+        destination = { jobId = jobId, problem = reason, releaseGate = released, releaseReason = releaseReason }
+        return
+      end
+      destination = { jobId = jobId, address = found.address, class = found.class, releaseGate = released, releaseReason = releaseReason }
+    end)
   end)
 end
 
@@ -748,6 +799,12 @@ local function queueDelivery(jobId)
   local kind = holdKindFor(destination.class)
   if kind then
     holdDelivery(HELD_MESSAGE[kind])
+    return
+  end
+  -- The release gate is checked before the chord, not after: without a
+  -- release-triggered shortcut the shortcut's own release was never observed.
+  if destination.releaseGate ~= true then
+    holdDelivery("Paste held: automatic paste needs the dictation shortcut on a release bind (`bindr`), so the shortcut is released before the paste chord. " .. (destination.releaseReason or "The shortcut's release could not be confirmed.") .. " Use Paste now while the target window is focused, or copy the transcript.")
     return
   end
   local class = destination.class ~= "" and destination.class or "the focused window"
