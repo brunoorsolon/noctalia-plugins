@@ -324,7 +324,11 @@ end
 local function shortcutConfigPath()
   local explicit = envValue("HYPRLAND_CONFIG")
   if explicit then
-    return explicit, (explicit:sub(-4) == ".lua") and "lua" or "conf"
+    -- The compositor takes this path on faith, so a file that is not there is named
+    -- rather than reported as a free chord this setup cannot write.
+    explicit = noctalia.expandPath(explicit)
+    if not noctalia.fileExists(explicit) then return nil, nil, explicit end
+    return explicit, (explicit:sub(-4) == ".lua") and "lua" or "conf", nil
   end
   local dirs = {}
   local home = envValue("HOME")
@@ -421,17 +425,17 @@ local function queryBinds(callback)
   end
 end
 
-local function occupyingBind(binds)
+-- Every bind on the chord in the default submap. A bind defined inside a submap is
+-- not active outside it, so it does not occupy this chord.
+local function shortcutOccupants(binds)
+  local found = {}
   for _, bind in ipairs(binds) do
-    -- Only the default submap competes: a binding defined inside a submap is not
-    -- active outside it, so it is not an occupant of this chord.
-    local submap = type(bind) == "table" and (bind.submap == nil or bind.submap == "")
-    if submap and bind.modmask == SHORTCUT_MODMASK then
+    if type(bind) == "table" and (bind.submap == nil or bind.submap == "") and bind.modmask == SHORTCUT_MODMASK then
       local key = type(bind.key) == "string" and string.upper(bind.key) or ""
-      if key == SHORTCUT_KEY then return bind end
+      if key == SHORTCUT_KEY then table.insert(found, bind) end
     end
   end
-  return nil
+  return found
 end
 
 -- A bind is this setup's only when the block it wrote is on disk. Hyprland runs
@@ -443,6 +447,20 @@ local function bindIsOurs(bind, installed)
   if not installed or type(bind) ~= "table" then return false end
   if bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
   return type(bind.arg) == "string" and noctalia.string.trim(bind.arg) == SHORTCUT_COMMAND
+end
+
+-- The chord is this setup's only when it holds it exactly once: the compositor runs
+-- every binding on a chord, so a second one toggles twice. The returned bind is the
+-- one that has to go, and nil means the chord is free or held by this setup alone.
+local function strayShortcutOccupant(binds, installed)
+  local occupants = shortcutOccupants(binds)
+  local first = nil
+  for _, bind in ipairs(occupants) do
+    if not bindIsOurs(bind, installed) and not first then first = bind end
+  end
+  if first then return first, #occupants end
+  if #occupants > 1 then return occupants[1], #occupants end
+  return nil, #occupants
 end
 
 local function bindLabel(bind)
@@ -492,14 +510,15 @@ end
 -- installed, a block that is written but not registered is reported as such, and
 -- anything else is free to install.
 local function applyShortcutStatus(path, format, installed, binds)
-  local occupying = occupyingBind(binds)
-  if occupying and not bindIsOurs(occupying, installed) then
+  local stray, count = strayShortcutOccupant(binds, installed)
+  if stray then
     setShortcut("conflict", {
       path = path, format = format, installed = installed, canRemove = installed,
-      message = string.format("%s is already bound to %s, so nothing was changed and no second binding was added. Remove that binding, then check again.",
-        SHORTCUT_CHORD, bindLabel(occupying)),
+      message = installed
+        and string.format("%s is also bound to %s, so the chord would run twice. Remove that extra binding, or Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, bindLabel(stray), path)
+        or string.format("%s is already bound to %s, so nothing was changed and no second binding was added. Remove that binding, then check again.", SHORTCUT_CHORD, bindLabel(stray)),
     })
-  elseif occupying then
+  elseif count > 0 then
     setShortcut("installed", {
       path = path, format = format, installed = true, canInstall = true, canRemove = true,
       message = string.format("%s starts and stops recording while another window is focused. Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, path),
@@ -524,10 +543,12 @@ local function refreshShortcut()
     })
     return
   end
-  local path, format = shortcutConfigPath()
+  local path, format, missing = shortcutConfigPath()
   if not path then
     setShortcut("unsupported", {
-      message = "No Hyprland configuration file was found in the usual places, so this setup has nowhere to put the binding. Recording from the panel and the bar still works.",
+      message = missing
+        and ("HYPRLAND_CONFIG names " .. missing .. ", which does not exist, so this setup has nowhere to put the binding. Recording from the panel and the bar still works.")
+        or "No Hyprland configuration file was found in the usual places, so this setup has nowhere to put the binding. Recording from the panel and the bar still works.",
     })
     return
   end
@@ -565,8 +586,8 @@ local function confirmInstalledShortcut(path, backup)
       noctalia.notifyError("Dictation", S.shortcut.message)
       return
     end
-    local occupying = occupyingBind(binds)
-    if occupying and bindIsOurs(occupying, true) then
+    local stray, count = strayShortcutOccupant(binds, true)
+    if count == 1 and not stray then
       setShortcut("installed", {
         path = path, installed = true, canInstall = true, canRemove = true,
         message = string.format("%s now starts and stops recording while another window is focused. The backup is %s; Undo removes the block.", SHORTCUT_CHORD, backup),
@@ -576,7 +597,7 @@ local function confirmInstalledShortcut(path, backup)
     end
     setShortcut("error", {
       path = path, installed = true, canInstall = true, canRemove = true,
-      message = "The binding is written in " .. path .. " and the compositor reloaded, but " .. SHORTCUT_CHORD .. " did not register. Undo removes the block, or restore " .. backup .. ".",
+      message = "The binding is written in " .. path .. " and the compositor reloaded, but " .. SHORTCUT_CHORD .. (count == 0 and " did not register." or " runs more than once: another binding holds the same chord.") .. " Undo removes the block, or restore " .. backup .. ".",
     })
     noctalia.notifyError("Dictation", S.shortcut.message)
   end)
@@ -667,8 +688,8 @@ local function installShortcut()
       noctalia.notifyError("Dictation", reason)
       return
     end
-    local occupying = occupyingBind(binds)
-    if occupying and not bindIsOurs(occupying, installed) then
+    local stray = strayShortcutOccupant(binds, installed)
+    if stray then
       applyShortcutStatus(path, format, installed, binds)
       noctalia.notifyError("Dictation", S.shortcut.message)
       return

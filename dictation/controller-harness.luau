@@ -1816,6 +1816,42 @@ command("shortcut-refresh")
 check("no configuration file is unsupported", "unsupported", state().shortcut.state)
 check("no configuration file cannot install", false, state().shortcut.canInstall)
 
+-- A path the compositor was told to use but that is not there is named, instead of
+-- being reported as a free chord this setup cannot write to.
+ENV.HYPRLAND_CONFIG = CONFIG_DIR .. "/missing.lua"
+command("shortcut-refresh")
+check("a missing explicit configuration is unsupported", "unsupported", state().shortcut.state)
+check("a missing explicit configuration is named", true, string.find(state().shortcut.message, "missing.lua", 1, true) ~= nil)
+check("a missing explicit configuration cannot install", false, state().shortcut.canInstall)
+ENV.HYPRLAND_CONFIG = nil
+
+-- The compositor runs every binding on a chord, so a second binding beside this
+-- setup's own block is reported rather than hidden behind "installed".
+putFile(CONF_PATH, "# user config\nbind = SUPER, Return, exec, terminal\n")
+fixtureBinds = {}
+command("shortcut-refresh")
+check("the reinstalled chord is free", "available", state().shortcut.state)
+command("shortcut-install")
+check("the reinstalled chord is installed", "installed", state().shortcut.state)
+fixtureBinds = { { modmask = 72, key = "D", has_description = true, description = "Dictation: start or stop recording" } }
+command("shortcut-refresh")
+check("a duplicate of this setup's own binding is a conflict", "conflict", state().shortcut.state)
+check("a duplicate of this setup's own binding says the chord would run twice", true, string.find(state().shortcut.message, "run twice", 1, true) ~= nil)
+check("a duplicate of this setup's own binding still offers undo", true, state().shortcut.canRemove)
+fixtureBinds = { { modmask = 72, key = "D", dispatcher = "exec", arg = "their-own-dictation-script" } }
+command("shortcut-refresh")
+check("a second binding on the chord is a conflict", "conflict", state().shortcut.state)
+check("a second binding on the chord is named", true, string.find(state().shortcut.message, "their-own-dictation-script", 1, true) ~= nil)
+check("a second binding on the chord still offers undo", true, state().shortcut.canRemove)
+local withDuplicate = fs[CONF_PATH]
+command("shortcut-install")
+check("a second binding on the chord is not written again", withDuplicate, fs[CONF_PATH])
+fixtureBinds = {}
+command("shortcut-refresh")
+check("the chord is this setup's once the duplicate is gone", "installed", state().shortcut.state)
+command("shortcut-remove")
+check("undo clears the reinstalled block", "available", state().shortcut.state)
+
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then
