@@ -1396,6 +1396,10 @@ check("a recovered job keeps its transcript", "recovered text", state().transcri
 -- typed as keystrokes, no extra key, and no injected Return.
 check("every injection is the ordinary paste chord", true, chordOnly())
 
+-- The chord's safety is a property of the mechanism, so nothing in the run may
+-- ask which shortcut invoked the job. A bind table read would come back here.
+check("no launch in the run asks for the bind table", nil, string.find(launchesFrom(0), "binds", 1, true))
+
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then
