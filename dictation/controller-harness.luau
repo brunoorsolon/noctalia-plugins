@@ -25,6 +25,7 @@ local fs = {}
 local mtimes = {}
 local decoded = {}
 local clipboard = nil
+local clipboardMime = nil
 local notifications = {}
 local launches = {}
 local panelsOpened = 0
@@ -32,7 +33,9 @@ local stateStore = {}
 local watchers = {}
 local lastTree = nil
 local lastBarTree = nil
-local CONFIG = { engine = "", model = "", recording = "", threads = 4 }
+-- Delivery is exercised in its own section below; the checks that came first are
+-- about recognition, so they run in manual mode, where nothing is ever pasted.
+local CONFIG = { engine = "", model = "", recording = "", threads = 4, delivery = "manual" }
 local freeBytes = 1024 * 1024 * 1024
 local mkdirFails = false
 -- What the runtime answers about a live process for the job: nil = cannot
@@ -42,6 +45,17 @@ local jobProcessDrop = 0
 -- What the helper prints for a source scan: ok = JSON on stdout,
 -- nostdout = nothing readable, so only the durable file can help.
 local availability = "ok"
+
+-- What the compositor reports as the focused window, what the paste tool answers
+-- when it runs, and which tools this runtime does not have. `wtype ""` is the
+-- setup probe: it types nothing and only reports whether the compositor accepts a
+-- virtual keyboard.
+local activeWindow = nil
+local activeWindowExitCode = 0
+local pasteExitCode = 0
+local pasteStartRefused = false
+local clipboardWriteFails = false
+local missingCommands = {}
 
 local SOURCE_LIST = {
   { id = "alsa_input.internal-mic", name = "alsa_input.internal-mic", description = "Built-in Microphone" },
@@ -78,7 +92,7 @@ function noctalia.pluginDir() return "/plugin" end
 function noctalia.pluginDataDir() return "/data", nil end
 function noctalia.nowMs() return clockMs end
 function noctalia.expandPath(path) return path end
-function noctalia.commandExists() return true end
+function noctalia.commandExists(name) return missingCommands[name] ~= true end
 function noctalia.diskStats()
   return { availableBytes = freeBytes, freeBytes = freeBytes, totalBytes = freeBytes, usagePercent = 0 }
 end
@@ -135,7 +149,11 @@ end
 function noctalia.setUpdateInterval() end
 function noctalia.notify(title, body) table.insert(notifications, { kind = "info", title = title, body = body }) end
 function noctalia.notifyError(title, body) table.insert(notifications, { kind = "error", title = title, body = body }) end
-function noctalia.copyToClipboard(text) clipboard = text return true end
+function noctalia.copyToClipboard(text, mime)
+  if clipboardWriteFails then return false end
+  clipboard, clipboardMime = text, mime
+  return true
+end
 function noctalia.openSettings() end
 function noctalia.togglePanel() panelsOpened = panelsOpened + 1 end
 noctalia.string = { trim = function(value) return (value:gsub("^%s+", ""):gsub("%s+$", "")) end }
@@ -168,9 +186,34 @@ noctalia.json = {
   end,
 }
 
--- Every helper invocation the controller makes, in order.
+-- The compositor's answer for the focused window. The stub decodes by lookup, so
+-- every answer is registered the way a durable file is.
+local function putActiveWindow(address, class, title)
+  local window = { address = address, class = class, title = title }
+  activeWindow = encode(window)
+  decoded[activeWindow] = window
+end
+putActiveWindow("0x1", "TextEditor", "notes.txt")
+local EDITOR = activeWindow
+
+-- Every helper invocation and every key injection the controller makes, in order.
 function noctalia.runAsync(argv, onResult)
   table.insert(launches, argv)
+  -- The compositor is asked which window is focused; the answer is what the
+  -- controller is allowed to paste into.
+  if argv[1] == "hyprctl" then
+    if type(onResult) == "function" then
+      onResult({ exitCode = activeWindowExitCode, stdout = activeWindowExitCode == 0 and activeWindow or "", stderr = "" })
+    end
+    return true
+  end
+  -- The paste tool is started detached in one test, and answers an exit status in
+  -- the others.
+  if argv[1] == "wtype" then
+    if pasteStartRefused then return false end
+    if type(onResult) == "function" then onResult({ exitCode = pasteExitCode, stdout = "", stderr = "" }) end
+    return true
+  end
   if argv[3] == "sources" and type(onResult) == "function" then
     if availability == "ok" then
       onResult({ exitCode = 0, stdout = sourceStdout, stderr = "" })
@@ -234,7 +277,14 @@ local function command(action, extra)
 end
 
 local function state() return stateStore["dictation"] end
-local function lastLaunch() return table.concat(launches[#launches], ",") end
+local function lastLaunch()
+  -- The compositor query is not a job launch, and it is what the last recording
+  -- start leaves behind.
+  for index = #launches, 1, -1 do
+    if launches[index][1] ~= "hyprctl" then return table.concat(launches[index], ",") end
+  end
+  return ""
+end
 local function jobDir(jobId) return "/data/jobs/" .. jobId end
 local function leaseOf(jobId) return fs[jobDir(jobId) .. ".lease"] end
 -- Only the runs that own a job matter for "nothing was started" checks; a source
@@ -245,6 +295,25 @@ local function jobLaunches()
     if argv[3] == "record" or argv[3] == "run" then count = count + 1 end
   end
   return count
+end
+
+-- Key injections only: the setup probe runs the same tool with an empty text and
+-- types nothing, so it is not a paste.
+local function pasteLaunches()
+  local count = 0
+  for _, argv in ipairs(launches) do
+    if argv[1] == "wtype" and argv[2] ~= "" then count = count + 1 end
+  end
+  return count
+end
+
+-- The speech is never typed as keystrokes and no extra key rides along: every
+-- injection is the one ordinary paste chord and nothing else.
+local function chordOnly()
+  for _, argv in ipairs(launches) do
+    if argv[1] == "wtype" and argv[2] ~= "" and table.concat(argv, " ") ~= "wtype -M ctrl -k v -m ctrl" then return false end
+  end
+  return true
 end
 
 local function finishSummary(jobId, outcome, severity, message, opts)
@@ -765,6 +834,383 @@ onOpen({})
 check("panel shows the partial text", "partial text", find(lastTree, "input").props.value)
 check("panel review label", "The transcript was truncated.", find(lastTree, "label", "The transcript was truncated.").props.text)
 check("panel stays rendered", "column", lastTree.kind)
+
+-- ── Delivery ─────────────────────────────────────────────────────────────────
+
+-- Delivery is the only place the plugin touches the clipboard and the keyboard, so
+-- every check drives it through the interface the panel and the bar use and then
+-- reads what the runtime was really asked to do: which window was queried, whether
+-- the clipboard was written, and which keys were injected.
+onClose()
+clipboard, clipboardMime = nil, nil
+CONFIG.delivery = "auto"
+onConfigChanged()
+check("delivery names its mechanism", "untested", state().paste.state)
+
+-- Verify and record tests the mechanism itself, not only the engine: it asks the
+-- paste tool to type nothing and reports whether the compositor accepted it.
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-ok-delivery")
+update()
+check("verify tests the paste tool", true, state().paste.tested)
+check("tested mechanism is reported", "ok", state().paste.state)
+check("the probe types nothing", "wtype,", lastLaunch())
+
+-- An unconfirmed window class is held: automatic delivery is only for targets the
+-- user has confirmed once, and the hold is where that confirmation happens.
+local firstText = "first line\nzweite Zeile"
+local beforeHeld = pasteLaunches()
+activeWindow = EDITOR
+onWidgetRecord()
+local heldJob = state().job.id
+finishSummary(heldJob, "ok", "ok", "Transcription complete.", { transcript = firstText, recording = true, copyable = true })
+update()
+check("unconfirmed target is held", "held", state().delivery.state)
+check("unconfirmed target sends no keys", beforeHeld, pasteLaunches())
+check("unconfirmed target copies nothing", nil, clipboard)
+check("unconfirmed target offers the confirmation", true, string.find(state().delivery.message, "Paste now") ~= nil)
+check("held paste shows on the bar", "tertiary", find(lastBarTree, "glyph").props.color)
+check("held paste is named on the bar", true, string.find(string.lower(barWidget.tooltip), "held") ~= nil)
+onOpen({})
+check("panel offers the re-arm", true, findByHandler(lastTree, "onDeliver") ~= nil)
+check("panel delivery row names the state", true, find(lastTree, "label", "Delivery") ~= nil)
+check("panel re-arm enabled with a transcript", true, findByHandler(lastTree, "onDeliver").props.enabled)
+
+-- The explicit action sends the one ordinary chord into the focused window. It is
+-- reported as an attempt, never as a verified insertion, because an injection tool
+-- that exits cleanly cannot prove the application inserted the text.
+onClose()
+local beforeExplicit = pasteLaunches()
+onDeliver()
+check("explicit paste waits for the settle", "waiting", state().delivery.state)
+check("explicit paste sends nothing yet", beforeExplicit, pasteLaunches())
+clockMs = clockMs + 250
+update()
+check("explicit paste is still settling", beforeExplicit, pasteLaunches())
+clockMs = clockMs + 250
+update()
+check("explicit paste injects one chord", beforeExplicit + 1, pasteLaunches())
+check("explicit paste uses the ordinary shortcut", "wtype,-M,ctrl,-k,v,-m,ctrl", lastLaunch())
+check("explicit paste carries the transcript", firstText, clipboard)
+check("explicit paste sends text data", "text/plain", clipboardMime)
+check("explicit paste is an attempt", "attempted", state().delivery.state)
+check("explicit paste says attempted", true, string.find(state().delivery.message, "attempted") ~= nil)
+check("attempt marker is persisted", "attempted", noctalia.json.decode(fs[jobDir(heldJob) .. "/delivery.json"]).state)
+check("attempt marker names the target", "0x1", noctalia.json.decode(fs[jobDir(heldJob) .. "/delivery.json"]).target.address)
+check("attempt marker names the class", "TextEditor", noctalia.json.decode(fs[jobDir(heldJob) .. "/delivery.json"]).target.class)
+
+-- One attempt stays one attempt: later ticks never repeat the side effects, and the
+-- transcript is left on the clipboard for the user.
+local beforeRepeat = pasteLaunches()
+clockMs = clockMs + 5000
+update()
+update()
+check("a finished attempt is not repeated", beforeRepeat, pasteLaunches())
+check("the attempt is not restarted", "attempted", state().delivery.state)
+check("the transcript stays on the clipboard", firstText, clipboard)
+
+-- A confirmed target is pasted into automatically, after the settle and only into
+-- the window the recording was started from.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local autoJob = state().job.id
+finishSummary(autoJob, "ok", "ok", "Transcription complete.", { transcript = "auto text", recording = true, copyable = true })
+update()
+check("confirmed target waits for the settle", "waiting", state().delivery.state)
+check("the settle injects nothing", beforeRepeat, pasteLaunches())
+clockMs = clockMs + 500
+update()
+check("confirmed target is pasted into", beforeRepeat + 1, pasteLaunches())
+check("automatic paste carries the new transcript", "auto text", clipboard)
+check("automatic paste is an attempt", "attempted", state().delivery.state)
+
+-- A destination that changed while the job ran is held, never followed: the paste
+-- does not drift into a window the recording was not started from.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local movedJob = state().job.id
+putActiveWindow("0x2", "TextEditor", "other.txt")
+finishSummary(movedJob, "ok", "ok", "Transcription complete.", { transcript = "moved text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeMoved = pasteLaunches()
+update()
+check("changed destination is held", "held", state().delivery.state)
+check("changed destination sends no keys", beforeMoved, pasteLaunches())
+check("changed destination copies nothing", nil, clipboard)
+check("changed destination says why", true, string.find(state().delivery.message, "changed") ~= nil)
+activeWindow = EDITOR
+
+-- Terminals and password managers are held for an explicit action. The plugin knows
+-- named window classes; it does not claim to recognise a password field.
+putActiveWindow("0x3", "kitty", "shell")
+onWidgetRecord()
+local terminalJob = state().job.id
+finishSummary(terminalJob, "ok", "ok", "Transcription complete.", { transcript = "shell text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeTerminal = pasteLaunches()
+update()
+check("terminal destination is held", "held", state().delivery.state)
+check("terminal receives no keys", beforeTerminal, pasteLaunches())
+check("terminal hold is named", true, string.find(state().delivery.message, "terminal") ~= nil)
+putActiveWindow("0x4", "KeePassXC", "vault")
+onWidgetRecord()
+local passwordJob = state().job.id
+finishSummary(passwordJob, "ok", "ok", "Transcription complete.", { transcript = "secret text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforePassword = pasteLaunches()
+update()
+check("password manager is held", "held", state().delivery.state)
+check("password manager receives no keys", beforePassword, pasteLaunches())
+
+-- The explicit action overrides a hold, because the user asked for that window.
+clipboard = nil
+onClose()
+onDeliver()
+clockMs = clockMs + 500
+update()
+check("explicit action pastes into a held window", beforePassword + 1, pasteLaunches())
+check("explicit override carries the transcript", "secret text", clipboard)
+
+-- A tool that fails, and a tool that cannot be started, are visible failures with
+-- nothing typed into the user's window.
+clipboard = nil
+activeWindow = EDITOR
+pasteExitCode = 1
+onWidgetRecord()
+local failedJob = state().job.id
+finishSummary(failedJob, "ok", "ok", "Transcription complete.", { transcript = "failing text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+update()
+check("tool failure is reported", "failed", state().delivery.state)
+check("tool failure keeps the transcript on the clipboard", "failing text", clipboard)
+check("tool failure is notified", "error", notifications[#notifications].kind)
+check("tool failure marker is persisted", "failed", noctalia.json.decode(fs[jobDir(failedJob) .. "/delivery.json"]).state)
+check("bar shows the failed paste", "error", find(lastBarTree, "glyph").props.color)
+pasteExitCode = 0
+
+clipboard = nil
+pasteStartRefused = true
+onWidgetRecord()
+local unstartedJob = state().job.id
+finishSummary(unstartedJob, "ok", "ok", "Transcription complete.", { transcript = "unstarted text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeUnstarted = pasteLaunches()
+update()
+check("a tool that cannot start is a failure", "failed", state().delivery.state)
+check("a tool that cannot start injects once", beforeUnstarted + 1, pasteLaunches())
+clockMs = clockMs + 2000
+update()
+check("a failed start is not retried", beforeUnstarted + 1, pasteLaunches())
+check("a failed start keeps the transcript", "unstarted text", clipboard)
+pasteStartRefused = false
+
+-- Persistence failure before delivery: nothing is typed, and the failure says what
+-- happened instead of pretending the paste went out.
+clipboard, clipboardMime = nil, nil
+clipboardWriteFails = true
+activeWindow = EDITOR
+onWidgetRecord()
+local unwritableJob = state().job.id
+finishSummary(unwritableJob, "ok", "ok", "Transcription complete.", { transcript = "unwritable text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeUnwritable = pasteLaunches()
+update()
+check("a failed clipboard write is a failure", "failed", state().delivery.state)
+check("a failed clipboard write sends no keys", beforeUnwritable, pasteLaunches())
+check("a failed clipboard write says why", true, string.find(state().delivery.message, "clipboard") ~= nil)
+clipboardWriteFails = false
+
+-- Output the plugin cannot trust is never pasted on its own, even when the text is
+-- still readable and copyable by hand: the whole point is that the user decides.
+local untrusted = {
+  { "empty", "error", false },
+  { "malformed_row", "error", false },
+  { "truncated", "review", true },
+  { "unknown_token", "review", true },
+  { "nonzero_exit", "error", false },
+}
+for _, case in ipairs(untrusted) do
+  clipboard = nil
+  onWidgetRecord()
+  local badJob = state().job.id
+  finishSummary(badJob, case[1], case[2], "Not trustworthy.", { transcript = "untrusted text", recording = true, copyable = case[3] })
+  update()
+  clockMs = clockMs + 500
+  local beforeBad = pasteLaunches()
+  update()
+  check("never pastes on its own: " .. case[1], beforeBad, pasteLaunches())
+  check("copies nothing for: " .. case[1], nil, clipboard)
+  check("stays idle for: " .. case[1], "idle", state().delivery.state)
+end
+
+-- A recording started from the panel has no destination: the panel is a layer
+-- surface the recording came from, not the application the user was typing in.
+activeWindow = EDITOR
+onOpen({})
+onRecord()
+local panelStartedJob = state().job.id
+onClose()
+finishSummary(panelStartedJob, "ok", "ok", "Transcription complete.", { transcript = "panel started", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforePanelStart = pasteLaunches()
+update()
+check("a panel-started recording arms no destination", "held", state().delivery.state)
+check("a panel-started recording pastes nothing", beforePanelStart, pasteLaunches())
+check("a panel-started recording asks for a target", true, string.find(state().delivery.message, "panel") ~= nil)
+
+-- An open panel holds the keyboard, so the chord would land in the panel. Automatic
+-- delivery is held; the explicit action closes the panel so the keyboard returns to
+-- the window the user came from, and a panel that stays open is held instead.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local keyboardJob = state().job.id
+onOpen({})
+finishSummary(keyboardJob, "ok", "ok", "Transcription complete.", { transcript = "keyboard text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeKeyboard = pasteLaunches()
+update()
+check("an open panel holds automatic delivery", "held", state().delivery.state)
+check("an open panel receives no chord", beforeKeyboard, pasteLaunches())
+check("an open panel is named in the hold", true, string.find(state().delivery.message, "panel") ~= nil)
+local opens = panelsOpened
+onDeliver()
+check("explicit paste closes the holding panel", opens + 1, panelsOpened)
+onClose()
+clockMs = clockMs + 500
+update()
+check("explicit paste after the panel closes", "attempted", state().delivery.state)
+check("explicit paste after the panel closes injects", beforeKeyboard + 1, pasteLaunches())
+
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local settledJob = state().job.id
+finishSummary(settledJob, "ok", "ok", "Transcription complete.", { transcript = "settled text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+update()
+check("a confirmed target pastes", "attempted", state().delivery.state)
+onOpen({})
+local beforeStuck = pasteLaunches()
+onDeliver()
+clockMs = clockMs + 500
+update()
+check("a panel that stays open holds the paste", "held", state().delivery.state)
+check("a panel that stays open receives nothing", beforeStuck, pasteLaunches())
+onClose()
+
+-- Manual copy is a deliberate preference and the recovery route: nothing is pasted
+-- on its own, the interface offers no paste, and the explicit action is refused.
+CONFIG.delivery = "manual"
+onConfigChanged()
+check("manual mode is named in setup", "manual", state().paste.state)
+onOpen({})
+check("manual mode disables the paste action", false, findByHandler(lastTree, "onDeliver").props.enabled)
+onClose()
+clipboard = nil
+onWidgetRecord()
+local manualJob = state().job.id
+finishSummary(manualJob, "ok", "ok", "Transcription complete.", { transcript = "manual text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeManual = pasteLaunches()
+update()
+check("manual mode pastes nothing", beforeManual, pasteLaunches())
+check("manual mode says why", "manual", state().delivery.state)
+onDeliver()
+check("manual mode refuses the explicit paste", beforeManual, pasteLaunches())
+check("manual mode keeps copy available", true, state().copyable)
+CONFIG.delivery = "auto"
+onConfigChanged()
+
+-- The mechanism and the window query are dependencies, not privileges: a missing
+-- tool is explained and held, never installed and never escalated.
+missingCommands.wtype = true
+onConfigChanged()
+check("missing paste tool is reported", "missing", state().paste.state)
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local noToolJob = state().job.id
+finishSummary(noToolJob, "ok", "ok", "Transcription complete.", { transcript = "no tool text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeNoTool = pasteLaunches()
+update()
+check("missing paste tool holds delivery", "held", state().delivery.state)
+check("missing paste tool sends no keys", beforeNoTool, pasteLaunches())
+check("missing paste tool copies nothing", nil, clipboard)
+check("missing paste tool is named", true, string.find(state().delivery.message, "wtype") ~= nil)
+onDeliver()
+check("explicit paste without the tool sends no keys", beforeNoTool, pasteLaunches())
+missingCommands.wtype = nil
+onConfigChanged()
+
+missingCommands.hyprctl = true
+activeWindow = EDITOR
+onWidgetRecord()
+local noQueryJob = state().job.id
+finishSummary(noQueryJob, "ok", "ok", "Transcription complete.", { transcript = "no query text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeNoQuery = pasteLaunches()
+update()
+check("missing window query holds delivery", "held", state().delivery.state)
+check("missing window query sends no keys", beforeNoQuery, pasteLaunches())
+check("missing window query is named", true, string.find(state().delivery.message, "hyprctl") ~= nil)
+missingCommands.hyprctl = nil
+
+-- A crash around the marker is never repeated. With the marker on disk the next
+-- runtime holds the job, and a job recovered from disk never delivers at all: its
+-- destination belonged to a runtime that is gone.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local crashJob = state().job.id
+finishSummary(crashJob, "ok", "ok", "Transcription complete.", { transcript = "crashed mid paste", recording = true, copyable = true })
+putTable(jobDir(crashJob) .. "/delivery.json", { jobId = crashJob, state = "attempting", attempt = 1, clipboard = true }, "marker-attempting")
+nowSeconds = nowSeconds + 3
+onClose()
+onExit(0, "reload")
+watchers = {}
+load()
+local beforeCrash = pasteLaunches()
+check("a paste interrupted by a crash is not repeated", "held", state().delivery.state)
+check("a crash mid paste sends no keys", beforeCrash, pasteLaunches())
+check("a crash mid paste explains itself", true, string.find(state().delivery.message, "did not finish") ~= nil)
+check("a crash mid paste keeps the transcript", "crashed mid paste", state().transcript)
+
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local recoveredJob = state().job.id
+finishSummary(recoveredJob, "ok", "ok", "Transcription complete.", { transcript = "recovered text", recording = true, copyable = true })
+nowSeconds = nowSeconds + 2
+onExit(0, "reload")
+watchers = {}
+load()
+local beforeRecovered = pasteLaunches()
+check("a job recovered from disk is not delivered", "idle", state().delivery.state)
+clockMs = clockMs + 5000
+update()
+check("a recovered job sends no keys", beforeRecovered, pasteLaunches())
+check("a recovered job copies nothing", nil, clipboard)
+check("a recovered job keeps its transcript", "recovered text", state().transcript)
+
+-- Over the whole run every injection was the one ordinary paste chord: no speech
+-- typed as keystrokes, no extra key, and no injected Return.
+check("every injection is the ordinary paste chord", true, chordOnly())
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

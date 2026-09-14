@@ -777,13 +777,20 @@ assert not missing, "controller passes options the helper does not define: %r" %
 assert passed, "no helper option found in controller.luau"
 PY
 
-# Recording and playback must never paste: no entry drives a clipboard writer, and
-# only the panel's explicit Copy button touches the clipboard at all.
+# Recording must never paste on its own and delivery is one mechanism in one place:
+# the controller copies the finished transcript and sends the ordinary paste chord
+# from there, nothing anywhere types the speech as keystrokes or presses Return,
+# and only the panel's explicit Copy button touches the clipboard besides delivery.
 check "helper pastes nothing" False \
   "$(grep -qE 'wl-copy|xclip|xsel|wl-paste|wtype|ydotool|dotool' "$helper" && echo True || echo False)"
-for entry in controller widget; do
-  check "$entry touches no clipboard" False "$(grep -q 'copyToClipboard' "$entry.luau" && echo True || echo False)"
+check "controller copies for delivery once" 1 "$(grep -c 'copyToClipboard' controller.luau)"
+check "controller injects keys in one place" 1 "$(grep -c 'runAsync(PASTE_CHORD' controller.luau)"
+check "delivery sends the ordinary paste chord" 1 \
+  "$(grep -c 'PASTE_CHORD = { PASTE_TOOL, "-M", "ctrl", "-k", "v", "-m", "ctrl" }' controller.luau)"
+for entry in controller widget panel; do
+  check "$entry sends no Return" False "$(grep -qE '\bReturn\b|KP_Enter|"Enter"' "$entry.luau" && echo True || echo False)"
 done
+check "widget touches no clipboard" False "$(grep -q 'copyToClipboard' widget.luau && echo True || echo False)"
 check "panel copy is explicit" True "$(grep -q 'copyToClipboard' panel.luau && echo True || echo False)"
 
 if command -v luau-compile >/dev/null 2>&1; then

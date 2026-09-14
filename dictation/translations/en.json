@@ -6,5 +6,9 @@
   "settings.recording.label": "Recording to transcribe",
   "settings.recording.description": "A saved 16 kHz mono signed-16-bit WAV. It is validated before inference and never modified.",
   "settings.threads.label": "Inference threads",
-  "settings.threads.description": "Thread count passed to the engine. The OpenMP and OpenBLAS limits follow it."
+  "settings.threads.description": "Thread count passed to the engine. The OpenMP and OpenBLAS limits follow it.",
+  "settings.delivery.label": "Delivery",
+  "settings.delivery.description": "Automatic copies the finished transcript and sends the ordinary paste shortcut into the window the recording was started from. Manual never pastes: the transcript is only copied when you ask for it. Both modes need wtype installed, and the transcript goes on the clipboard first, where a clipboard manager keeps it in its history.",
+  "settings.delivery.auto": "Automatic (paste into the window you recorded from)",
+  "settings.delivery.manual": "Manual (never paste; copy only)"
 }

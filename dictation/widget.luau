@@ -14,9 +14,23 @@ local STATUS = {
 
 local commandSeq = 0
 
-local function send(action)
+-- Delivery outcomes that outlive the job: the bar must not show recognition
+-- success while the paste was held or failed.
+local DELIVERY_STATUS = {
+  attempted = { glyph = "check", color = "primary" },
+  held = { glyph = "alert-triangle", color = "tertiary" },
+  failed = { glyph = "alert-triangle", color = "error" },
+}
+
+local function send(action, extra)
   commandSeq = commandSeq + 1
-  noctalia.state.set("dictation.command", { seq = commandSeq, action = action })
+  -- `from` tells the controller this recording started from a surface that keeps
+  -- the focused window focused, so the window can be captured as the destination.
+  local command = { seq = commandSeq, action = action, from = "bar" }
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do command[key] = value end
+  end
+  noctalia.state.set("dictation.command", command)
 end
 
 local function statusFor(activity, severity)
@@ -36,10 +50,17 @@ local function render()
   local severity = type(s) == "table" and s.severity or nil
   local phase = type(s) == "table" and s.phase or nil
   local finalizing = activity == "recording" and phase == "finalizing"
+  local delivery = type(s) == "table" and type(s.delivery) == "table" and s.delivery or nil
+  local deliveryStatus = delivery and DELIVERY_STATUS[delivery.state] or nil
   -- Capture is over once the WAV is being finalized, so the bar swaps the
   -- microphone for a working glyph and drops Stop; the tooltip keeps naming the
-  -- microphone the audio came from.
-  local status = finalizing and { glyph = "loader", color = "primary" } or statusFor(activity, severity) or { glyph = "microphone", color = "on_surface_variant" }
+  -- microphone the audio came from. A finished job shows what happened to the
+  -- transcript - attempted, held or failed - rather than recognition success
+  -- alone, because a hold is not an insertion.
+  local status = finalizing and { glyph = "loader", color = "primary" }
+    or (activity == "idle" and deliveryStatus)
+    or statusFor(activity, severity)
+    or { glyph = "microphone", color = "on_surface_variant" }
 
   local elapsed = 0
   if type(s) == "table" and type(s.job) == "table" and type(s.job.elapsedSeconds) == "number" then
@@ -64,6 +85,11 @@ local function render()
   }))
 
   local message = type(s) == "table" and s.message or nil
+  -- A held or failed paste is the more useful line: the recognition message can
+  -- say the text is ready while nothing was inserted anywhere.
+  if delivery and type(delivery.message) == "string" and delivery.message ~= "" and (delivery.state == "held" or delivery.state == "failed") then
+    message = delivery.message
+  end
   if type(message) == "string" and message ~= "" then
     barWidget.setTooltip(message)
   else

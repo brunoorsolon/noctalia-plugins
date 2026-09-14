@@ -39,7 +39,9 @@ end
 
 local function sendCommand(action, extra)
   commandSeq = commandSeq + 1
-  local command = { seq = commandSeq, action = action }
+  -- `from` is what tells the controller whether this recording was started from a
+  -- surface that holds the keyboard: the panel is not a paste destination.
+  local command = { seq = commandSeq, action = action, from = "panel" }
   if type(extra) == "table" then
     for key, value in pairs(extra) do command[key] = value end
   end
@@ -196,6 +198,34 @@ local function recordingRow(s)
   })
 end
 
+-- The delivery row names the mechanism and the outcome, and it is where a held
+-- paste is re-armed. Nothing here claims the text landed: an accepted chord is
+-- reported as an attempt.
+local function deliveryRow(s)
+  local delivery = type(s.delivery) == "table" and s.delivery or {}
+  local paste = type(s.paste) == "table" and s.paste or {}
+  local state = delivery.state or "idle"
+  local color = "on_surface_variant"
+  if state == "held" then
+    color = "tertiary"
+  elseif state == "failed" then
+    color = "error"
+  elseif state == "attempted" then
+    color = "primary"
+  end
+  local message = type(delivery.message) == "string" and delivery.message or ""
+  if message == "" then message = type(paste.message) == "string" and paste.message or "" end
+  local manual = noctalia.getConfig("delivery") == "manual"
+  return ui.column({ gap = 6 }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = "Delivery", fontSize = 12, color = "on_surface_variant" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = "Paste now", variant = "ghost", enabled = s.copyable == true and not manual, onClick = "onDeliver" }),
+    }),
+    ui.label({ text = message, fontSize = 12, color = color, maxWidth = LABEL_WIDTH }),
+  })
+end
+
 local function jobRow(s, recording, idle)
   return ui.row({ gap = 8, align = "center" }, {
     ui.button({ text = "Transcribe file", variant = "ghost", enabled = idle and recording ~= "", onClick = "onTranscribe" }),
@@ -220,6 +250,7 @@ local function render()
     microphoneRow(s),
     ui.separator(),
     transcriptArea(s),
+    deliveryRow(s),
     recordingRow(s),
     jobRow(s, recording, s.activity == "idle" or s.activity == nil),
   }))
@@ -227,11 +258,16 @@ end
 
 function onOpen(_context)
   isOpen = true
+  -- The controller cannot ask the compositor about a layer surface, so the panel
+  -- publishes the fact that it holds the keyboard: a paste sent now would land in
+  -- the panel instead of the window the transcript belongs to.
+  noctalia.state.set("dictation.panelOpen", true)
   render()
 end
 
 function onClose()
   isOpen = false
+  noctalia.state.set("dictation.panelOpen", false)
 end
 
 function onRecord()
@@ -274,6 +310,10 @@ function onMicrophoneSelected(index, _text)
   if type(source) == "table" and type(source.id) == "string" then
     sendCommand("select", { source = source.id })
   end
+end
+
+function onDeliver()
+  sendCommand("deliver")
 end
 
 function onOpenSettings()

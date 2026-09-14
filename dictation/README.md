@@ -18,6 +18,7 @@ The service is the only owner of a job, so closing the panel or the bar widget n
 
 - `python3` (standard library only — the bundled helper has no third-party imports).
 - PipeWire tools: `pw-dump` to list capture sources, `pw-record` to capture, `pw-play` to play a recording back. They ship together in `pipewire-bin` (or `pipewire` on some distributions).
+- `wtype` for automatic paste: it injects the paste chord through the compositor's own virtual-keyboard protocol, so no daemon and no input-device access is needed. It is deliberately not a hard dependency — without it, and in manual copy mode, the transcript is still copied when you ask for it.
 - A capture source (microphone) PipeWire reports as an `Audio/Source`.
 - An installed recognition engine from [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), such as `transcribe-cli`.
 - A GGUF model the engine can load.
@@ -45,7 +46,7 @@ noctalia msg plugins enable magus/dictation
 2. Set **Recognition executable** to the installed engine, for example `/usr/local/bin/transcribe-cli`. It is run as it is.
 3. Set **Model GGUF** to the model file the engine should load.
 4. Set **Inference threads**. The default of 4 is passed to the engine, and `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` follow it.
-5. Press **Verify and record** in the panel (or open the panel from the bar widget's panel button). Verification runs the executable's `--help`, checks that the flags this plugin needs are accepted, hashes the executable and the model, and writes the result to `setup.json`. Nothing is rebuilt or downloaded; the recorded hashes only describe the files you selected.
+5. Press **Verify and record** in the panel (or open the panel from the bar widget's panel button). Verification runs the executable's `--help`, checks that the flags this plugin needs are accepted, hashes the executable and the model, and writes the result to `setup.json`. Verification also tests the paste mechanism: `wtype` is asked to type nothing, and the panel names the tool, whether it is installed, and whether the compositor accepted it. Nothing is rebuilt or downloaded; the recorded hashes only describe the files you selected.
 6. Choose the **Microphone** in the panel. The list is read from the PipeWire graph, and the choice is saved next to the plugin's data, so it survives a restart. The choice is a stable node name, so a reconnect keeps the same microphone selected.
 
 Optionally set **Recording to transcribe** if you also want to import a WAV you recorded elsewhere.
@@ -63,7 +64,7 @@ noctalia msg panel-toggle magus/dictation:panel
 ```
 
 - **Record** captures the selected microphone with `pw-record` into a private 16 kHz mono signed-16 WAV inside the job's directory. **Stop** finalizes that WAV, validates it, and only then runs recognition on it. **Cancel** stops the microphone without transcribing; the audio captured so far is kept. A **Cancel** that arrives after **Stop**, while the WAV is already being finalized, is honoured as well: the job reports `cancelled` and recognition is not started. A **Stop** or **Cancel** that arrives before the microphone is opened is honoured too, even when it arrives before the helper process itself has started: the request belongs to the job id the controller has just allocated, so the microphone is never opened and the job reports that no audio was captured instead of recording on.
-- **Play** plays the saved recording with `pw-play`, and **Retry** transcribes the saved recording again as a new job. Neither one pastes anything, and neither one ever triggers a paste: the plugin never writes to the clipboard on its own.
+- **Play** plays the saved recording with `pw-play`, and **Retry** transcribes the saved recording again as a new job. Neither one pastes anything: delivery belongs to a recording that this session finished, so an import, a retry, and a job recovered from disk are only copied on request.
 - The bar widget and the panel expose the same actions and share the one job: pressing Record in the bar while the panel is open starts exactly one recording, and pressing Stop twice converges on one finalized recording. A second Stop that arrives while the WAV is already being finalized is refused with the reason instead of being sent again. A second Record while a job runs is refused with the reason instead of starting a second recorder.
 - The bar names the microphone the recording came from and says whether audio is still being captured: while the WAV is being finalized the microphone glyph becomes a working glyph, **Stop** disappears, and the status the bar shows names the microphone and the phase. That working glyph, the elapsed time and the missing **Stop** continue through recognition, because the microphone is released once the WAV is finalized; pressing the bar's toggle then reports the running job instead of asking the helper to stop a capture that already ended. The microphone choice itself is closed while audio is being captured — the picker is disabled and a change is refused with the reason — because the recorder keeps the microphone it was started with, and the status would otherwise name one the recording does not come from.
 - The Record, Stop and Cancel buttons in the bar never open a panel or move focus, so recording from the bar leaves the window you were typing in focused. The panel button, and a right click, open the panel.
@@ -75,16 +76,20 @@ noctalia msg panel-toggle magus/dictation:panel
 - Recording has no length limit of its own: it ends when you press **Stop** or **Cancel**, when the recorder exits, or when the controller stops refreshing the lease. A recording that ends any way other than **Stop** is not transcribed on its own.
 - Recording is refused before anything is started when less than 20 MB is free, so a full disk cannot destroy an older job's files or leave a truncated recording. A failed write is reported as an error, and earlier jobs are left untouched.
 - The transcript appears in a selectable multiline field once the engine has returned text. Text is shown even when the outcome is an error or a review, so a partial result is readable; only a usable transcript enables **Copy transcript**.
-- **Copy transcript** copies the text that is shown. Nothing is pasted automatically: put the text where you want it yourself.
+- **Copy transcript** copies the text that is shown. **Paste now** copies it and sends the ordinary paste shortcut into the window that is focused when you press it; it is the route for a held transcript and for any other transcript the plugin did not deliver.
+- When a recording finishes with a usable transcript, the plugin copies that transcript to the clipboard and sends the ordinary paste shortcut (`Ctrl+V`, through `wtype`) into the window the recording was started from. Nothing is typed as keystrokes, no Return is sent, and no part of the speech is interpolated into a command. The first paste into a window class you have not confirmed is held for **Paste now**, and that confirmation makes later recordings into the same class automatic for the rest of the session. Terminals, password managers, a window whose class cannot be read, and a window that is not the one the recording was started from are always held. Nothing is pasted while the panel itself holds the keyboard or while the destination has changed or closed, and focus is never moved to a window to make a paste work.
+- Delivery is reported as **Paste attempted**, **Delivery held**, or **Delivery failed** — never as a verified insertion, because the tool's exit status only says the shortcut was sent, not that the application inserted the text. A hold and a failure also raise a notification; a successful attempt does not, so the paste cannot steal focus with a popup.
+- The **Delivery** setting chooses **Automatic** (the above) or **Manual**, which never pastes on its own and leaves **Copy transcript** and **Paste now** as your own route.
 - **Verify and record** repeats setup verification and re-hashes the files, for example after replacing the model.
 
-The controller also exposes `toggle`, `stop`, `cancel` and `show` over IPC:
+The controller also exposes `toggle`, `stop`, `cancel`, `show` and `paste` over IPC:
 
 ```sh
 noctalia msg plugin magus/dictation:controller all toggle
 noctalia msg plugin magus/dictation:controller all stop
 noctalia msg plugin magus/dictation:controller all cancel
 noctalia msg plugin magus/dictation:controller all show
+noctalia msg plugin magus/dictation:controller all paste
 ```
 
 ## Where the files go
@@ -105,6 +110,7 @@ jobs/<jobId>/job.json                       the config the job started with
 jobs/<jobId>/status.json                    the phase the panel reports
 jobs/<jobId>/heartbeat.json                 rewritten while the helper runs, so lost contact is noticed
 jobs/<jobId>/summary.json                   outcome the panel reads
+jobs/<jobId>/delivery.json                  the paste attempt: state, target, exit status
 jobs/<jobId>/recording.wav                  the captured audio, kept whether or not recognition ran
 jobs/<jobId>/recorder.log                   pw-record's own output
 jobs/<jobId>/attempt-1/argv.json            the exact argument vector, as a list
@@ -174,6 +180,18 @@ The engine runs with `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` set to the thr
 
 The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callback is capped far below a long inference, so the helper is launched detached and reports its outcome through `summary.json` instead. Every child — the recorder and the engine — is tied to the helper's lifetime, so a helper killed outright takes its children with it instead of leaving a recorder or an engine running behind a lost job.
 
+## How the delivery works
+
+One mechanism, chosen and tested, with no fallback matrix: the transcript is copied to the clipboard with Noctalia's clipboard API and the ordinary paste shortcut is sent with `wtype`, which uses the compositor's Wayland virtual-keyboard protocol. `wtype` needs no daemon and no device access, and it is never installed, replaced or escalated by the plugin; `ydotool` is deliberately not used, because it wants `/dev/uinput` and a running daemon. **Verify and record** tests the mechanism by asking `wtype` to type nothing: an exit status of zero is the compositor accepting a virtual keyboard, and the result is named in the panel. When `wtype` is missing, or the compositor refuses it, the transcript is held and **Copy transcript** stays the route.
+
+What is sent is exactly one chord, `wtype -M ctrl -k v -m ctrl`: no speech is typed as keystrokes, no extra key rides along, and no Return is ever sent, so dictation cannot submit a form or run a command on its own. The transcript itself travels as clipboard data (`text/plain`), and the plugin never clears or restores the clipboard afterwards — the transcript stays there for you, and a clipboard manager keeps it in its history.
+
+The destination is the window the recording was started from, and it is identified by the compositor's own answer to `hyprctl -j activewindow` at record start: its address is the identity, and its class is what decides a hold. A recording started from the panel arms no destination at all, because the panel is a layer surface and not the application you were typing in; the job is held until you press **Paste now** with the target window focused. Before the paste, the window is asked again: a destination that changed address, closed, or became a terminal, a password manager, or an unreadable class is held instead of receiving the text, and the plugin never moves focus to make a paste fit.
+
+The chord is sent no sooner than 500 ms after the job finished, so a modifier still held from the shortcut that ended the recording is not part of it. This is a wait, not a check: Hyprland publishes no held-modifier state — `hyprctl devices` reports the lock keys, not ctrl/alt/shift/super — so the release is waited out rather than observed, and a modifier you are holding yourself can still reach the paste. Transcription takes seconds, so the wait is over long before a normal chord would be sent.
+
+Delivery happens at most once per finished recording, and only for a result the plugin trusts: `ok` **and** copyable, with the transcript and result files really on disk. `empty`, `malformed_row`, `truncated`, `unknown_token`, `nonzero_exit` and every other outcome is never pasted on its own, even when partial text is shown and copyable by hand. The attempt is written to the job's `delivery.json` **before** the clipboard is touched: if the plugin crashes between that marker and the shortcut, the next run holds the job and says so instead of pasting it a second time, and a job adopted after a restart never delivers at all. Duplicate controller events, a second update tick, and a compositor answer that never arrives cannot repeat the side effects: an attempt in flight is never restarted, and one that never answers is held after 30 seconds.
+
 ## When something looks wrong
 
 - **"Setup required"** names the missing piece: the executable, the model, `python3`, or the data directory.
@@ -187,7 +205,9 @@ The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callba
 
 - CPU only: the engine is always called with `--backend cpu`.
 - One job at a time, and no queue.
-- Automatic paste into the focused window is not implemented yet. It is required for the first complete release, but it is deliberately not part of this milestone: nothing is pasted, and nothing is put on the clipboard unless you press **Copy transcript**.
+- Automatic paste needs `wtype` and a compositor that accepts the Wayland virtual-keyboard protocol; the plugin never installs it, never requests device access, and never runs a daemon, so without it a transcript is held and copied by hand. There is no fallback tool: `ydotool` is not used and not required, and nothing is granted or escalated to make a paste work.
+- The paste is sent 500 ms after the job finished, so a modifier still held from the recording shortcut is not part of the chord. That is a settle, not a query: Hyprland exposes no held-modifier state, so a modifier you hold for another reason can still reach the paste.
+- Holds are decided from the window's class, which is all the compositor reports. The plugin does not detect a password field, and a terminal or password manager without a recognisable class is pasted into; use **Manual** mode for those windows you always want to paste into by hand.
 - Monitors are excluded from the microphone list by name: a source whose node name ends in `.monitor`, or whose description starts with `Monitor of `, is treated as an output loopback and hidden. PipeWire does not mark monitors with a single portable field, so a monitor that is named differently could appear in the list; selecting it captures playback rather than a microphone, and nothing else about the plugin changes.
 - Only `media.class = "Audio/Source"` nodes are listed, so a virtual source that PipeWire reports as a different class is not offered.
 - Adopting a running job after a reload continues its elapsed timer: the helper writes the capture's start time as wall-clock milliseconds, and `noctalia.nowMs()` is on the same clock, so the elapsed time keeps counting from the real start. Elapsed time is clamped at zero, so two clocks that disagree can never show a negative duration. The job id, its files and **Cancel** are unaffected.
@@ -212,7 +232,7 @@ It uses fake `pw-dump`, `pw-record`, `pw-play` and engine executables with gener
 ./controller-selftest.sh
 ```
 
-It checks the controller's logic — duplicate-toggle convergence, one job at a time, cancel and stop routing, the lease it refreshes, microphone selection and refusal (including a change refused while recording), the phase it keeps once a stop is accepted, the transcribing state that follows a finalized recording, the elapsed time it restores for an adopted job, the low-disk refusal, adopting a recording after a reload, recovery after a restart, the recording it falls back to when its pointer is gone, the IPC actions, and what the bar widget and the panel render, including the finalizing and transcribing states — by loading `controller.luau`, `panel.luau` and `widget.luau` into a stubbed `noctalia` API, without PipeWire or Noctalia. The run fails its process when any check fails, so a caller reading the exit status sees a failed run. If `luau` is not on `PATH`, set `LUAU=/path/to/luau`.
+It checks the controller's logic — duplicate-toggle convergence, one job at a time, cancel and stop routing, the lease it refreshes, microphone selection and refusal (including a change refused while recording), the phase it keeps once a stop is accepted, the transcribing state that follows a finalized recording, the elapsed time it restores for an adopted job, the low-disk refusal, adopting a recording after a reload, recovery after a restart, the recording it falls back to when its pointer is gone, the IPC actions, and what the bar widget and the panel render, including the finalizing and transcribing states — by loading `controller.luau`, `panel.luau` and `widget.luau` into a stubbed `noctalia` API, without PipeWire or Noctalia. It drives delivery against a stubbed compositor and a stubbed `wtype` as well: the settle wait, one chord per attempt, the destination check that holds a changed window, the terminal and password-manager holds, the first-time confirmation of a window class, the explicit paste that closes the panel and skips a hold, the empty, malformed, truncated, unknown-token and nonzero-exit results that never paste, the attempt marker that survives a crash, a job recovered from disk that never delivers, a missing tool, a failed clipboard write, a failed or unstartable tool, manual mode, and that every injection over the whole run is the one ordinary chord. The run fails its process when any check fails, so a caller reading the exit status sees a failed run. If `luau` is not on `PATH`, set `LUAU=/path/to/luau`.
 
 ## Updating the plugin
 
