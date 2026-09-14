@@ -77,6 +77,10 @@ local fixtureBinds = {}
 local bindsIgnoreConfig = false
 local configWriteFails = false
 local backupWriteFails = false
+-- What the compositor's command line reports: --config wins over every default
+-- file, and a command line that cannot be read must stop the setup from guessing.
+local psExitCode = 0
+local psOutput = "/usr/bin/Hyprland"
 
 local SOURCE_LIST = {
   { id = "alsa_input.internal-mic", name = "alsa_input.internal-mic", description = "Built-in Microphone" },
@@ -326,6 +330,14 @@ function noctalia.runAsync(argv, onResult)
     end
     if type(onResult) == "function" then
       onResult({ exitCode = activeWindowExitCode, stdout = activeWindowExitCode == 0 and activeWindow or "", stderr = "" })
+    end
+    return true
+  end
+  if argv[1] == "ps" then
+    -- `ps -o args= -C Hyprland`: the compositor's command line, where --config
+    -- is the only visible sign of an explicitly chosen configuration file.
+    if type(onResult) == "function" then
+      onResult({ exitCode = psExitCode, stdout = psOutput or "", stderr = "" })
     end
     return true
   end
@@ -1556,6 +1568,39 @@ check("a free chord has nothing to undo", false, state().shortcut.canRemove)
 fixtureBinds = { { modmask = 72, key = "D", submap = "resize", has_description = true, description = "resize mode" } }
 command("shortcut-refresh")
 check("a submap binding is not a conflict", "available", state().shortcut.state)
+
+-- A universal bind runs in every submap including the default one, so it occupies
+-- the chord even though its submap is named.
+fixtureBinds = { { modmask = 72, key = "D", submap = "tools", submap_universal = "true", dispatcher = "exec", arg = "existing-launcher" } }
+command("shortcut-refresh")
+check("a universal submap bind is a conflict", "conflict", state().shortcut.state)
+local beforeUniversal = fs[CONF_PATH]
+command("shortcut-install")
+check("a universal conflict writes nothing", beforeUniversal, fs[CONF_PATH])
+
+-- A keycode bind carries no key name: the matcher falls back to the keycode, so a
+-- bind on the D key's keycode occupies the chord while `key` is empty.
+fixtureBinds = { { modmask = 72, key = "", keycode = 40, dispatcher = "exec", arg = "existing-launcher" } }
+command("shortcut-refresh")
+check("a keycode bind of the chord is a conflict", "conflict", state().shortcut.state)
+local beforeKeycode = fs[CONF_PATH]
+command("shortcut-install")
+check("a keycode conflict writes nothing", beforeKeycode, fs[CONF_PATH])
+
+-- The keycode check is not a blanket refusal: a bind on some other keycode leaves
+-- the chord free.
+fixtureBinds = { { modmask = 72, key = "", keycode = 24, dispatcher = "exec", arg = "existing-launcher" } }
+command("shortcut-refresh")
+check("a keycode bind of another key is not a conflict", "available", state().shortcut.state)
+
+-- A catchall bind runs on every key in the default submap, so it holds this chord
+-- too, and the compositor would run both bindings on one press.
+fixtureBinds = { { modmask = 72, key = "", catch_all = "true", dispatcher = "exec", arg = "existing-launcher" } }
+command("shortcut-refresh")
+check("a catchall bind of the chord is a conflict", "conflict", state().shortcut.state)
+local beforeCatchall = fs[CONF_PATH]
+command("shortcut-install")
+check("a catchall conflict writes nothing", beforeCatchall, fs[CONF_PATH])
 fixtureBinds = {}
 
 command("shortcut-install")
@@ -1824,6 +1869,42 @@ check("a missing explicit configuration is unsupported", "unsupported", state().
 check("a missing explicit configuration is named", true, string.find(state().shortcut.message, "missing.lua", 1, true) ~= nil)
 check("a missing explicit configuration cannot install", false, state().shortcut.canInstall)
 ENV.HYPRLAND_CONFIG = nil
+
+-- A --config path on the compositor's command line beats every default file, so
+-- the setup edits the file Hyprland is actually loading, not the one the XDG
+-- search would find.
+fs["/host"] = "@dir"
+putFile("/host/session.conf", "bind = SUPER, Return, exec, terminal\n")
+putFile(CONF_PATH, "# user config\n")
+fs[LUA_PATH] = nil
+psOutput = "/usr/bin/Hyprland --config /host/session.conf"
+command("shortcut-refresh")
+check("the compositor's config is chosen", "/host/session.conf", state().shortcut.path)
+check("the compositor's config is offered", "available", state().shortcut.state)
+command("shortcut-install")
+check("the compositor's config gets the block", true, string.find(fs["/host/session.conf"], "recording-shortcut:begin", 1, true) ~= nil)
+check("the compositor's config keeps the user's lines", true, string.find(fs["/host/session.conf"], "bind = SUPER, Return, exec, terminal", 1, true) ~= nil)
+check("the default file is left alone", "# user config\n", fs[CONF_PATH])
+command("shortcut-remove")
+check("undo clears the compositor's config", "available", state().shortcut.state)
+check("undo restores the compositor's config", "bind = SUPER, Return, exec, terminal\n", fs["/host/session.conf"])
+
+-- A command line that cannot be read leaves the --config choice unknown: the setup
+-- refuses to write rather than editing a file the compositor may not be loading.
+psExitCode = 1
+local untouched = fs[CONF_PATH]
+command("shortcut-refresh")
+check("an unreadable command line is unsupported", "unsupported", state().shortcut.state)
+check("an unreadable command line cannot install", false, state().shortcut.canInstall)
+check("an unreadable command line says why", true, string.find(state().shortcut.message, "command line", 1, true) ~= nil)
+command("shortcut-install")
+check("an unreadable command line writes nothing", untouched, fs[CONF_PATH])
+missingCommands.ps = true
+command("shortcut-refresh")
+check("a missing ps is unsupported", "unsupported", state().shortcut.state)
+missingCommands.ps = nil
+psExitCode = 0
+psOutput = "/usr/bin/Hyprland"
 
 -- The compositor runs every binding on a chord, so a second binding beside this
 -- setup's own block is reported rather than hidden behind "installed".
