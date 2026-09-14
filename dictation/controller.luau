@@ -364,7 +364,7 @@ local function reportSilence()
   silenceReported = true
   S.outcome = "internal"
   S.severity = "error"
-  S.message = "Lost contact with the recognition helper. The job is still owned: Cancel stops it, and another import waits until it exits."
+  S.message = "Lost contact with the recognition helper. The job is still owned: Cancel stops it, and another import waits until the job is released."
   publish()
   noctalia.notifyError("Dictation", S.message)
 end
