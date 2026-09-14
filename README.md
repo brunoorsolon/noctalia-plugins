@@ -23,6 +23,6 @@ noctalia msg plugins enable magus/dictation
 | Plugin | Description |
 | --- | --- |
 | [Masked Wallpaper Backdrop](masked-wallpaper/) | Keeps a blurred, tinted, decorated lockscreen backdrop in sync with the wallpaper. |
-| [Dictation](dictation/) | Transcribes a saved 16 kHz WAV with an installed recognition engine and GGUF model. |
+| [Dictation](dictation/) | Records the microphone you choose and transcribes it with an installed recognition engine and GGUF model. |
 
 Each plugin documents its own requirements, setup, and usage in its directory.

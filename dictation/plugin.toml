@@ -1,13 +1,13 @@
 id = "magus/dictation"
 name = "Dictation"
-version = "0.1.0"
+version = "0.2.0"
 plugin_api = 24
 author = "magus"
 license = "MIT"
-dependencies = ["python3", "transcribe-cli"]
-tags = ["audio", "dictation", "service", "panel"]
+dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "transcribe-cli"]
+tags = ["audio", "dictation", "recording", "service", "panel"]
 icon = "microphone"
-description = "Transcribes a saved 16 kHz WAV with an installed recognition engine and GGUF model."
+description = "Records the microphone you choose and transcribes the recording with an installed recognition engine and GGUF model."
 
 [[setting]]
 key = "engine"
@@ -49,7 +49,7 @@ entry = "controller.luau"
 id = "panel"
 entry = "panel.luau"
 width = 460
-height = 520
+height = 620
 placement = "floating"
 position = "center"
 open_near_click = true

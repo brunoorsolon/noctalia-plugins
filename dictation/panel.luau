@@ -1,5 +1,5 @@
--- Panel view: setup state, live job status, and the transcript the user reads and
--- copies. Everything it shows comes from the controller's published state.
+-- Panel view: microphone choice, live job status, and the transcript the user
+-- reads and copies. Everything it shows comes from the controller's state.
 
 local WIDTH = 460
 local LABEL_WIDTH = WIDTH - 32
@@ -8,6 +8,13 @@ local isOpen = false
 local draft = nil
 local draftKey = ""
 local commandSeq = 0
+
+local PHASE_TEXT = {
+  starting = "Starting the recorder.",
+  recording = "Recording.",
+  finalizing = "Finalizing the recording.",
+  transcribing = "Transcribing.",
+}
 
 local function state()
   local value = noctalia.state.get("dictation")
@@ -30,26 +37,34 @@ local function severityColor(severity)
   return "primary"
 end
 
-local function sendCommand(action)
+local function sendCommand(action, extra)
   commandSeq = commandSeq + 1
-  noctalia.state.set("dictation.command", { seq = commandSeq, action = action })
+  local command = { seq = commandSeq, action = action }
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do command[key] = value end
+  end
+  noctalia.state.set("dictation.command", command)
+end
+
+local function jobElapsed(s)
+  local job = s.job
+  if type(job) ~= "table" or type(job.elapsedSeconds) ~= "number" then return 0 end
+  return job.elapsedSeconds
 end
 
 local function statusText(s)
-  if s.activity == "running" then
-    -- A job whose helper went silent is still owned, so the panel reports the
-    -- lost contact instead of claiming the inference is progressing normally.
+  local activity = s.activity or "idle"
+  -- A job whose helper went silent is still owned, so the panel reports the
+  -- lost contact instead of claiming work is progressing normally.
+  if activity == "recording" or activity == "running" then
     if s.severity == "error" and type(s.message) == "string" and s.message ~= "" then
       return s.message
     end
-    local elapsed = 0
-    local job = s.job
-    if type(job) == "table" and type(job.elapsedSeconds) == "number" then
-      elapsed = job.elapsedSeconds
-    end
-    return string.format("Transcribing. %d:%02d elapsed.", math.floor(elapsed / 60), elapsed % 60)
+    local elapsed = jobElapsed(s)
+    local phase = activity == "recording" and (PHASE_TEXT[s.phase] or "Recording.") or "Transcribing."
+    return string.format("%s %d:%02d elapsed.", phase, math.floor(elapsed / 60), elapsed % 60)
   end
-  if s.activity == "verifying" then return "Verifying the executable and hashing the files." end
+  if activity == "verifying" then return "Verifying the executable and hashing the files." end
   if type(s.message) == "string" and s.message ~= "" then return s.message end
   return "Ready."
 end
@@ -76,6 +91,53 @@ local function setupBanner(s)
   return ui.column({ gap = 8, fill = color .. "/0.12", radius = 8, padding = 12 }, {
     ui.label({ text = setup.message or "Setup required.", color = color, maxWidth = LABEL_WIDTH }),
     ui.row({ gap = 8 }, actions),
+  })
+end
+
+-- The microphone list comes from pw-dump through the helper; the selection is a
+-- stable node name, so a reconnect keeps the same microphone chosen.
+local function microphoneRow(s)
+  local sources = type(s.sources) == "table" and s.sources or {}
+  local mic = type(s.microphone) == "table" and s.microphone or {}
+  local options, selected = {}, 0
+  if type(sources.list) == "table" then
+    for index, source in ipairs(sources.list) do
+      options[index] = source.description
+      if mic.id == source.id then selected = index - 1 end
+    end
+  end
+
+  local note, color = "", "on_surface_variant"
+  -- A recorder keeps the microphone it was started with, so the choice is closed
+  -- while audio is being captured instead of appearing to change it.
+  local capturing = (s.activity or "idle") == "recording"
+  if sources.state == "loading" then
+    note = "Scanning for microphones."
+  elseif sources.state == "error" then
+    note, color = sources.message, "error"
+  elseif mic.state == "missing" then
+    note, color = mic.message, "error"
+  elseif mic.state == "ok" then
+    note = "Recording from: " .. tostring(mic.name)
+  elseif mic.state == "unset" then
+    note, color = "Choose a microphone before recording.", "tertiary"
+  end
+
+  return ui.column({ gap = 6 }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = "Microphone", fontSize = 12, color = "on_surface_variant" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = "Refresh", variant = "ghost", onClick = "onRefreshSources" }),
+    }),
+    ui.select({
+      key = "microphone",
+      options = options,
+      selectedIndex = selected,
+      enabled = #options > 0 and not capturing,
+      placeholder = "No capture sources found",
+      onChange = "onMicrophoneSelected",
+    }),
+    ui.label({ text = note, fontSize = 12, color = color, maxWidth = LABEL_WIDTH }),
   })
 end
 
@@ -108,17 +170,36 @@ local function transcriptArea(s)
   })
 end
 
-local function buttonRow(s, recording)
-  local canStart = s.activity == "idle" and recording ~= ""
+local function recordingRow(s)
+  local activity = s.activity or "idle"
+  local idle = activity == "idle"
+  local mic = type(s.microphone) == "table" and s.microphone or {}
+  local canRecord = idle and mic.state == "ok"
+  local hasRecording = type(s.recording) == "table" and s.recording.exists == true
   return ui.row({ gap = 8, align = "center" }, {
-    ui.button({ text = "Transcribe", variant = "primary", enabled = canStart, onClick = "onTranscribe" }),
-    ui.button({ text = "Cancel", variant = "destructive", enabled = s.activity == "running", onClick = "onCancel" }),
-    ui.spacer({ flexGrow = 1 }),
     ui.button({
-      text = "Copy transcript",
-      enabled = s.copyable == true,
-      onClick = "onCopyTranscript",
+      text = activity == "recording" and "Stop" or "Record",
+      variant = "primary",
+      enabled = canRecord or activity == "recording",
+      onClick = activity == "recording" and "onStop" or "onRecord",
     }),
+    ui.button({
+      text = "Cancel",
+      variant = "destructive",
+      enabled = activity == "recording" or activity == "running",
+      onClick = "onCancel",
+    }),
+    ui.button({ text = "Play", enabled = idle and hasRecording, onClick = "onPlay" }),
+    ui.button({ text = "Retry", enabled = idle and hasRecording, onClick = "onRetry" }),
+    ui.spacer({ flexGrow = 1 }),
+    ui.button({ text = "Copy transcript", enabled = s.copyable == true, onClick = "onCopyTranscript" }),
+  })
+end
+
+local function jobRow(s, recording, idle)
+  return ui.row({ gap = 8, align = "center" }, {
+    ui.button({ text = "Transcribe file", variant = "ghost", enabled = idle and recording ~= "", onClick = "onTranscribe" }),
+    ui.spacer({ flexGrow = 1 }),
     ui.button({ text = "Close", variant = "ghost", onClick = "onClosePanel" }),
   })
 end
@@ -128,17 +209,19 @@ local function render()
   local recording = configPath("recording")
   local threads = noctalia.getConfig("threads")
   if type(threads) ~= "number" then threads = 4 end
-  local info = string.format("Backend CPU only. %d threads. Recording: %s",
-    math.floor(threads),
-    recording ~= "" and recording or "none selected")
+  local mic = type(s.microphone) == "table" and s.microphone or {}
+  local micLabel = mic.state == "ok" and tostring(mic.name) or (mic.id ~= "" and mic.id or "none selected")
+  local info = string.format("Backend CPU only. %d threads. Microphone: %s", math.floor(threads), micLabel)
   panel.render(ui.column({ gap = 10, padding = 16 }, {
     ui.label({ text = "Dictation", fontSize = 16, fontWeight = "bold" }),
     setupBanner(s),
     ui.label({ text = statusText(s), color = severityColor(s.severity), maxWidth = LABEL_WIDTH }),
     ui.label({ text = info, fontSize = 12, color = "on_surface_variant", maxWidth = LABEL_WIDTH }),
+    microphoneRow(s),
     ui.separator(),
     transcriptArea(s),
-    buttonRow(s, recording),
+    recordingRow(s),
+    jobRow(s, recording, s.activity == "idle" or s.activity == nil),
   }))
 end
 
@@ -151,16 +234,46 @@ function onClose()
   isOpen = false
 end
 
-function onTranscribe()
-  sendCommand("import")
+function onRecord()
+  sendCommand("record")
+end
+
+function onStop()
+  sendCommand("stop")
 end
 
 function onCancel()
   sendCommand("cancel")
 end
 
+function onPlay()
+  sendCommand("play")
+end
+
+function onRetry()
+  sendCommand("retry")
+end
+
+function onTranscribe()
+  sendCommand("import")
+end
+
 function onVerify()
   sendCommand("verify")
+end
+
+function onRefreshSources()
+  sendCommand("sources")
+end
+
+function onMicrophoneSelected(index, _text)
+  local s = state()
+  local list = type(s.sources) == "table" and type(s.sources.list) == "table" and s.sources.list or {}
+  local position = tonumber(index)
+  local source = position and list[position + 1]
+  if type(source) == "table" and type(source.id) == "string" then
+    sendCommand("select", { source = source.id })
+  end
 end
 
 function onOpenSettings()

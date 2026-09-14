@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Recognition helper for the magus/dictation Noctalia plugin.
+"""Recognition and recording helper for the magus/dictation Noctalia plugin.
 
-The plugin owns the interface and the settings; this helper owns every
-recognition job. It validates the imported WAV, builds the engine argv, runs
-the installed transcribe-cli with CPU-only inference, thread-matched
-OpenMP/OpenBLAS limits and niceness 10, enforces the 30-minute watchdog, ties
-the engine's lifetime to its own so a killed helper cannot leave it running,
-honours a cancel request, and persists the raw engine output, logs, transcript
-and per-attempt result under the plugin data directory.
+The plugin owns the interface and the settings; this helper owns every job. It
+enumerates the PipeWire capture sources, records the selected microphone to a
+private 16 kHz mono signed-16 WAV, finalizes that recording on a stop request,
+validates the audio before recognition, runs the installed transcribe-cli with
+CPU-only inference, thread-matched OpenMP/OpenBLAS limits and niceness 10,
+enforces the 30-minute watchdog, ties every child's lifetime to its own so a
+killed helper cannot leave a recorder or an engine behind, honours stop, cancel
+and controller-loss requests, and persists the raw engine output, logs,
+transcript and per-attempt result under the plugin data directory.
 
 Only the Python standard library is used. The plugin never builds a shell
 string: it passes a program name and an argument array here, and this helper
-does the same to the engine.
+does the same to every child it starts.
 """
 
 import argparse
@@ -45,6 +47,23 @@ PR_SET_PDEATHSIG = 1  # Linux prctl option: signal the child when its parent die
 CONTROL_TOKEN = re.compile(r"<\|[^|>]*\|>")
 TRUNCATION_MARK = "truncat"
 SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
+
+# Recording is fixed to the format the engine and the plugin validate: a real
+# 16 kHz mono signed-16 WAV captured by pw-record from the selected source.
+RECORD_RATE = 16000
+RECORD_CHANNELS = 1
+RECORD_FORMAT = "s16"
+# A stop waits this long for pw-record to finish the WAV before it is killed.
+STOP_GRACE_SECONDS = 5
+# Playback is bounded so a stuck pw-play cannot outlive its helper forever.
+DEFAULT_PLAY_TIMEOUT_SECONDS = 600
+# Cancel and controller loss wait this long before escalating to SIGKILL.
+CANCEL_GRACE_SECONDS = 3
+# The controller refreshes its lease every second; six seconds of silence means
+# it is gone and the microphone must be released even if nobody asked.
+DEFAULT_LEASE_SECONDS = 6
+MONITOR_SUFFIX = ".monitor"
+MONITOR_PREFIX = "monitor of "
 
 # Set per command; every verdict is mirrored here so the plugin, which launches
 # this helper detached, can read the outcome instead of a short-lived callback.
@@ -111,6 +130,13 @@ def private_open(path):
     return os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
 
 
+def atomic_write(path, text):
+    """Write through a rename so a reader never sees half a file."""
+    temporary = path + ".tmp"
+    private_write(temporary, text)
+    os.replace(temporary, path)
+
+
 def log_tail(path, limit=240):
     """The last engine output, so a failing run explains itself in the outcome."""
     try:
@@ -136,6 +162,35 @@ def write_heartbeat(path):
         pass
 
 
+def write_status(job_dir, job, phase, message):
+    """The phase the panel reports: starting, recording, finalizing, transcribing."""
+    try:
+        atomic_write(
+            os.path.join(job_dir, "status.json"),
+            json.dumps(
+                {
+                    "ts": int(time.time()),
+                    "jobId": job["jobId"],
+                    "startedAt": job["startedAt"],
+                    "phase": phase,
+                    "message": message,
+                }
+            )
+            + "\n",
+        )
+    except OSError:
+        # Status is a view, not a contract; the summary carries the outcome.
+        pass
+
+
+def write_job_record(job_dir, job):
+    """The config this job started with, so a reload adopts it instead of guessing."""
+    try:
+        atomic_write(os.path.join(job_dir, "job.json"), json.dumps(job, indent=2) + "\n")
+    except OSError:
+        pass
+
+
 def probe_flags(engine):
     """Return (required flags the engine's --help omits, failure to run --help)."""
     try:
@@ -152,6 +207,24 @@ def probe_flags(engine):
     if completed.returncode != 0 and len(missing) == len(REQUIRED_FLAGS):
         return [], "%s --help exited with status %d and printed no usage" % (engine, completed.returncode)
     return missing, None
+
+
+def engine_problem(engine, model):
+    """The shared engine/model preflight; None when the pair can be used."""
+    if not os.path.isfile(engine) or not os.access(engine, os.X_OK):
+        return {"outcome": "setup_required", "message": "Setup required: the recognition engine is missing or not executable."}
+    if not os.path.isfile(model):
+        return {"outcome": "setup_required", "message": "Setup required: the Model GGUF is missing."}
+    missing, failure = probe_flags(engine)
+    if failure:
+        return {"outcome": "engine_unavailable", "message": "The recognition engine could not be run: %s." % failure}
+    if missing:
+        return {
+            "outcome": "engine_incompatible",
+            "message": "Setup required: the engine does not support %s." % ", ".join(missing),
+            "extra": {"missingFlags": missing},
+        }
+    return None
 
 
 def validate_wav(path):
@@ -180,6 +253,203 @@ def validate_wav(path):
         return "The imported WAV contains no audio frames."
     return None
 
+
+# ── Capture sources ──────────────────────────────────────────────────────────
+
+def is_monitor(props, name):
+    """A monitor is an output loopback, never a microphone.
+
+    pw-dump does not mark monitors with one portable field, so the two names
+    PipeWire and the session managers give them are used, and the plugin never
+    falls back to one when the chosen source is missing.
+    """
+    if name.lower().endswith(MONITOR_SUFFIX):
+        return True
+    text = str(props.get("node.description") or props.get("device.description") or "")
+    return text.strip().lower().startswith(MONITOR_PREFIX)
+
+
+def enumerate_sources(raw):
+    sources = []
+    for obj in raw:
+        if not isinstance(obj, dict):
+            continue
+        info = obj.get("info")
+        props = info.get("props") if isinstance(info, dict) else None
+        if not isinstance(props, dict) or props.get("media.class") != "Audio/Source":
+            continue
+        name = props.get("node.name")
+        if not isinstance(name, str) or name.strip() == "":
+            continue
+        if is_monitor(props, name):
+            continue
+        description = props.get("node.description") or props.get("device.description") or name
+        sources.append(
+            {
+                "id": name,
+                "name": name,
+                "description": str(description),
+            }
+        )
+    sources.sort(key=lambda source: (source["description"].lower(), source["id"]))
+    return sources
+
+
+def pw_dump_sources():
+    """(sources, problem) from the structured PipeWire graph, never from names alone."""
+    try:
+        completed = subprocess.run(
+            ["pw-dump"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, "Could not read the PipeWire graph with pw-dump: %s" % exc
+    if completed.returncode != 0:
+        lines = [line for line in completed.stderr.decode("utf-8", "replace").splitlines() if line.strip()]
+        detail = ": " + " ".join(lines[-1].split()) if lines else ""
+        return None, "pw-dump exited with status %d%s" % (completed.returncode, detail)
+    try:
+        raw = json.loads(completed.stdout.decode("utf-8", "replace"))
+    except ValueError as exc:
+        return None, "pw-dump did not produce JSON: %s" % exc
+    if not isinstance(raw, list):
+        return None, "pw-dump produced an unexpected document."
+    return enumerate_sources(raw), None
+
+
+def command_sources(args):
+    """List the capture sources the user can choose from."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    data_dir = private_dir(args.data_dir)
+    SUMMARY_PATH = os.path.join(data_dir, "sources.json")
+    sources, problem = pw_dump_sources()
+    if problem:
+        verdict("sources_unavailable", "error", problem)
+        return
+    if not sources:
+        verdict("no_sources", "error", "PipeWire reports no capture sources. Connect a microphone and refresh.")
+        return
+    verdict(
+        "ok",
+        "ok",
+        "Found %d capture source%s." % (len(sources), "" if len(sources) == 1 else "s"),
+        sources=sources,
+        capturedAt=int(time.time()),
+    )
+
+
+# ── Process ownership ────────────────────────────────────────────────────────
+
+def child_preexec(nice_value):
+    """Runs in a forked child, before it execs.
+
+    A helper that is killed outright cannot stop its children, and the plugin
+    keeps a job owned while any process for it is alive, so no child may outlive
+    the helper. PR_SET_PDEATHSIG covers exactly that case, including SIGKILL,
+    which no in-helper cleanup can.
+    """
+    if nice_value is not None:
+        try:
+            os.nice(nice_value)
+        except OSError:
+            pass
+    try:
+        # The recorder writes its own WAV, so give it a private umask too.
+        os.umask(0o077)
+    except OSError:
+        pass
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        parent = os.getppid()
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        # The parent can die between the fork and that call; re-check the race.
+        if os.getppid() != parent:
+            os.kill(os.getpid(), signal.SIGKILL)
+    except Exception:
+        # Not Linux, or no libc to call: the watchdog still stops the engine.
+        pass
+
+
+def engine_preexec():
+    child_preexec(NICE)
+
+
+def recorder_preexec():
+    child_preexec(None)
+
+
+def group_signal(proc, number):
+    """Signal the process group of a child this helper started itself."""
+    try:
+        os.killpg(os.getpgid(proc.pid), number)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+
+def stop_recorder(proc, grace=STOP_GRACE_SECONDS):
+    """Ask one recorder to finish with SIGINT, then kill that same process."""
+    try:
+        proc.send_signal(signal.SIGINT)
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    group_signal(proc, signal.SIGKILL)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def cancel_recorder(proc, grace=CANCEL_GRACE_SECONDS):
+    """Cancel and controller loss: group SIGTERM, then group SIGKILL after a grace."""
+    group_signal(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=grace)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    group_signal(proc, signal.SIGKILL)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def terminate(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def lease_stale(path, limit):
+    """True when the controller has stopped refreshing its claim on this job.
+
+    A missing or unreadable lease counts as stale: the plugin writes the lease
+    before it launches the helper, so no lease means no live controller.
+    """
+    try:
+        with open(path, "rb") as handle:
+            record = json.loads(handle.read().decode("utf-8", "replace"))
+    except (OSError, ValueError):
+        return True
+    stamp = record.get("ts") if isinstance(record, dict) else None
+    if not isinstance(stamp, (int, float)):
+        return True
+    return (time.time() - stamp) > limit
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
 
 def command_probe(args):
     """Explicit setup: verify the engine, hash the engine and model, record them."""
@@ -228,27 +498,6 @@ def command_probe(args):
     )
 
 
-def engine_preexec():
-    """Runs in the forked engine process, before it execs.
-
-    A helper that is killed outright cannot stop its engine, and the plugin keeps
-    the job owned while any process for it is alive, so the engine must not
-    outlive the helper. PR_SET_PDEATHSIG covers exactly that case, including
-    SIGKILL, which no in-helper cleanup can.
-    """
-    os.nice(NICE)
-    try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        parent = os.getppid()
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-        # The parent can die between the fork and that call; re-check the race.
-        if os.getppid() != parent:
-            os.kill(os.getpid(), signal.SIGKILL)
-    except Exception:
-        # Not Linux, or no libc to call: the watchdog still stops the engine.
-        pass
-
-
 def command_run(args):
     global SUMMARY_PATH
     # The engine runs with the attempt directory as its working directory, so a
@@ -258,64 +507,330 @@ def command_run(args):
     if args.wav != "":
         args.wav = os.path.abspath(args.wav)
     args.data_dir = os.path.abspath(args.data_dir)
-    job_dir = private_dir(os.path.join(args.data_dir, "jobs", safe_id(args.job_id)))
+    jobs_dir = private_dir(os.path.join(args.data_dir, "jobs"))
+    job_dir = private_dir(os.path.join(jobs_dir, safe_id(args.job_id)))
     SUMMARY_PATH = os.path.join(job_dir, "summary.json")
     # The plugin watches this file, so a helper that dies is noticed in seconds
     # instead of waiting out the inference stall guard.
     heartbeat_path = os.path.join(job_dir, "heartbeat.json")
     write_heartbeat(heartbeat_path)
+    write_job_record(
+        job_dir,
+        {
+            "jobId": args.job_id,
+            "mode": "import",
+            "engine": args.engine,
+            "model": args.model,
+            "threads": args.threads,
+            "startedAt": int(time.time() * 1000),
+            "wav": args.wav,
+        },
+    )
     if args.threads < 1 or args.threads > 64:
         verdict("invalid_threads", "error", "Setup required: the inference thread count must be between 1 and 64.")
         return
-    if not os.path.isfile(args.engine) or not os.access(args.engine, os.X_OK):
-        verdict("setup_required", "error", "Setup required: the recognition engine is missing or not executable.")
-        return
-    if not os.path.isfile(args.model):
-        verdict("setup_required", "error", "Setup required: the Model GGUF is missing.")
-        return
-    missing, failure = probe_flags(args.engine)
-    if failure:
-        verdict("engine_unavailable", "error", "The recognition engine could not be run: %s." % failure)
-        return
-    if missing:
-        verdict(
-            "engine_incompatible",
-            "error",
-            "Setup required: the engine does not support %s." % ", ".join(missing),
-            missingFlags=missing,
-        )
+    problem = engine_problem(args.engine, args.model)
+    if problem:
+        verdict(problem["outcome"], "error", problem["message"], **problem.get("extra", {}))
         return
     wav_problem = validate_wav(args.wav)
     if wav_problem:
         verdict("invalid_wav", "error", wav_problem, wav=args.wav)
         return
-    transcribe(args, heartbeat_path)
+    # The imported file is this job's recording too, so the panel can play it back
+    # and retry it without the user choosing it again.
+    transcribe(args, heartbeat_path, recording=args.wav)
 
 
-def terminate(proc):
-    proc.terminate()
+def command_play(args):
+    """Play a saved recording on the local output.
+
+    Playback runs here, not in Noctalia, so the process belongs to this helper:
+    it is bounded by a timeout and it carries the same parent-death signal as the
+    recorder. Nothing is pasted and no clipboard is touched.
+    """
+    wav = os.path.abspath(args.wav)
+    if not os.path.isfile(wav):
+        verdict("missing_recording", "error", "There is no saved recording to play.")
+        return
     try:
-        proc.wait(timeout=10)
+        proc = subprocess.Popen(
+            ["pw-play", wav],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            preexec_fn=recorder_preexec,
+        )
+    except OSError as exc:
+        verdict("playback_unavailable", "error", "Could not start pw-play: %s." % exc)
+        return
+    try:
+        _, stderr = proc.communicate(timeout=args.timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        terminate(proc)
+        verdict("playback_timeout", "error", "Playback exceeded the limit and was stopped.")
+        return
+    if proc.returncode != 0:
+        detail = " ".join(stderr.decode("utf-8", "replace").split())[:200]
+        verdict(
+            "playback_failed",
+            "error",
+            "pw-play exited with status %d.%s" % (proc.returncode, (" " + detail) if detail else ""),
+        )
+        return
+    verdict("ok", "ok", "Played the saved recording. Nothing was pasted.")
 
 
-def transcribe(args, heartbeat_path):
+def command_record(args):
+    """Record one job: capture, finalize, validate, then transcribe.
+
+    Every step is owned by this process. Stop signals only the recorder this
+    helper started, cancel and controller loss stop only that recorder's own
+    process group, and the captured audio is preserved before any inference.
+    """
+    global SUMMARY_PATH
+    args.engine = os.path.abspath(args.engine)
+    args.model = os.path.abspath(args.model)
+    args.data_dir = os.path.abspath(args.data_dir)
+    job_name = safe_id(args.job_id)
+    jobs_dir = private_dir(os.path.join(args.data_dir, "jobs"))
+    job_dir = private_dir(os.path.join(jobs_dir, job_name))
+    SUMMARY_PATH = os.path.join(job_dir, "summary.json")
+    heartbeat_path = os.path.join(job_dir, "heartbeat.json")
+    recording = os.path.join(job_dir, "recording.wav")
+    stop_file = os.path.join(jobs_dir, job_name + ".stop")
+    cancel_file = os.path.join(jobs_dir, job_name + ".cancel")
+    lease_file = os.path.join(jobs_dir, job_name + ".lease")
+    job = {
+        "jobId": args.job_id,
+        "mode": "record",
+        "source": args.source,
+        "engine": args.engine,
+        "model": args.model,
+        "threads": args.threads,
+        "startedAt": int(time.time() * 1000),
+        "recording": recording,
+    }
+    write_job_record(job_dir, job)
+    write_heartbeat(heartbeat_path)
+    write_status(job_dir, job, "starting", "Preparing the microphone.")
+    recording_paths = {"jobDir": job_dir, "recording": recording}
+
+    if args.threads < 1 or args.threads > 64:
+        verdict("invalid_threads", "error", "Setup required: the inference thread count must be between 1 and 64.", jobId=args.job_id)
+        return
+    problem = engine_problem(args.engine, args.model)
+    if problem:
+        verdict(problem["outcome"], "error", problem["message"], jobId=args.job_id, **problem.get("extra", {}))
+        return
+    sources, source_problem = pw_dump_sources()
+    if source_problem:
+        verdict("sources_unavailable", "error", "Could not check the selected microphone: " + source_problem, jobId=args.job_id)
+        return
+    if not any(source["id"] == args.source for source in sources):
+        verdict(
+            "source_missing",
+            "error",
+            "The selected microphone is not available: %s. Connect it and choose it in the panel; no other source is used."
+            % args.source,
+            jobId=args.job_id,
+            availableSources=[source["id"] for source in sources],
+        )
+        return
+
+    # The controller allocates the job id fresh and never reuses one, so a request
+    # written for this job id is this job's own request however early it arrives:
+    # it is never discarded as a leftover from an earlier job. The controller
+    # accepts Stop and Cancel as soon as it has launched this helper, so a request
+    # can exist before this function, or this process, has started; the microphone
+    # is not opened for a recording its owner has already ended.
+    if os.path.exists(cancel_file):
+        try:
+            os.remove(cancel_file)
+        except OSError:
+            pass
+        verdict(
+            "cancelled",
+            "cancelled",
+            "Cancelled before the microphone was opened, so no audio was captured.",
+            jobId=args.job_id,
+            attempt=0,
+            paths=recording_paths,
+            source=args.source,
+        )
+        return
+    if os.path.exists(stop_file):
+        try:
+            os.remove(stop_file)
+        except OSError:
+            pass
+        verdict(
+            "invalid_recording",
+            "error",
+            "The recording was stopped before the microphone was opened, so no audio was captured.",
+            jobId=args.job_id,
+            attempt=0,
+            paths=recording_paths,
+            source=args.source,
+        )
+        return
+    argv = [
+        "pw-record",
+        "--target", args.source,
+        "--rate", str(RECORD_RATE),
+        "--channels", str(RECORD_CHANNELS),
+        "--format", RECORD_FORMAT,
+        recording,
+    ]
+    recorder_log = os.path.join(job_dir, "recorder.log")
+    try:
+        with private_open(recorder_log) as log:
+            recorder = subprocess.Popen(
+                argv,
+                stdout=log,
+                stderr=log,
+                cwd=job_dir,
+                env=dict(os.environ),
+                preexec_fn=recorder_preexec,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        verdict("recorder_unavailable", "error", "Could not start pw-record: %s." % exc, jobId=args.job_id)
+        return
+    write_status(job_dir, job, "recording", "Recording from the selected microphone.")
+    write_heartbeat(heartbeat_path)
+
+    override = None  # (outcome, severity, message)
+    stop_requested = False
+    recorder_code = None
+    last_beat = time.monotonic()
+    while True:
+        code = recorder.poll()
+        if code is not None:
+            recorder_code = code
+            break
+        if os.path.exists(cancel_file):
+            override = ("cancelled", "cancelled", "Cancelled while recording. The captured audio was preserved.")
+            break
+        if os.path.exists(stop_file):
+            stop_requested = True
+            break
+        if lease_stale(lease_file, args.lease_seconds):
+            override = (
+                "interrupted",
+                "error",
+                "Noctalia stopped claiming the recording, so the microphone was released. The captured audio was preserved.",
+            )
+            break
+        now = time.monotonic()
+        if now - last_beat >= HEARTBEAT_SECONDS:
+            last_beat = now
+            write_heartbeat(heartbeat_path)
+        time.sleep(0.25)
+
+    # The request files never outlive the job that owns them.
+    for path in (stop_file, cancel_file):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    if os.path.exists(recording):
+        try:
+            os.chmod(recording, 0o600)
+        except OSError:
+            pass
+
+    if override:
+        write_status(job_dir, job, "finalizing", "Stopping the recorder.")
+        cancel_recorder(recorder)
+        problem = validate_wav(recording)
+        verdict(
+            override[0],
+            override[1],
+            override[2],
+            jobId=args.job_id,
+            attempt=0,
+            usableAudio=problem is None,
+            paths=recording_paths,
+            source=args.source,
+        )
+        return
+
+    if stop_requested:
+        write_status(job_dir, job, "finalizing", "Stopping the recorder and finalizing the WAV.")
+        stop_recorder(recorder)
+        # The stop is not the last word: a cancel that arrives while the WAV is
+        # being finalized wins, so an accepted cancel is never silently dropped.
+        if os.path.exists(cancel_file):
+            try:
+                os.remove(cancel_file)
+            except OSError:
+                pass
+            problem = validate_wav(recording)
+            verdict(
+                "cancelled",
+                "cancelled",
+                "Cancelled while the recording was being finalized. The captured audio was preserved.",
+                jobId=args.job_id,
+                attempt=0,
+                usableAudio=problem is None,
+                paths=recording_paths,
+                source=args.source,
+            )
+            return
+        problem = validate_wav(recording)
+        if problem:
+            verdict(
+                "invalid_recording",
+                "error",
+                "The microphone did not produce usable audio: %s" % problem,
+                jobId=args.job_id,
+                attempt=0,
+                paths=recording_paths,
+                source=args.source,
+            )
+            return
+        args.wav = recording
+        transcribe(args, heartbeat_path, status_dir=job_dir, status_job=job, recording=recording)
+        return
+
+    write_status(job_dir, job, "finalizing", "The recorder stopped on its own.")
+    try:
+        recorder.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        cancel_recorder(recorder)
+    detail = log_tail(recorder_log)
+    verdict(
+        "recorder_failed",
+        "error",
+        "pw-record stopped before the recording was finished (status %s).%s The captured audio was preserved."
+        % (recorder_code, (" " + detail) if detail else ""),
+        jobId=args.job_id,
+        attempt=0,
+        paths=recording_paths,
+        source=args.source,
+    )
+
+
+def transcribe(args, heartbeat_path, status_dir=None, status_job=None, recording=None):
     private_dir(args.data_dir)
     jobs_dir = private_dir(os.path.join(args.data_dir, "jobs"))
     job_name = safe_id(args.job_id)
     job_dir = private_dir(os.path.join(jobs_dir, job_name))
     cancel_file = os.path.join(jobs_dir, job_name + ".cancel")
+    record_path = recording if recording is not None else (args.wav if os.path.isabs(args.wav) else "")
     if os.path.exists(cancel_file):
         # A cancel that arrived before any work started is honoured, not discarded.
         os.remove(cancel_file)
-        verdict("cancelled", "cancelled", "Cancelled before the engine started.")
+        verdict("cancelled", "cancelled", "Cancelled before the engine started.", jobId=args.job_id, attempt=0, paths={"jobDir": job_dir, "recording": record_path})
         return
     attempt = 1
     while os.path.isdir(os.path.join(job_dir, "attempt-%d" % attempt)):
         attempt += 1
     attempt_dir = private_dir(os.path.join(job_dir, "attempt-%d" % attempt))
+
+    if status_dir and status_job:
+        write_status(status_dir, status_job, "transcribing", "Transcribing the recording.")
 
     wav = os.path.abspath(args.wav)
     input_list = os.path.join(attempt_dir, "input-list.txt")
@@ -438,6 +953,7 @@ def transcribe(args, heartbeat_path):
             "log": log_path,
             "transcript": transcript_path,
             "result": result_path,
+            "recording": recording,
         },
     }
     write_result(result)
@@ -561,6 +1077,9 @@ def main(argv):
     probe.add_argument("--model", required=True)
     probe.add_argument("--data-dir", required=True)
 
+    sources = sub.add_parser("sources")
+    sources.add_argument("--data-dir", required=True)
+
     run = sub.add_parser("run")
     run.add_argument("--engine", required=True)
     run.add_argument("--model", required=True)
@@ -570,9 +1089,29 @@ def main(argv):
     run.add_argument("--data-dir", required=True)
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
 
+    record = sub.add_parser("record")
+    record.add_argument("--engine", required=True)
+    record.add_argument("--model", required=True)
+    record.add_argument("--threads", type=int, required=True)
+    record.add_argument("--source", required=True)
+    record.add_argument("--job-id", required=True)
+    record.add_argument("--data-dir", required=True)
+    record.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    record.add_argument("--lease-seconds", type=float, default=DEFAULT_LEASE_SECONDS)
+
+    play = sub.add_parser("play")
+    play.add_argument("--wav", required=True)
+    play.add_argument("--timeout", type=float, default=DEFAULT_PLAY_TIMEOUT_SECONDS)
+
     args = parser.parse_args(argv)
     if args.command == "probe":
         command_probe(args)
+    elif args.command == "sources":
+        command_sources(args)
+    elif args.command == "record":
+        command_record(args)
+    elif args.command == "play":
+        command_play(args)
     else:
         command_run(args)
     return 0
