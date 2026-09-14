@@ -588,7 +588,6 @@ def command_record(args):
     process group, and the captured audio is preserved before any inference.
     """
     global SUMMARY_PATH
-    started = time.time()
     args.engine = os.path.abspath(args.engine)
     args.model = os.path.abspath(args.model)
     args.data_dir = os.path.abspath(args.data_dir)
@@ -638,19 +637,27 @@ def command_record(args):
         )
         return
 
-    # Only a request that predates this helper is stale: it belongs to an earlier
-    # job that reused the id. Stop or Cancel written after this helper started is
-    # this job's own request, so one pressed while the engine and the source were
-    # still being prepared is honoured by the loop below instead of discarded.
-    for path in (stop_file, cancel_file):
-        if os.path.exists(path) and os.path.getmtime(path) < started:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-    # A Stop that arrived while the engine and the source were still being prepared
-    # is this job's Stop, so the microphone is never opened for a recording the user
-    # already ended.
+    # The controller allocates the job id fresh and never reuses one, so a request
+    # written for this job id is this job's own request however early it arrives:
+    # it is never discarded as a leftover from an earlier job. The controller
+    # accepts Stop and Cancel as soon as it has launched this helper, so a request
+    # can exist before this function, or this process, has started; the microphone
+    # is not opened for a recording its owner has already ended.
+    if os.path.exists(cancel_file):
+        try:
+            os.remove(cancel_file)
+        except OSError:
+            pass
+        verdict(
+            "cancelled",
+            "cancelled",
+            "Cancelled before the microphone was opened, so no audio was captured.",
+            jobId=args.job_id,
+            attempt=0,
+            paths=recording_paths,
+            source=args.source,
+        )
+        return
     if os.path.exists(stop_file):
         try:
             os.remove(stop_file)

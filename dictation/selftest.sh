@@ -673,6 +673,25 @@ check "stop during startup is honoured" invalid_recording "$(field outcome <"$wo
 check "stop during startup opens no microphone" False "$([[ -f "$data/jobs/job-early-stop/recorder.log" ]] && echo True || echo False)"
 check "stop during startup cleared the request" False "$([[ -f "$data/jobs/job-early-stop.stop" ]] && echo True || echo False)"
 
+# The controller accepts Stop as soon as it has launched the helper, so a request
+# for this job can exist before this helper process has started at all. The job id
+# is allocated fresh and never reused, so such a request is this job's own and the
+# microphone is not opened for a recording its owner already ended. A lease short
+# enough to end the recording keeps the unfixed path from waiting forever.
+printf 'stop\n' >"$data/jobs/job-pre-stop.stop"
+LEASE=6 REC_JSON= helper_record job-pre-stop >"$work/rec-pre-stop.json"
+check "stop queued before the helper starts is honoured" invalid_recording "$(field outcome <"$work/rec-pre-stop.json")"
+check "stop queued before the helper starts opens no microphone" False "$([[ -f "$data/jobs/job-pre-stop/recorder.log" ]] && echo True || echo False)"
+check "stop queued before the helper starts cleared the request" False "$([[ -f "$data/jobs/job-pre-stop.stop" ]] && echo True || echo False)"
+
+# The same window for Cancel: the request wins over the capture and no recognition
+# is started, because the job never captured anything to recognize.
+printf 'cancel\n' >"$data/jobs/job-pre-cancel.cancel"
+LEASE=6 REC_JSON= helper_record job-pre-cancel >"$work/rec-pre-cancel.json"
+check "cancel queued before the helper starts is honoured" cancelled "$(field outcome <"$work/rec-pre-cancel.json")"
+check "cancel queued before the helper starts opens no microphone" False "$([[ -f "$data/jobs/job-pre-cancel/recorder.log" ]] && echo True || echo False)"
+check "cancel queued before the helper starts cleared the request" False "$([[ -f "$data/jobs/job-pre-cancel.cancel" ]] && echo True || echo False)"
+
 # A controller that stops refreshing the lease releases the microphone by itself.
 LEASE=6 REC_JSON= helper_record job-lease >"$work/rec-lease.json" &
 pid=$!
