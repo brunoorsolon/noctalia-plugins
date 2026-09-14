@@ -13,11 +13,10 @@ local JOBS = DATA and (DATA .. "/jobs") or nil
 -- plugin's own state does not survive a reload, and a detached helper does.
 local JOB_POINTER = DATA and (DATA .. "/current-job") or nil
 
--- Longest a helper may stay silent before the controller stops waiting. The
--- helper's own watchdog stops inference after 30 minutes, and it rewrites its
--- heartbeat every few seconds, so silence this long means it is gone.
+-- How long a helper may stay silent before the controller reports the lost
+-- contact. The helper rewrites its heartbeat every few seconds, so silence this
+-- long means the plugin can no longer see it working.
 local RUN_SILENT_SECONDS = 60
-local RUN_STALL_SECONDS = 35 * 60
 local PROBE_STALL_SECONDS = 10 * 60
 
 local S = {
@@ -38,6 +37,11 @@ local S = {
 local summaryPath = nil
 local activityStartedAtMs = 0
 local silenceReported = false
+-- Lost contact is not lost ownership: a job is released only when the helper
+-- reports or when the runtime confirms that no process for it is left.
+-- nil = not asked yet, true = observed running, false = observed gone.
+local jobProcessAlive = nil
+local processCheckPending = false
 
 local function publish()
   noctalia.state.set("dictation", S)
@@ -124,6 +128,7 @@ local function resetActivity()
   S.activity = "idle"
   summaryPath = nil
   silenceReported = false
+  jobProcessAlive = nil
   if JOB_POINTER then noctalia.removeFile(JOB_POINTER) end
 end
 
@@ -344,21 +349,36 @@ local function finishProbe(summary)
   end
 end
 
-local function stopWaiting()
-  local seconds = (noctalia.nowMs() - activityStartedAtMs) / 1000
-  local limit = S.activity == "running" and RUN_STALL_SECONDS or PROBE_STALL_SECONDS
-  if seconds <= limit then return false end
-  fail("The recognition helper stopped without reporting a result.", "internal")
+-- A verification helper starts no engine, so giving up on one cannot overlap a
+-- recognition job; only a recognition job has to be released with its engine.
+local function probeExpired()
+  if S.activity ~= "verifying" then return false end
+  if (noctalia.nowMs() - activityStartedAtMs) / 1000 <= PROBE_STALL_SECONDS then return false end
+  fail("The setup verification stopped without reporting a result.", "internal")
   return true
 end
 
--- Silence is not an exit. The engine may still be running, so reporting the lost
--- contact must not release the job: a second import would overlap the first, and
--- Cancel would lose its target. Ownership is handed back when the helper reports
--- an outcome, or when the stall window passes as a bounded escape hatch.
--- ponytail: the stall release is time-based, not proof of exit. A helper killed
--- with no report can leave an orphaned engine, and a detached-engine check would
--- have to observe the process itself; upgrade if an engine can outlive its helper.
+-- Silence is not an exit. Contact can stop while the engine keeps running, so
+-- the job stays owned and its Cancel stays valid until a summary arrives or the
+-- runtime confirms that no process for the job is left. A clock cannot make that
+-- call, because the helper's watchdog dies with the helper, not with its engine.
+-- The engine carries this job's directory in its command line, so a match is a
+-- live helper or a live engine, and only no match releases the job.
+-- ponytail: when the runtime cannot answer the process check the job stays
+-- owned, so a helper that died leaving a live engine locks out new imports until
+-- that engine stops. Add an abandon action if that lock ever bites a real user.
+local function checkJobProcess()
+  if processCheckPending or S.activity ~= "running" or not S.job then return end
+  if type(noctalia.processMatches) ~= "function" then return end
+  local jobId = S.job.id
+  processCheckPending = true
+  local accepted = noctalia.processMatches(function(matched)
+    processCheckPending = false
+    if S.job and S.job.id == jobId then jobProcessAlive = matched == true end
+  end, jobId)
+  if accepted == false then processCheckPending = false end
+end
+
 local function reportSilence()
   if silenceReported then return end
   silenceReported = true
@@ -374,9 +394,16 @@ function update()
   local path = summaryPath
   local summary = path and noctalia.fileExists(path) and readSummary(path) or nil
   if not summary then
-    if stopWaiting() then return end
+    if probeExpired() then return end
     if helperSilent() then
       reportSilence()
+      -- Contact is lost, not ownership. Release the job only on a confirmed
+      -- absence, never on elapsed time.
+      checkJobProcess()
+      if jobProcessAlive == false then
+        fail("The recognition helper stopped without reporting, and no process for the job is left.", "internal")
+        return
+      end
     elseif silenceReported then
       -- Contact resumed before any result: the job is live again, so stop
       -- showing the lost-contact error.

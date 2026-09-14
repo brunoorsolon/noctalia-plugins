@@ -61,7 +61,7 @@ noctalia msg panel-toggle magus/dictation:panel
 
 - **Transcribe** imports the selected recording as one job. Only one job runs at a time, and the buttons stay responsive while it runs — the elapsed time keeps counting.
 - The plugin writes the id of the running job to disk and reads it back when it starts, so reloading or updating the plugin adopts the job that is already running instead of forgetting it: **Cancel** keeps addressing that job, and another import is refused until it ends.
-- The helper rewrites a heartbeat while it runs. If it stops reporting for a minute — a crash, a killed process, a full disk — the panel says contact was lost and keeps the job owned, so **Cancel** still reaches it and another import is refused. The job is released once the helper reports, or after the window beyond the helper's own 30-minute watchdog has passed; its files stay in the plugin data directory.
+- The helper rewrites a heartbeat while it runs. If it stops reporting for a minute — a crash, a killed process, a full disk — the panel says contact was lost and keeps the job owned, so **Cancel** still reaches it and another import is refused. The job is released once the helper reports, or once no process for that job is left running; its files stay in the plugin data directory.
 - **Cancel** asks the helper to stop the engine this job started. If no engine has started yet, the cancel is honoured anyway instead of being discarded. Only this plugin's own process is stopped.
 - The transcript appears in a selectable multiline field once the engine has returned text. Text is shown even when the outcome is an error or a review, so a partial result is readable; only a usable transcript enables **Copy transcript**.
 - **Copy transcript** copies the text that is shown. Nothing is pasted automatically: put the text where you want it yourself.
@@ -125,7 +125,7 @@ transcribe-cli --backend cpu --threads 4 --timestamps none -m MODEL --batch inpu
 
 The engine runs with `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` set to the thread count and with niceness 10, so it yields to interactive work. On the first run against a new executable, the helper checks the `--help` output for every flag above and refuses to guess when one is missing.
 
-The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callback is capped far below a long inference, so the helper is launched detached and reports its outcome through `summary.json` instead.
+The helper keeps the 30-minute watchdog, not Noctalia: a captured-process callback is capped far below a long inference, so the helper is launched detached and reports its outcome through `summary.json` instead. The engine is tied to the helper's lifetime, so a helper killed outright takes the engine with it instead of leaving inference running behind a lost job.
 
 ## When something looks wrong
 

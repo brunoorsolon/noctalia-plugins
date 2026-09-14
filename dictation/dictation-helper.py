@@ -4,7 +4,8 @@
 The plugin owns the interface and the settings; this helper owns every
 recognition job. It validates the imported WAV, builds the engine argv, runs
 the installed transcribe-cli with CPU-only inference, thread-matched
-OpenMP/OpenBLAS limits and niceness 10, enforces the 30-minute watchdog,
+OpenMP/OpenBLAS limits and niceness 10, enforces the 30-minute watchdog, ties
+the engine's lifetime to its own so a killed helper cannot leave it running,
 honours a cancel request, and persists the raw engine output, logs, transcript
 and per-attempt result under the plugin data directory.
 
@@ -14,10 +15,12 @@ does the same to the engine.
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -38,6 +41,7 @@ REQUIRED_FLAGS = (
 DEFAULT_TIMEOUT_SECONDS = 1800  # the 30-minute inference watchdog lives here
 HEARTBEAT_SECONDS = 5  # how often the helper tells the plugin it is still alive
 NICE = 10
+PR_SET_PDEATHSIG = 1  # Linux prctl option: signal the child when its parent dies
 CONTROL_TOKEN = re.compile(r"<\|[^|>]*\|>")
 TRUNCATION_MARK = "truncat"
 SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
@@ -224,6 +228,27 @@ def command_probe(args):
     )
 
 
+def engine_preexec():
+    """Runs in the forked engine process, before it execs.
+
+    A helper that is killed outright cannot stop its engine, and the plugin keeps
+    the job owned while any process for it is alive, so the engine must not
+    outlive the helper. PR_SET_PDEATHSIG covers exactly that case, including
+    SIGKILL, which no in-helper cleanup can.
+    """
+    os.nice(NICE)
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        parent = os.getppid()
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+        # The parent can die between the fork and that call; re-check the race.
+        if os.getppid() != parent:
+            os.kill(os.getpid(), signal.SIGKILL)
+    except Exception:
+        # Not Linux, or no libc to call: the watchdog still stops the engine.
+        pass
+
+
 def command_run(args):
     global SUMMARY_PATH
     # The engine runs with the attempt directory as its working directory, so a
@@ -334,7 +359,7 @@ def transcribe(args, heartbeat_path):
                 stderr=err,
                 cwd=attempt_dir,
                 env=env,
-                preexec_fn=lambda: os.nice(NICE),
+                preexec_fn=engine_preexec,
             )
         except OSError as exc:
             killed = "failed"
