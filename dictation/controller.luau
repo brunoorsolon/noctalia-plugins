@@ -130,6 +130,8 @@ local SHORTCUT_COMMAND = "noctalia msg plugin magus/dictation:controller all tog
 -- A compositor answer that never arrives must not leave the row busy forever, so
 -- the wait is bounded and the outcome is read back instead of assumed.
 local SHORTCUT_STALL_MS = 30 * 1000
+-- `hyprctl` is the compositor's control CLI here as well as for automatic paste, so
+-- both read the same constant rather than a second name for one binary.
 local BINDS_QUERY = { PASTE_TOOL, "-j", "binds" }
 local RELOAD_COMMAND = { PASTE_TOOL, "reload" }
 
@@ -432,12 +434,15 @@ local function occupyingBind(binds)
   return nil
 end
 
+-- A bind is this setup's only when the block it wrote is on disk. Hyprland runs
+-- every bind that matches a chord, so a binding of the same command written by hand
+-- is somebody else's and installing beside it would toggle twice. The description
+-- is what identifies this setup's own bind in a Lua configuration, where the
+-- dispatcher is reported as a reference number rather than the command.
 local function bindIsOurs(bind, installed)
-  if type(bind) ~= "table" then return false end
-  -- The block on disk is what proves a matching description is this setup's, so a
-  -- bind that only shares the wording is somebody else's and is refused, not claimed.
-  if installed and bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
-  return type(bind.arg) == "string" and string.find(bind.arg, SHORTCUT_COMMAND, 1, true) ~= nil
+  if not installed or type(bind) ~= "table" then return false end
+  if bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
+  return type(bind.arg) == "string" and noctalia.string.trim(bind.arg) == SHORTCUT_COMMAND
 end
 
 local function bindLabel(bind)
@@ -491,15 +496,13 @@ local function applyShortcutStatus(path, format, installed, binds)
   if occupying and not bindIsOurs(occupying, installed) then
     setShortcut("conflict", {
       path = path, format = format, installed = installed, canRemove = installed,
-      message = string.format("%s is already bound to %s, so nothing was changed. Free that chord in %s, then check again.",
-        SHORTCUT_CHORD, bindLabel(occupying), path),
+      message = string.format("%s is already bound to %s, so nothing was changed and no second binding was added. Remove that binding, then check again.",
+        SHORTCUT_CHORD, bindLabel(occupying)),
     })
   elseif occupying then
     setShortcut("installed", {
-      path = path, format = format, installed = installed, canInstall = true, canRemove = installed,
-      message = installed
-        and string.format("%s starts and stops recording while another window is focused. Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, path)
-        or string.format("%s is bound to the dictation controller, but not by this setup, so there is no block to undo.", SHORTCUT_CHORD),
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = string.format("%s starts and stops recording while another window is focused. Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, path),
     })
   elseif installed then
     setShortcut("error", {

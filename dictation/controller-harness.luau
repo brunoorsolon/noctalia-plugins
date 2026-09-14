@@ -1754,6 +1754,13 @@ check("a foreign binding that shares the wording is a conflict", "conflict", sta
 command("shortcut-install")
 check("a foreign binding that shares the wording is not written", nil, string.find(fs[LUA_PATH], "recording-shortcut:begin", 1, true))
 check("a foreign binding that shares the wording names who holds it", true, string.find(state().shortcut.message, "their-own-dictation-script", 1, true) ~= nil)
+
+-- A binding of the same command written by hand is not this setup's either: the
+-- compositor runs every binding on a chord, so installing beside it would toggle twice.
+fixtureBinds = { { modmask = 72, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" } }
+command("shortcut-refresh")
+check("a hand-written binding of the same command is a conflict", "conflict", state().shortcut.state)
+check("a hand-written binding of the same command offers no install", false, state().shortcut.canInstall)
 fixtureBinds = {}
 command("shortcut-refresh")
 
