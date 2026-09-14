@@ -1915,6 +1915,28 @@ missingCommands.ps = nil
 psExitCode = 0
 psOutput = "/usr/bin/Hyprland"
 
+-- A --config carried in a form the standard parser does not take, or a flattened
+-- path whose end cannot be delimited, stops the setup instead of a default-file
+-- guess.
+putFile("/host/other.conf", "# other session\n")
+psOutput = "/usr/bin/Hyprland --config=/host/other.conf"
+command("shortcut-refresh")
+check("a joined --config form is unsupported", "unsupported", state().shortcut.state)
+command("shortcut-install")
+check("a joined --config form writes nothing", "# other session\n", fs["/host/other.conf"])
+psOutput = "/usr/bin/Hyprland"
+
+-- A binding report in an unexpected shape cannot be read for conflicts, so it
+-- must not read as a free chord.
+fixtureBinds = { { mask = 72, keyname = "D" } }
+command("shortcut-refresh")
+check("an unreadable binding report is not a free chord", "error", state().shortcut.state)
+check("an unreadable binding report offers no install", false, state().shortcut.canInstall)
+local beforeUnreadable = fs[CONF_PATH]
+command("shortcut-install")
+check("an unreadable binding report writes nothing", beforeUnreadable, fs[CONF_PATH])
+fixtureBinds = {}
+
 -- ps flattens argv with spaces, so a path element holding a space cannot be
 -- delimited from its output: with anything left after the path token the setup
 -- refuses, because the truncated prefix may exist as an unrelated file.

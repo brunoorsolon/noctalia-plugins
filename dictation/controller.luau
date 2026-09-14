@@ -339,8 +339,11 @@ local function explicitConfigPath(args)
       -- The flags are matched as patterns because they are compositor flags, not
       -- helper options, and the shell check counts every bare "--" string literal
       -- in this file as the latter.
+      if token:find("^%-%-config=") or token:find("^%-c=") then
+        return nil, "the compositor's command line carries --config in a form this setup does not read"
+      end
       if token:find("^%-%-config$") or token:find("^%-c$") then
-        withFlag = { line = line, path = tokens[i + 1], trailing = #tokens - (i + 1) }
+        withFlag = { path = tokens[i + 1], trailing = #tokens - (i + 1) }
       end
     end
   end
@@ -497,6 +500,15 @@ local function queryBinds(callback)
       callback(nil, "hyprctl's answer about the bindings was not readable.")
       return
     end
+    -- The chord can only be called free when the report carries the fields binds
+    -- are described with; a report in some other shape must not read as free.
+    for i = 1, #binds do
+      local entry = binds[i]
+      if type(entry) ~= "table" or type(entry.modmask) ~= "number" or type(entry.key) ~= "string" then
+        callback(nil, "hyprctl's answer about the bindings is not in the shape this setup reads, so the chord cannot be checked.")
+        return
+      end
+    end
     callback(binds, nil)
   end)
   if accepted == false then
@@ -568,7 +580,7 @@ local function bindLabel(bind)
   -- dispatcher string is named beside the description. A keycode bind is named
   -- with its keycode, because the key it presses depends on the host's keymap.
   local command = (dispatcher ~= "" and dispatcher ~= "__lua") and noctalia.string.trim(dispatcher .. " " .. arg) or ""
-  if command ~= "" and (description == "" or description == nil) then
+  if command ~= "" and description == "" then
     local keycode = type(bind.keycode) == "number" and bind.keycode or nil
     local key = type(bind.key) == "string" and bind.key or ""
     if key == "" and keycode and keycode ~= 0 then
@@ -582,7 +594,6 @@ local function bindLabel(bind)
 end
 
 local shortcutPendingAtMs = nil
-local shortcutPendingSettled = nil
 
 -- A pending shortcut flow is superseded when any other shortcut action reaches a
 -- settled state after it started: another install, an Undo, a re-check. Its
@@ -606,7 +617,6 @@ local function setShortcut(state, fields)
     message = fields.message or "",
   }
   shortcutPendingAtMs = state == "working" and noctalia.nowMs() or nil
-  shortcutPendingSettled = state == "working" and shortcutSettled or nil
   -- Every settled state belongs to the newest flow: a callback of an older one
   -- must not set anything.
   if state ~= "working" then shortcutSettled = shortcutSettled + 1 end
@@ -615,7 +625,6 @@ end
 
 local function expireShortcutWait()
   if S.shortcut.state ~= "working" or not shortcutPendingAtMs then return end
-  if shortcutPendingSettled ~= shortcutSettled then return end
   if noctalia.nowMs() - shortcutPendingAtMs <= SHORTCUT_STALL_MS then return end
   setShortcut("error", {
     path = S.shortcut.path, format = S.shortcut.format, installed = S.shortcut.installed,
