@@ -18,6 +18,9 @@ local JOB_POINTER = DATA and (DATA .. "/current-job") or nil
 -- long means the plugin can no longer see it working.
 local RUN_SILENT_SECONDS = 60
 local PROBE_STALL_SECONDS = 10 * 60
+-- A process check whose callback never arrives is retried this often; a missing
+-- answer is never read as one.
+local PROCESS_CHECK_RETRY_MS = 5000
 
 local S = {
   activity = "idle", -- idle | running | verifying
@@ -41,7 +44,7 @@ local silenceReported = false
 -- reports or when the runtime confirms that no process for it is left.
 -- nil = not asked yet, true = observed running, false = observed gone.
 local jobProcessAlive = nil
-local processCheckPending = false
+local processCheckSinceMs = nil
 
 local function publish()
   noctalia.state.set("dictation", S)
@@ -129,6 +132,7 @@ local function resetActivity()
   summaryPath = nil
   silenceReported = false
   jobProcessAlive = nil
+  processCheckSinceMs = nil
   if JOB_POINTER then noctalia.removeFile(JOB_POINTER) end
 end
 
@@ -368,15 +372,18 @@ end
 -- owned, so a helper that died leaving a live engine locks out new imports until
 -- that engine stops. Add an abandon action if that lock ever bites a real user.
 local function checkJobProcess()
-  if processCheckPending or S.activity ~= "running" or not S.job then return end
+  if S.activity ~= "running" or not S.job then return end
+  -- Retry a request the runtime accepted but never answered, so a dropped
+  -- callback cannot freeze the check; an unanswered request is not an exit.
+  if processCheckSinceMs and (noctalia.nowMs() - processCheckSinceMs) < PROCESS_CHECK_RETRY_MS then return end
   if type(noctalia.processMatches) ~= "function" then return end
   local jobId = S.job.id
-  processCheckPending = true
+  processCheckSinceMs = noctalia.nowMs()
   local accepted = noctalia.processMatches(function(matched)
-    processCheckPending = false
+    processCheckSinceMs = nil
     if S.job and S.job.id == jobId then jobProcessAlive = matched == true end
   end, jobId)
-  if accepted == false then processCheckPending = false end
+  if accepted == false then processCheckSinceMs = nil end
 end
 
 local function reportSilence()
