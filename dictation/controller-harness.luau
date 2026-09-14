@@ -311,6 +311,12 @@ local function jobLaunches()
   return count
 end
 
+local function launchesFrom(mark)
+  local out = {}
+  for index = mark + 1, #launches do out[#out + 1] = table.concat(launches[index], " ") end
+  return table.concat(out, " | ")
+end
+
 -- Key injections only: the window query and the setup probe are hyprctl too, but
 -- they carry no chord, so they are not pastes.
 local function pasteLaunches()
@@ -1136,14 +1142,15 @@ clipboard = nil
 activeWindow = EDITOR
 onWidgetRecord()
 local selectorJob = state().job.id
+local selectorMark = #launches
 finishSummary(selectorJob, "ok", "ok", "Transcription complete.", { transcript = "selector text", recording = true, copyable = true })
 update()
 clockMs = clockMs + 500
 update()
-check("the automatic chord carries the empty window selector", "hyprctl,dispatch,sendshortcut,CTRL,V,", lastLaunch())
-check("the chord names no window of its own", nil, string.find(lastLaunch(), "TextEditor", 1, true))
+-- Nothing about the shortcut is consulted on the way: the delivery reads the
+-- focused window and then hands over the one chord.
+check("a delivery asks for the window and then sends the chord", "hyprctl -j activewindow | hyprctl dispatch sendshortcut CTRL,V,", launchesFrom(selectorMark))
 check("an automatically delivered job is an attempt", "attempted", state().delivery.state)
-
 -- A paste tool that accepts the chord and never reports back must not leave the
 -- plugin saying "pasting" for the rest of the session, and must not be asked a
 -- second time: the attempt marker stays unfinished.
