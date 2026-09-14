@@ -41,6 +41,21 @@ default = 4
 min = 1
 max = 64
 
+# Delivery is one mechanism, not a fallback matrix: the transcript is copied and
+# the ordinary paste chord is dispatched by the compositor through hyprctl,
+# rootless, in the user's own session. Manual copy is a deliberate preference and
+# the recovery route.
+[[setting]]
+key = "delivery"
+type = "select"
+label_key = "settings.delivery.label"
+description_key = "settings.delivery.description"
+default = "auto"
+options = [
+  { value = "auto", label_key = "settings.delivery.auto" },
+  { value = "manual", label_key = "settings.delivery.manual" },
+]
+
 [[service]]
 id = "controller"
 entry = "controller.luau"

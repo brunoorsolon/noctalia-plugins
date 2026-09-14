@@ -23,6 +23,73 @@ local MIC_PATH = DATA and (DATA .. "/microphone.json") or nil
 -- own path to outlive the job and the plugin's state.
 local LAST_RECORDING_PATH = DATA and (DATA .. "/last-recording") or nil
 
+-- One rootless delivery mechanism: the finished transcript goes on the clipboard,
+-- and the compositor itself sends the single paste chord. `hyprctl dispatch
+-- sendshortcut CTRL,V,` reaches the focused client through Hyprland's own seat: it
+-- writes the chord's modifier state (ctrl) into that client first, sends the key
+-- straight to the client instead of through the bind matcher, and clears the
+-- modifiers again afterwards. A modifier the user still holds is therefore
+-- replaced rather than consulted - the application receives exactly Ctrl+V
+-- whatever the keyboard holds - and no speech is ever typed as keystrokes.
+-- ydotool is refused on purpose: it needs a running daemon and access to the input
+-- devices, and this plugin never asks for either.
+local PASTE_TOOL = "hyprctl"
+-- The empty window selector is deliberate: `sendshortcut` re-points focus, and
+-- restores it afterwards, when it is given a window to target, so the chord is
+-- addressed to the focused client and the focus check below stays the one thing
+-- that decides where the paste goes. The trailing comma is what carries that
+-- empty selector, and the dispatcher refuses a dispatch with fewer than three
+-- fields as invalid arguments.
+local PASTE_CHORD = { PASTE_TOOL, "dispatch", "sendshortcut", "CTRL,V," }
+-- The focused window is read from the compositor; its address is the identity a
+-- paste is checked against.
+local WINDOW_QUERY = { PASTE_TOOL, "-j", "activewindow" }
+-- The chord is sent no sooner than this after a job finished, so a panel that is
+-- closing or a focus change that is landing has a moment to settle. It is not a
+-- modifier wait: the modifier state of the chord comes from the compositor, so a
+-- modifier the user still holds cannot join it either way.
+local PASTE_SETTLE_MS = 500
+-- A compositor answer that never arrives must not leave the panel saying
+-- "checking" for the rest of the session.
+local PASTE_STALL_MS = 30 * 1000
+
+-- A window class is all that can be read, so these holds are class level and the
+-- plugin never claims to detect a password field: a window whose class looks like
+-- a shell or a password manager is held for an explicit action instead.
+local TERMINAL_CLASSES = {
+  kitty = true,
+  foot = true,
+  alacritty = true,
+  wezterm = true,
+  konsole = true,
+  ghostty = true,
+  xterm = true,
+  urxvt = true,
+  st = true,
+  tilix = true,
+  terminator = true,
+  ["gnome-terminal"] = true,
+  ["xfce4-terminal"] = true,
+  ["org.wezfurlong.wezterm"] = true,
+  ["com.mitchellh.ghostty"] = true,
+}
+local PASSWORD_CLASSES = {
+  keepassxc = true,
+  keepass = true,
+  bitwarden = true,
+  ["1password"] = true,
+  ["onepassword"] = true,
+  seahorse = true,
+  ["gnome-keyring"] = true,
+  passwordsafe = true,
+}
+local HOLD_FRAGMENTS = { "term", "keepass", "bitwarden", "1password", "password", "keyring" }
+local HELD_MESSAGE = {
+  terminal = "Paste held: a terminal would receive the text at its prompt. Use Paste now to send it anyway, or copy the transcript.",
+  password = "Paste held: the window looks like a password manager. Use Paste now to send it anyway, or copy the transcript.",
+  unknown = "Paste held: the focused window could not be identified. Use Paste now while the target window is focused, or copy the transcript.",
+}
+
 -- How long a helper may stay silent before the controller reports the lost
 -- contact. The helper rewrites its heartbeat every few seconds, so silence this
 -- long means the plugin can no longer see it working.
@@ -52,6 +119,10 @@ local S = {
   resultPath = "",
   attempt = 0,
   controlTokens = {},
+  -- idle | manual | waiting | checking | pasting | attempted | held | failed
+  delivery = { state = "idle", message = "" },
+  -- The delivery mechanism itself, so the panel can name it and its state.
+  paste = { state = "untested", tested = false, message = "Automatic paste waits for the first verification." },
 }
 
 local summaryPath = nil
@@ -135,9 +206,29 @@ local function readLastJson(stdout)
   return type(value) == "table" and value or nil
 end
 
+-- The delivery mechanism is setup too: which tool is used, whether it is
+-- installed, and whether the compositor accepted it the last time setup ran.
+local function refreshPaste()
+  local tested = S.paste.tested == true
+  if noctalia.getConfig("delivery") == "manual" then
+    S.paste = { state = "manual", tested = tested, message = "Manual copy mode: the transcript is only copied when you ask for it." }
+  elseif not noctalia.commandExists(PASTE_TOOL) then
+    S.paste = { state = "missing", tested = false, message = "Automatic paste sends the chord with the compositor's `sendshortcut`, which needs " .. PASTE_TOOL .. ". It is not installed, so only copying works." }
+  elseif tested then
+    S.paste = {
+      state = "ok",
+      tested = true,
+      message = "Automatic paste sends `sendshortcut CTRL,V` through " .. PASTE_TOOL .. ", and the compositor accepted it. The transcript is copied to the clipboard first, so a clipboard manager keeps it in its history.",
+    }
+  else
+    S.paste = { state = "untested", tested = false, message = "Automatic paste sends `sendshortcut CTRL,V` through " .. PASTE_TOOL .. ". Verify and record tests it." }
+  end
+end
+
 -- Cheap half of setup: it never starts a process, so it is safe on every config
 -- change. The explicit probe is what records hashes and engine capabilities.
 local function refreshSetup()
+  refreshPaste()
   local engine, model = configPath("engine"), configPath("model")
   local reason = nil
   if not DATA then
@@ -423,6 +514,375 @@ local function diskFreeBytes()
   return nil
 end
 
+-- ── Delivering the transcript ───────────────────────────────────────────────
+
+-- The window the current recording was started from, the paste that is queued but
+-- has not touched the clipboard or the keyboard yet, and the window classes the
+-- user has confirmed as paste targets in this session: a GUI target is only
+-- delivered to automatically once it has been confirmed by hand.
+local destination = nil
+local pendingDelivery = nil
+local validatedTargets = {}
+
+local function holdKindFor(class)
+  if type(class) ~= "string" or class == "" then return "unknown" end
+  local name = class:lower()
+  if TERMINAL_CLASSES[name] then return "terminal" end
+  if PASSWORD_CLASSES[name] then return "password" end
+  for _, fragment in ipairs(HOLD_FRAGMENTS) do
+    if name:find(fragment, 1, true) then
+      return fragment == "term" and "terminal" or "password"
+    end
+  end
+  return nil
+end
+
+local function deliveryPath(jobId)
+  return JOBS .. "/" .. jobId .. "/delivery.json"
+end
+
+local function readDelivery(jobId)
+  local raw = noctalia.readFile(deliveryPath(jobId))
+  local record = type(raw) == "string" and noctalia.json.decode(raw) or nil
+  return type(record) == "table" and record or nil
+end
+
+-- The attempt marker is durable before anything is copied or typed, so a paste
+-- interrupted by a crash is visible afterwards and is never repeated on its own.
+local function writeDelivery(record)
+  return noctalia.writeFile(deliveryPath(record.jobId), noctalia.json.encode(record, true))
+end
+
+-- The panel keeps the keyboard while it is open, and the compositor is never
+-- asked about a layer surface, so the panel publishes its own state.
+local function panelHoldsKeyboard()
+  return noctalia.state.get("dictation.panelOpen") == true
+end
+
+local function setDelivery(state, message)
+  S.delivery = { state = state, message = message }
+  publish()
+end
+
+-- A hold is not a failed recognition and not a paste: the text stays where it is,
+-- and the panel keeps offering Copy and Paste now.
+local function holdDelivery(message)
+  pendingDelivery = nil
+  setDelivery("held", message)
+  noctalia.notify("Dictation", message)
+end
+
+-- The focused window comes from the compositor, never from a guess: a window that
+-- cannot be read is reported, and nothing is pasted into it.
+local function queryDestination(callback)
+  if not noctalia.commandExists("hyprctl") then
+    callback(nil, "hyprctl is not installed, so the focused window cannot be identified.")
+    return
+  end
+  local accepted = noctalia.runAsync(WINDOW_QUERY, function(result)
+    if type(result) ~= "table" or result.exitCode ~= 0 then
+      callback(nil, "hyprctl could not report the focused window.")
+      return
+    end
+    local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+    local window = text ~= "" and noctalia.json.decode(text) or nil
+    local address = type(window) == "table" and window.address or nil
+    if type(address) ~= "string" or address == "" then
+      callback(nil, "No window is focused, so the transcript was not pasted.")
+      return
+    end
+    local class = type(window.class) == "string" and window.class or ""
+    callback({ address = address, class = class, held = holdKindFor(class) }, nil)
+  end)
+  if accepted == false then
+    callback(nil, "hyprctl could not be run, so the focused window is unknown.")
+  end
+end
+
+-- At record start the user is still in the window the dictation belongs to, so
+-- that is the one window the automatic paste is allowed to reach.
+local function captureDestination(jobId)
+  destination = nil
+  queryDestination(function(found, reason)
+    if not S.job or S.job.id ~= jobId then return end
+    if not found then
+      destination = { jobId = jobId, problem = reason }
+      return
+    end
+    destination = { jobId = jobId, address = found.address, class = found.class }
+  end)
+end
+
+-- The compositor answers a dispatch with "ok", and it still exits 0 when it
+-- refuses the chord, so the reply - not the exit status - is what says the chord
+-- was sent into the client.
+local function chordAccepted(result)
+  if type(result) ~= "table" or result.exitCode ~= 0 then
+    return false, "hyprctl exited with status " .. tostring(type(result) == "table" and result.exitCode or nil)
+  end
+  local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+  if text == "ok" then return true end
+  return false, text ~= "" and text or "hyprctl returned no answer"
+end
+
+-- The setup probe sends no key at all: dispatching `sendshortcut` with no
+-- arguments asks the compositor for a chord and lets it answer with its own
+-- argument error, which only a compositor that has the dispatcher can say. Older
+-- compositors answer a successful dispatch with a plain "ok" whatever the
+-- dispatcher does with it, and refuse an unknown dispatcher by name, so both
+-- answers are read here and only the refusal is a missing mechanism.
+local function dispatcherInstalled(result)
+  if type(result) ~= "table" or result.exitCode ~= 0 then return false end
+  local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+  if text == "" or string.find(text, "Invalid dispatcher", 1, true) then return false end
+  return text == "ok" or string.find(text, "sendshortcut", 1, true) ~= nil
+end
+
+-- Copy and paste, once, into the destination that was just checked. The marker is
+-- written first: nothing after this point is repeated automatically.
+local function pasteInto(target, text)
+  local request = pendingDelivery
+  local class = target.class ~= "" and target.class or "the focused window"
+  local record = {
+    jobId = request.jobId,
+    state = "attempting",
+    attempt = ((readDelivery(request.jobId) or {}).attempt or 0) + 1,
+    at = os.time(),
+    target = { address = target.address, class = target.class },
+  }
+  local saved, saveError = writeDelivery(record)
+  if not saved then
+    -- The marker is what makes a crash distinguishable from a fresh start. Without
+    -- it the attempt could not be recognised afterwards, so nothing is copied and
+    -- no key is sent: the durable boundary is enforced, not merely intended.
+    pendingDelivery = nil
+    local reason = type(saveError) == "string" and (" (" .. saveError .. ")") or ""
+    local message = "The delivery attempt could not be recorded" .. reason .. ", so nothing was copied and no keys were sent. Copy the transcript and paste it yourself."
+    setDelivery("failed", message)
+    noctalia.notifyError("Dictation", message)
+    return
+  end
+
+  if not noctalia.copyToClipboard(text, "text/plain") then
+    pendingDelivery = nil
+    record.state, record.message = "failed", "the transcript could not be put on the clipboard"
+    writeDelivery(record)
+    local message = "The transcript could not be put on the clipboard, so no keys were sent. Copy it again or select the text."
+    setDelivery("failed", message)
+    noctalia.notifyError("Dictation", message)
+    return
+  end
+  record.clipboard = true
+  writeDelivery(record)
+  setDelivery("pasting", "Pasting into " .. class .. ".")
+
+  local accepted = noctalia.runAsync(PASTE_CHORD, function(result)
+    -- The request stays queued until its answer arrives, so a wait that gave up on
+    -- it must not have its report overwritten by a late status.
+    if pendingDelivery ~= request then return end
+    pendingDelivery = nil
+    -- An accepted chord only proves the requested V was handed to the focused
+    -- client: nothing reads the destination's buffer, so the result is
+    -- "attempted", never "inserted".
+    local sent, why = chordAccepted(result)
+    record.exitCode, record.finishedAt = type(result) == "table" and result.exitCode or nil, os.time()
+    if sent then
+      record.state = "attempted"
+      writeDelivery(record)
+      -- The user confirmed this target by hand, so it can be automatic from now
+      -- on in this session.
+      if request.explicit and target.class ~= "" then validatedTargets[target.class] = true end
+      setDelivery("attempted", "Paste attempted into " .. class .. ". The transcript is on the clipboard.")
+      return
+    end
+    record.state, record.message = "failed", "the compositor refused the chord: " .. why
+    writeDelivery(record)
+    local message = "The compositor refused the paste chord (" .. why .. "), so nothing was typed. The transcript is on the clipboard; paste it yourself."
+    setDelivery("failed", message)
+    noctalia.notifyError("Dictation", message)
+  end)
+  if accepted == false then
+    pendingDelivery = nil
+    record.state, record.message = "failed", "the chord could not be started"
+    writeDelivery(record)
+    local message = "The paste chord could not be started, so nothing was sent. The transcript is on the clipboard; paste it yourself."
+    setDelivery("failed", message)
+    noctalia.notifyError("Dictation", message)
+  end
+end
+
+-- The automatic route: the recording's own window has to still be the focused
+-- one. A destination that changed, closed or became ineligible is held instead of
+-- receiving the text, and focus is never moved to it.
+local function checkAutomaticDelivery()
+  local request = pendingDelivery
+  queryDestination(function(current, reason)
+    if not pendingDelivery or pendingDelivery ~= request then return end
+    if panelHoldsKeyboard() then
+      holdDelivery("Paste held: the dictation panel is open and holds the keyboard. Close it and use Paste now, or copy the transcript.")
+      return
+    end
+    if not current then
+      holdDelivery((reason or "The destination window could not be confirmed.") .. " Nothing was pasted; use Paste now while the target window is focused, or copy the transcript.")
+      return
+    end
+    if current.address ~= request.target.address then
+      holdDelivery("Paste held: the focused window changed after the recording finished, so nothing was pasted. Use Paste now to paste into the window that is focused now, or copy the transcript.")
+      return
+    end
+    if current.held then
+      holdDelivery(HELD_MESSAGE[current.held])
+      return
+    end
+    pasteInto(current, request.text)
+  end)
+end
+
+-- The explicit route: the user asked for the paste, so the window that is focused
+-- now is the destination and the hold classes do not apply.
+local function checkExplicitDelivery()
+  local request = pendingDelivery
+  queryDestination(function(current, reason)
+    if not pendingDelivery or pendingDelivery ~= request then return end
+    if panelHoldsKeyboard() then
+      holdDelivery("Paste held: the panel still holds the keyboard. Focus the window you want, paste from a shortcut, or copy the transcript.")
+      return
+    end
+    if not current then
+      holdDelivery((reason or "The focused window could not be identified.") .. " Nothing was pasted; copy the transcript.")
+      return
+    end
+    pasteInto(current, request.text)
+  end)
+end
+
+-- The automatic decision, taken once per finished recording. An import, a retry, a
+-- job re-adopted after a restart and a replayed recording never reach this point.
+local function queueDelivery(jobId)
+  if noctalia.getConfig("delivery") == "manual" then
+    setDelivery("manual", "Manual copy mode: the transcript is ready to copy.")
+    return
+  end
+  -- Nothing is injected without the compositor that injects it, and the plugin
+  -- never installs or replaces one for you.
+  if not noctalia.commandExists(PASTE_TOOL) then
+    holdDelivery("Paste held: automatic paste needs " .. PASTE_TOOL .. ", which is not installed. Copy the transcript and paste it yourself.")
+    return
+  end
+  if panelHoldsKeyboard() then
+    holdDelivery("Paste held: the dictation panel is open and holds the keyboard. Close it and use Paste now, or copy the transcript.")
+    return
+  end
+  if type(destination) ~= "table" or destination.jobId ~= jobId or type(destination.address) ~= "string" then
+    local reason = "The window to paste into was not identified."
+    if type(destination) == "table" and destination.jobId == jobId and type(destination.problem) == "string" then
+      reason = destination.problem
+    end
+    holdDelivery(reason .. " Nothing was pasted; use Paste now while the target window is focused, or copy the transcript.")
+    return
+  end
+  local kind = holdKindFor(destination.class)
+  if kind then
+    holdDelivery(HELD_MESSAGE[kind])
+    return
+  end
+  -- No release gate is needed here, and none would be sound: Hyprland fires a
+  -- `bindr` command on the key release while the bind's modifiers are still held
+  -- (that is what the bind matches on), and no rootless client can read held
+  -- modifiers at all - `hyprctl devices` reports the lock keys, not ctrl, alt,
+  -- shift or super. The chord is made safe instead of observed: the compositor
+  -- writes the chord's modifier state into the client itself.
+  local class = destination.class ~= "" and destination.class or "the focused window"
+  -- A GUI target is only automatic once the user has confirmed that pasting there
+  -- works, so a window the plugin has never been told about is held instead.
+  if destination.class == "" or not validatedTargets[destination.class] then
+    holdDelivery("Paste held: automatic paste is not confirmed for " .. class .. " yet. Use Paste now once to confirm it; after that it is automatic for this session, or copy the transcript.")
+    return
+  end
+  pendingDelivery = { jobId = jobId, target = destination, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS, text = S.transcript }
+  setDelivery("waiting", "Waiting to paste into " .. class .. ".")
+end
+
+-- The explicit paste, from the panel or a shortcut: into whatever window is
+-- focused now. The panel is closed first, because it holds the keyboard.
+local function deliverNow(text)
+  if S.activity ~= "idle" then
+    refuse("Wait for the job to finish before pasting.")
+    return
+  end
+  local job = S.job
+  if not job then
+    refuse("There is no finished job to paste from.")
+    return
+  end
+  -- The panel can show an edited transcript, and that is the text the user sees,
+  -- so it is what an explicit paste sends - exactly like Copy transcript. Without
+  -- an edit, and on every shortcut or IPC route, it is the saved transcript.
+  local payload = type(text) == "string" and text or ""
+  if payload == "" then payload = S.transcript end
+  if payload == "" then
+    refuse("There is no transcript to paste.")
+    return
+  end
+  if noctalia.getConfig("delivery") == "manual" then
+    refuse("Manual copy mode is on. Copy the transcript, or switch Delivery to automatic.")
+    return
+  end
+  if not noctalia.commandExists(PASTE_TOOL) then
+    refuse("Automatic paste needs " .. PASTE_TOOL .. " for the compositor's `sendshortcut`.")
+    return
+  end
+  if pendingDelivery or S.delivery.state == "checking" or S.delivery.state == "pasting" then
+    refuse("A paste is already in progress.")
+    return
+  end
+  pendingDelivery = { jobId = job.id, target = {}, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS, explicit = true, text = payload }
+  if panelHoldsKeyboard() then
+    -- Giving the keyboard back and waiting for it is the difference between
+    -- pasting into the window the user came from and pasting into the panel.
+    noctalia.togglePanel("magus/dictation:panel")
+    setDelivery("waiting", "Closing the panel and pasting into the window you came from.")
+  else
+    setDelivery("waiting", "Pasting into the focused window.")
+  end
+end
+
+-- The queued paste is one step of the update tick: the settle wait cannot block
+-- the controller, and it is the only reason a paste needs a second look.
+local function pumpDelivery()
+  local request = pendingDelivery
+  if not request then return end
+  -- The request belongs to the job that produced it: a job replaced before the
+  -- settle expired must never be delivered to the new one's destination.
+  if not S.job or S.job.id ~= request.jobId then
+    pendingDelivery = nil
+    setDelivery("idle", "")
+    return
+  end
+  local state = S.delivery.state
+  -- A check or a paste already in flight is never restarted; an answer that never
+  -- arrives is bounded instead of retried.
+  if state == "checking" or state == "pasting" then
+    if noctalia.nowMs() - request.readyAtMs > PASTE_STALL_MS then
+      -- The attempt marker is left as it is: a paste whose answer never arrived is
+      -- not repeated, not on the next tick and not after a restart.
+      if state == "pasting" then
+        holdDelivery("Paste held: the paste tool never reported back, so the attempt was not repeated. The transcript is on the clipboard; paste it yourself.")
+      else
+        holdDelivery("Paste held: the compositor did not report the focused window. Nothing was pasted; copy the transcript.")
+      end
+    end
+    return
+  end
+  if noctalia.nowMs() < request.readyAtMs then return end
+  setDelivery("checking", "Checking the destination window.")
+  if request.explicit then
+    checkExplicitDelivery()
+  else
+    checkAutomaticDelivery()
+  end
+end
+
 -- ── Starting jobs ────────────────────────────────────────────────────────────
 
 -- Import and retry share one path: they transcribe a recording that is already on
@@ -488,6 +948,11 @@ local function startJob(wav, label)
   S.outcome, S.severity, S.message = nil, nil, "Transcribing."
   S.copyable, S.transcript, S.transcriptPath, S.resultPath = false, "", "", ""
   S.attempt, S.controlTokens = 0, {}
+  -- A queued paste belongs to the job that produced it. An import or a retry
+  -- replaces that job, so the queue is dropped rather than carried into a job
+  -- that #11 excludes from automatic delivery.
+  pendingDelivery = nil
+  if S.delivery.state ~= "manual" then S.delivery = { state = "idle", message = "" } end
   summaryPath = summaryPathFor(jobId)
   activityStartedAtMs = S.job.startedAtMs
   publish()
@@ -499,7 +964,7 @@ local function recordingMessage()
   return subject .. "."
 end
 
-local function startRecording()
+local function startRecording(from)
   if S.activity ~= "idle" then
     noctalia.notify("Dictation", busyMessage())
     return
@@ -589,6 +1054,10 @@ local function startRecording()
     engine = configPath("engine"),
     model = configPath("model"),
     threads = threads,
+    -- Delivery is decided when this job finishes, and only a recording this
+    -- session started is allowed to deliver: a job re-adopted after a restart is
+    -- not, and neither is an import or a retry.
+    deliver = true,
   }
   S.recording = { path = JOBS .. "/" .. jobId .. "/recording.wav", exists = false }
   S.outcome, S.severity = nil, nil
@@ -597,6 +1066,16 @@ local function startRecording()
   S.message = recordingMessage()
   S.copyable, S.transcript, S.transcriptPath, S.resultPath = false, "", "", ""
   S.attempt, S.controlTokens = 0, {}
+  -- The destination is captured now, while the user is still in the window the
+  -- dictation is meant for. A recording started from the panel arms nothing: the
+  -- window behind the panel is not a destination the user chose.
+  pendingDelivery = nil
+  S.delivery = { state = "idle", message = "" }
+  if from == "panel" then
+    destination = { jobId = jobId, problem = "The recording was started from the panel, so no destination window was recorded." }
+  else
+    captureDestination(jobId)
+  end
   summaryPath = summaryPathFor(jobId)
   activityStartedAtMs = S.job.startedAtMs
   publish()
@@ -627,9 +1106,9 @@ end
 
 -- Toggle is the bar widget's one gesture: start when idle, finalize when
 -- recording, and report the job that is already running otherwise.
-local function toggleRecording()
+local function toggleRecording(from)
   if S.activity == "idle" then
-    startRecording()
+    startRecording(from)
   elseif S.activity == "recording" then
     requestStop()
   else
@@ -717,7 +1196,9 @@ end
 
 -- ── Finishing ────────────────────────────────────────────────────────────────
 
-local function finishJob(summary)
+local function finishJob(summary, jobId)
+  local job = S.job
+  local id = jobId or (job and job.id)
   local paths = type(summary.paths) == "table" and summary.paths or {}
   local transcriptPath = type(paths.transcript) == "string" and paths.transcript or ""
   local resultPath = type(paths.result) == "string" and paths.result or ""
@@ -749,9 +1230,36 @@ local function finishJob(summary)
   S.resultPath = resultPath
   S.attempt = type(summary.attempt) == "number" and summary.attempt or 0
   S.controlTokens = type(summary.controlTokens) == "table" and summary.controlTokens or {}
+  -- Automatic delivery is decided here and nowhere else. An import, a retry, a job
+  -- re-adopted after a restart and a replayed recording never reach this point,
+  -- and the durable attempt marker is what keeps a paste that a crash interrupted
+  -- from being repeated on its own.
+  local previous = id and readDelivery(id) or nil
+  if previous and previous.state == "attempting" then
+    holdDelivery("Paste held: an earlier paste attempt did not finish, so it was not repeated. The transcript is on the clipboard; copy it or use Paste now.")
+  elseif job and job.deliver == true and id and summary.outcome == "ok" and copyable then
+    queueDelivery(id)
+  else
+    setDelivery("idle", "")
+  end
   publish()
   if S.severity == "error" then
     noctalia.notifyError("Dictation", S.message)
+  end
+end
+
+local function probePasteTool()
+  -- Asking for a chord with no arguments is answered by the dispatcher's own
+  -- argument error and sends nothing, so the mechanism is tested without a key.
+  local accepted = noctalia.runAsync({ PASTE_TOOL, "dispatch", "sendshortcut" }, function(result)
+    S.paste.tested = dispatcherInstalled(result)
+    refreshPaste()
+    publish()
+  end)
+  if accepted == false then
+    S.paste.tested = false
+    refreshPaste()
+    publish()
   end
 end
 
@@ -759,6 +1267,7 @@ local function finishProbe(summary)
   resetActivity()
   if summary.outcome == "ok" then
     refreshSetup()
+    probePasteTool()
   else
     S.setup = { state = "required", message = type(summary.message) == "string" and summary.message or "Setup verification failed." }
   end
@@ -812,7 +1321,10 @@ local function reportSilence()
 end
 
 function update()
-  if S.activity == "idle" then return end
+  if S.activity == "idle" then
+    pumpDelivery()
+    return
+  end
   if S.activity == "recording" then refreshLease() end
   local path = summaryPath
   local summary = path and noctalia.fileExists(path) and readSummary(path) or nil
@@ -890,13 +1402,15 @@ end
 function onIpc(event, _payload)
   local name = type(event) == "string" and event:lower() or ""
   if name == "toggle" then
-    toggleRecording()
+    toggleRecording("ipc")
   elseif name == "stop" then
     requestStop()
   elseif name == "cancel" then
     requestCancel()
   elseif name == "show" then
     noctalia.togglePanel("magus/dictation:panel")
+  elseif name == "paste" then
+    deliverNow()
   end
 end
 
@@ -911,7 +1425,7 @@ local function restoreJob()
   local path = summaryPathFor(jobId)
   local summary = noctalia.fileExists(path) and readSummary(path) or nil
   if summary then
-    finishJob(summary)
+    finishJob(summary, jobId)
     return
   end
   local job = readJob(jobId)
@@ -955,9 +1469,9 @@ noctalia.state.watch("dictation.command", function(command)
   if type(command) ~= "table" then return end
   local action = command.action
   if action == "record" then
-    startRecording()
+    startRecording(command.from)
   elseif action == "toggle" then
-    toggleRecording()
+    toggleRecording(command.from)
   elseif action == "stop" then
     requestStop()
   elseif action == "cancel" then
@@ -974,5 +1488,7 @@ noctalia.state.watch("dictation.command", function(command)
     refreshSources()
   elseif action == "select" then
     selectSource(command.source)
+  elseif action == "deliver" then
+    deliverNow(command.text)
   end
 end)
