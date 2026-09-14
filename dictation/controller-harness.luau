@@ -54,6 +54,7 @@ local activeWindow = nil
 local activeWindowExitCode = 0
 local pasteExitCode = 0
 local pasteStartRefused = false
+local pasteSilent = false
 local clipboardWriteFails = false
 local missingCommands = {}
 
@@ -207,10 +208,11 @@ function noctalia.runAsync(argv, onResult)
     end
     return true
   end
-  -- The paste tool is started detached in one test, and answers an exit status in
-  -- the others.
+  -- The paste tool is started detached in one test, answers an exit status in the
+  -- others, and in one test accepts the chord without ever reporting back.
   if argv[1] == "wtype" then
     if pasteStartRefused then return false end
+    if pasteSilent then return true end
     if type(onResult) == "function" then onResult({ exitCode = pasteExitCode, stdout = "", stderr = "" }) end
     return true
   end
@@ -975,6 +977,57 @@ clockMs = clockMs + 500
 update()
 check("explicit action pastes into a held window", beforePassword + 1, pasteLaunches())
 check("explicit override carries the transcript", "secret text", clipboard)
+
+-- An edited transcript in the panel is the text the user sees, so Paste now sends
+-- that text rather than the saved transcript the edit replaced.
+local beforeEdited = pasteLaunches()
+onOpen({})
+onTranscriptEdited("edited text")
+onClose()
+onDeliver()
+clockMs = clockMs + 500
+update()
+check("explicit paste carries the edited transcript", "edited text", clipboard)
+check("explicit paste after an edit injects one chord", beforeEdited + 1, pasteLaunches())
+
+-- A draft left over from an earlier job is not an edit of this one, so the saved
+-- transcript is what an explicit paste carries.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local staleJob = state().job.id
+finishSummary(staleJob, "ok", "ok", "Transcription complete.", { transcript = "stale text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+update()
+onClose()
+onDeliver()
+clockMs = clockMs + 500
+update()
+check("a stale panel draft is not sent", "stale text", clipboard)
+
+-- A paste tool that accepts the chord and never reports back must not leave the
+-- plugin saying "pasting" for the rest of the session, and must not be asked a
+-- second time: the attempt marker stays unfinished.
+pasteSilent = true
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local silentJob = state().job.id
+finishSummary(silentJob, "ok", "ok", "Transcription complete.", { transcript = "silent text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeSilent = pasteLaunches()
+update()
+check("a silent paste tool is asked once", beforeSilent + 1, pasteLaunches())
+check("a silent paste tool leaves the paste in flight", "pasting", state().delivery.state)
+clockMs = clockMs + 31000
+update()
+check("a silent paste tool is held after the bound", "held", state().delivery.state)
+check("a silent paste tool is not asked again", beforeSilent + 1, pasteLaunches())
+check("a silent paste tool leaves the marker unfinished", "attempting", noctalia.json.decode(fs[jobDir(silentJob) .. "/delivery.json"]).state)
+check("a silent paste tool keeps the transcript", "silent text", clipboard)
+pasteSilent = false
 
 -- A tool that fails, and a tool that cannot be started, are visible failures with
 -- nothing typed into the user's window.

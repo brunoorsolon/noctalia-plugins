@@ -605,9 +605,8 @@ end
 
 -- Copy and paste, once, into the destination that was just checked. The marker is
 -- written first: nothing after this point is repeated automatically.
-local function pasteInto(target)
+local function pasteInto(target, text)
   local request = pendingDelivery
-  pendingDelivery = nil
   local class = target.class ~= "" and target.class or "the focused window"
   local record = {
     jobId = request.jobId,
@@ -618,7 +617,8 @@ local function pasteInto(target)
   }
   writeDelivery(record)
 
-  if not noctalia.copyToClipboard(S.transcript, "text/plain") then
+  if not noctalia.copyToClipboard(text, "text/plain") then
+    pendingDelivery = nil
     record.state, record.message = "failed", "the transcript could not be put on the clipboard"
     writeDelivery(record)
     local message = "The transcript could not be put on the clipboard, so no keys were sent. Copy it again or select the text."
@@ -631,6 +631,10 @@ local function pasteInto(target)
   setDelivery("pasting", "Pasting into " .. class .. ".")
 
   local accepted = noctalia.runAsync(PASTE_CHORD, function(result)
+    -- The request stays queued until its answer arrives, so a wait that gave up on
+    -- it must not have its report overwritten by a late status.
+    if pendingDelivery ~= request then return end
+    pendingDelivery = nil
     -- A successful exit only proves the chord was injected: nothing reads the
     -- destination's buffer, so the result is "attempted", never "inserted".
     local exitCode = type(result) == "table" and result.exitCode or nil
@@ -651,6 +655,7 @@ local function pasteInto(target)
     noctalia.notifyError("Dictation", message)
   end)
   if accepted == false then
+    pendingDelivery = nil
     record.state, record.message = "failed", "the paste tool could not be started"
     writeDelivery(record)
     local message = "The paste tool could not be started, so nothing was sent. The transcript is on the clipboard; paste it yourself."
@@ -682,7 +687,7 @@ local function checkAutomaticDelivery()
       holdDelivery(HELD_MESSAGE[current.held])
       return
     end
-    pasteInto(current)
+    pasteInto(current, request.text)
   end)
 end
 
@@ -700,7 +705,7 @@ local function checkExplicitDelivery()
       holdDelivery((reason or "The focused window could not be identified.") .. " Nothing was pasted; copy the transcript.")
       return
     end
-    pasteInto(current)
+    pasteInto(current, request.text)
   end)
 end
 
@@ -741,13 +746,13 @@ local function queueDelivery(jobId)
     holdDelivery("Paste held: automatic paste is not confirmed for " .. class .. " yet. Use Paste now once to confirm it; after that it is automatic for this session, or copy the transcript.")
     return
   end
-  pendingDelivery = { jobId = jobId, target = destination, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS }
+  pendingDelivery = { jobId = jobId, target = destination, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS, text = S.transcript }
   setDelivery("waiting", "Waiting to paste into " .. class .. ".")
 end
 
 -- The explicit paste, from the panel or a shortcut: into whatever window is
 -- focused now. The panel is closed first, because it holds the keyboard.
-local function deliverNow()
+local function deliverNow(text)
   if S.activity ~= "idle" then
     refuse("Wait for the job to finish before pasting.")
     return
@@ -757,7 +762,12 @@ local function deliverNow()
     refuse("There is no finished job to paste from.")
     return
   end
-  if S.transcript == "" then
+  -- The panel can show an edited transcript, and that is the text the user sees,
+  -- so it is what an explicit paste sends - exactly like Copy transcript. Without
+  -- an edit, and on every shortcut or IPC route, it is the saved transcript.
+  local payload = type(text) == "string" and text or ""
+  if payload == "" then payload = S.transcript end
+  if payload == "" then
     refuse("There is no transcript to paste.")
     return
   end
@@ -773,7 +783,7 @@ local function deliverNow()
     refuse("A paste is already in progress.")
     return
   end
-  pendingDelivery = { jobId = job.id, target = {}, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS, explicit = true }
+  pendingDelivery = { jobId = job.id, target = {}, readyAtMs = noctalia.nowMs() + PASTE_SETTLE_MS, explicit = true, text = payload }
   if panelHoldsKeyboard() then
     -- Giving the keyboard back and waiting for it is the difference between
     -- pasting into the window the user came from and pasting into the panel.
@@ -793,8 +803,14 @@ local function pumpDelivery()
   -- A check or a paste already in flight is never restarted; an answer that never
   -- arrives is bounded instead of retried.
   if state == "checking" or state == "pasting" then
-    if state == "checking" and noctalia.nowMs() - request.readyAtMs > PASTE_STALL_MS then
-      holdDelivery("Paste held: the compositor did not report the focused window. Nothing was pasted; copy the transcript.")
+    if noctalia.nowMs() - request.readyAtMs > PASTE_STALL_MS then
+      -- The attempt marker is left as it is: a paste whose answer never arrived is
+      -- not repeated, not on the next tick and not after a restart.
+      if state == "pasting" then
+        holdDelivery("Paste held: the paste tool never reported back, so the attempt was not repeated. The transcript is on the clipboard; paste it yourself.")
+      else
+        holdDelivery("Paste held: the compositor did not report the focused window. Nothing was pasted; copy the transcript.")
+      end
     end
     return
   end
@@ -1408,6 +1424,6 @@ noctalia.state.watch("dictation.command", function(command)
   elseif action == "select" then
     selectSource(command.source)
   elseif action == "deliver" then
-    deliverNow()
+    deliverNow(command.text)
   end
 end)

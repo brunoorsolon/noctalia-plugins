@@ -313,7 +313,16 @@ function onMicrophoneSelected(index, _text)
 end
 
 function onDeliver()
-  sendCommand("deliver")
+  -- The panel can show an edited transcript, and it is the text the user sees: it is
+  -- what Copy copies and what Paste now sends. The draft only counts while it
+  -- belongs to the transcript on screen - a draft left over from an earlier job is
+  -- not an edit of this one, and then the saved transcript is sent.
+  local s = state()
+  local edited = type(draft) == "string"
+    and type(s) == "table"
+    and draftKey == tostring(s.transcriptPath)
+    and draft ~= s.transcript
+  sendCommand("deliver", { text = edited and draft or nil })
 end
 
 function onOpenSettings()
