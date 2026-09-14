@@ -55,6 +55,7 @@ local activeWindowExitCode = 0
 local pasteExitCode = 0
 local pasteStartRefused = false
 local pasteSilent = false
+local markerWriteFails = false
 local clipboardWriteFails = false
 local missingCommands = {}
 
@@ -114,6 +115,9 @@ end
 function noctalia.writeFile(path, contents)
   local parent = parentFolder(path)
   if parent and fs[parent] == nil then return false, "no such directory" end
+  if markerWriteFails and type(path) == "string" and string.find(path, "/delivery.json", 1, true) then
+    return false, "No space left on device"
+  end
   fs[path] = contents
   return true
 end
@@ -1016,6 +1020,51 @@ finishSummary(emptyJob, "empty", "error", "The engine returned no text.", { tran
 update()
 onCopyTranscript()
 check("copy never sends an earlier job's draft", nil, clipboard)
+
+-- An import that starts while a paste is waiting must not inherit it: the queue
+-- belongs to the job that produced it, and #11 excludes imports from automatic
+-- delivery altogether.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local liveJob = state().job.id
+finishSummary(liveJob, "ok", "ok", "Transcription complete.", { transcript = "live payload", recording = true, copyable = true })
+update()
+check("the replaced recording waits for the settle", "waiting", state().delivery.state)
+local beforeImport = pasteLaunches()
+command("import")
+local importJob = state().job.id
+check("an import is its own job", true, importJob ~= liveJob)
+check("starting an import drops the waiting paste", "idle", state().delivery.state)
+finishSummary(importJob, "ok", "ok", "Transcription complete.", { transcript = "import payload", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+update()
+check("an import inherits no paste", beforeImport, pasteLaunches())
+check("an import never auto-delivers", "idle", state().delivery.state)
+check("an import copies nothing", nil, clipboard)
+check("the replaced attempt left no marker", nil, fs[jobDir(liveJob) .. "/delivery.json"])
+
+-- A delivery attempt that cannot be recorded is not made: the durable marker is
+-- what stops a crash from repeating a paste, so without it nothing is copied and
+-- no key is sent.
+markerWriteFails = true
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local unwritableJob = state().job.id
+finishSummary(unwritableJob, "ok", "ok", "Transcription complete.", { transcript = "unwritable text", recording = true, copyable = true })
+update()
+clockMs = clockMs + 500
+local beforeMarkerFail = pasteLaunches()
+update()
+check("an unrecordable attempt fails", "failed", state().delivery.state)
+check("an unrecordable attempt copies nothing", nil, clipboard)
+check("an unrecordable attempt sends no keys", beforeMarkerFail, pasteLaunches())
+check("an unrecordable attempt says why", true, string.find(state().delivery.message, "record") ~= nil)
+check("an unrecordable attempt is notified", "error", notifications[#notifications].kind)
+check("an unrecordable attempt leaves no marker", nil, fs[jobDir(unwritableJob) .. "/delivery.json"])
+markerWriteFails = false
 
 -- A paste tool that accepts the chord and never reports back must not leave the
 -- plugin saying "pasting" for the rest of the session, and must not be asked a

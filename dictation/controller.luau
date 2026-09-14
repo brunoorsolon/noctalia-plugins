@@ -540,7 +540,7 @@ end
 -- The attempt marker is durable before anything is copied or typed, so a paste
 -- interrupted by a crash is visible afterwards and is never repeated on its own.
 local function writeDelivery(record)
-  noctalia.writeFile(deliveryPath(record.jobId), noctalia.json.encode(record, true))
+  return noctalia.writeFile(deliveryPath(record.jobId), noctalia.json.encode(record, true))
 end
 
 -- The panel keeps the keyboard while it is open, and the compositor is never
@@ -615,7 +615,18 @@ local function pasteInto(target, text)
     at = os.time(),
     target = { address = target.address, class = target.class },
   }
-  writeDelivery(record)
+  local saved, saveError = writeDelivery(record)
+  if not saved then
+    -- The marker is what makes a crash distinguishable from a fresh start. Without
+    -- it the attempt could not be recognised afterwards, so nothing is copied and
+    -- no key is sent: the durable boundary is enforced, not merely intended.
+    pendingDelivery = nil
+    local reason = type(saveError) == "string" and (" (" .. saveError .. ")") or ""
+    local message = "The delivery attempt could not be recorded" .. reason .. ", so nothing was copied and no keys were sent. Copy the transcript and paste it yourself."
+    setDelivery("failed", message)
+    noctalia.notifyError("Dictation", message)
+    return
+  end
 
   if not noctalia.copyToClipboard(text, "text/plain") then
     pendingDelivery = nil
@@ -799,6 +810,13 @@ end
 local function pumpDelivery()
   local request = pendingDelivery
   if not request then return end
+  -- The request belongs to the job that produced it: a job replaced before the
+  -- settle expired must never be delivered to the new one's destination.
+  if not S.job or S.job.id ~= request.jobId then
+    pendingDelivery = nil
+    setDelivery("idle", "")
+    return
+  end
   local state = S.delivery.state
   -- A check or a paste already in flight is never restarted; an answer that never
   -- arrives is bounded instead of retried.
@@ -888,6 +906,11 @@ local function startJob(wav, label)
   S.outcome, S.severity, S.message = nil, nil, "Transcribing."
   S.copyable, S.transcript, S.transcriptPath, S.resultPath = false, "", "", ""
   S.attempt, S.controlTokens = 0, {}
+  -- A queued paste belongs to the job that produced it. An import or a retry
+  -- replaces that job, so the queue is dropped rather than carried into a job
+  -- that #11 excludes from automatic delivery.
+  pendingDelivery = nil
+  if S.delivery.state ~= "manual" then S.delivery = { state = "idle", message = "" } end
   summaryPath = summaryPathFor(jobId)
   activityStartedAtMs = S.job.startedAtMs
   publish()
