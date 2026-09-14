@@ -354,9 +354,11 @@ end
 
 -- Silence is not an exit. The engine may still be running, so reporting the lost
 -- contact must not release the job: a second import would overlap the first, and
--- Cancel would lose its target. Ownership is handed back only when the helper
--- reports an outcome, or when the stall window beyond its own 30-minute watchdog
--- proves the engine had to be stopped even with no report.
+-- Cancel would lose its target. Ownership is handed back when the helper reports
+-- an outcome, or when the stall window passes as a bounded escape hatch.
+-- ponytail: the stall release is time-based, not proof of exit. A helper killed
+-- with no report can leave an orphaned engine, and a detached-engine check would
+-- have to observe the process itself; upgrade if an engine can outlive its helper.
 local function reportSilence()
   if silenceReported then return end
   silenceReported = true
