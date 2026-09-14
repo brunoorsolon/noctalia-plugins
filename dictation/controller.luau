@@ -591,6 +591,9 @@ local function bindLabel(bind)
   if description ~= "" and command ~= "" then return description .. " (" .. command .. ")" end
   if description ~= "" then return description end
   if command ~= "" then return command end
+  -- A Lua bind reports a reference number where a command would be, so when it
+  -- also carries no description there is nothing more specific to name.
+  if dispatcher == "__lua" then return "a Lua binding" end
   return "another binding"
 end
 

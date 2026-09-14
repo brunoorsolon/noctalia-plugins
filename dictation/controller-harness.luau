@@ -1608,6 +1608,7 @@ check("a keycode bind on another layout is still a conflict", "conflict", state(
 fixtureBinds = { { modmask = 72, key = "", keycode = 0, submap = "", dispatcher = "__lua", arg = "42", catch_all = false } }
 command("shortcut-refresh")
 check("a Lua numeric-key bind of the chord is a conflict", "conflict", state().shortcut.state)
+check("a Lua numeric-key conflict names what it is", true, string.find(state().shortcut.message, "a Lua binding", 1, true) ~= nil)
 local beforeLuaNumeric = fs[LUA_PATH]
 command("shortcut-install")
 check("a Lua numeric-key conflict writes nothing", beforeLuaNumeric, fs[LUA_PATH])
