@@ -102,6 +102,37 @@ local PROCESS_CHECK_RETRY_MS = 5000
 -- older job's files or leave a truncated recording.
 local MIN_FREE_BYTES = 20 * 1024 * 1024
 
+-- Constants for the recording shortcut, which the panel offers in its own section.
+--
+-- The recording shortcut is the user's own compositor binding, so setup proposes
+-- one chord and writes it in the format the active configuration uses. Nothing is
+-- installed without an explicit approval: the chord is checked against the live
+-- bind table first, the edit is one delimited block in the user's own file, the
+-- file is copied aside before it changes, and Undo removes exactly that block
+-- instead of restoring the copy over later edits.
+local SHORTCUT_KEY = "D"
+local SHORTCUT_CHORD = "Super+Alt+D"
+local SHORTCUT_MODS_CONF = "SUPER ALT"
+local SHORTCUT_MODS_LUA = "SUPER + ALT + D"
+-- SUPER (1 << 6) | ALT (1 << 3): the live bind table reports masks, so a conflict
+-- is found without parsing anybody's configuration.
+local SHORTCUT_MODMASK = 72
+-- The description is the bind's identity in the live table: a Lua bind reports the
+-- dispatcher as a reference number rather than the command, so it is the one field
+-- that identifies this setup's binding in both configuration formats.
+local SHORTCUT_DESCRIPTION = "Dictation: start or stop recording"
+local SHORTCUT_BEGIN = "magus/dictation:recording-shortcut:begin"
+local SHORTCUT_END = "magus/dictation:recording-shortcut:end"
+-- The binding drives the singleton controller through the plugin's own IPC, so the
+-- chord and the panel's buttons are the same entry and #11's destination context
+-- is preserved.
+local SHORTCUT_COMMAND = "noctalia msg plugin magus/dictation:controller all toggle"
+-- A compositor answer that never arrives must not leave the row busy forever, so
+-- the wait is bounded and the outcome is read back instead of assumed.
+local SHORTCUT_STALL_MS = 30 * 1000
+local BINDS_QUERY = { PASTE_TOOL, "-j", "binds" }
+local RELOAD_COMMAND = { PASTE_TOOL, "reload" }
+
 local S = {
   activity = "idle", -- idle | recording | running | verifying
   phase = "",
@@ -123,6 +154,10 @@ local S = {
   delivery = { state = "idle", message = "" },
   -- The delivery mechanism itself, so the panel can name it and its state.
   paste = { state = "untested", tested = false, message = "Automatic paste waits for the first verification." },
+  -- The recording shortcut is the user's own compositor binding, and this is the
+  -- setup record for it: unknown | unsupported | available | working | installed |
+  -- conflict | error.
+  shortcut = { state = "unknown", chord = SHORTCUT_CHORD, message = "Not checked yet.", canInstall = false, canRemove = false, installed = false },
 }
 
 local summaryPath = nil
@@ -271,6 +306,406 @@ local function refreshSetup()
     engineSha256 = shortHash(record.engine.sha256),
     modelSha256 = shortHash(record.model.sha256),
   }
+end
+
+-- ── Recording shortcut ───────────────────────────────────────────────────────
+
+local function envValue(name)
+  if type(noctalia.getenv) ~= "function" then return nil end
+  local value = noctalia.getenv(name)
+  return type(value) == "string" and value ~= "" and value or nil
+end
+
+-- Hyprland's own precedence: an explicit path wins, then hyprland.lua in the
+-- configuration directories, then hyprland.conf in the same order. The running
+-- compositor loads the same choice, so the block is written where it is read.
+local function shortcutConfigPath()
+  local explicit = envValue("HYPRLAND_CONFIG")
+  if explicit then
+    return explicit, (explicit:sub(-4) == ".lua") and "lua" or "conf"
+  end
+  local dirs = {}
+  local home = envValue("HOME")
+  local configHome = envValue("XDG_CONFIG_HOME")
+  if configHome then
+    table.insert(dirs, configHome)
+  elseif home then
+    table.insert(dirs, home .. "/.config")
+  end
+  for dir in (envValue("XDG_CONFIG_DIRS") or "/etc/xdg"):gmatch("[^:]+") do
+    table.insert(dirs, dir)
+  end
+  for _, suffix in ipairs({ "lua", "conf" }) do
+    for _, dir in ipairs(dirs) do
+      local path = dir .. "/hypr/hyprland." .. suffix
+      if noctalia.fileExists(path) then return path, suffix end
+    end
+  end
+  return nil, nil
+end
+
+local function shortcutBlock(format)
+  if format == "lua" then
+    return {
+      "-- " .. SHORTCUT_BEGIN,
+      string.format('hl.bind("%s", hl.dsp.exec_cmd("%s"), { description = "%s" })',
+        SHORTCUT_MODS_LUA, SHORTCUT_COMMAND, SHORTCUT_DESCRIPTION),
+      "-- " .. SHORTCUT_END,
+    }
+  end
+  return {
+    "# " .. SHORTCUT_BEGIN,
+    string.format("bindd = %s, %s, %s, exec, %s",
+      SHORTCUT_MODS_CONF, SHORTCUT_KEY, SHORTCUT_DESCRIPTION, SHORTCUT_COMMAND),
+    "# " .. SHORTCUT_END,
+  }
+end
+
+-- The block is one delimited piece, so removing it never touches a line this setup
+-- did not write and never has to trust the whole-file copy.
+local function stripShortcutBlock(content, beginMark, endMark)
+  local startAt = content:find(beginMark, 1, true)
+  if not startAt then return content end
+  local endAt = content:find(endMark, startAt, true)
+  if not endAt then return content end
+  local head = content:sub(1, startAt - 1):match("^(.*\n)") or ""
+  local lineEnd = content:find("\n", endAt + #endMark - 1, true)
+  local tail = lineEnd and content:sub(lineEnd + 1) or ""
+  return head .. tail
+end
+
+local function upsertShortcutBlock(content, lines, beginMark, endMark)
+  local stripped = stripShortcutBlock(content, beginMark, endMark)
+  -- The block goes in front of the file rather than behind it: a configuration can
+  -- end inside a submap, where a bind is not in effect outside it, and a Lua
+  -- configuration can end in a top-level return, after which nothing may follow.
+  return table.concat(lines, "\n") .. "\n" .. stripped
+end
+
+local function brokenBlockMessage(path)
+  return "The block in " .. path .. " has no closing marker (" .. SHORTCUT_END .. "), so this setup left it alone. Delete the marked lines by hand, then check again."
+end
+
+-- A block that was half-deleted by hand is not "absent": writing beside it would
+-- add a second binding and removing it would claim a removal that never happened.
+local function shortcutBlockState(content)
+  if type(content) ~= "string" then return "absent" end
+  local startAt = content:find(SHORTCUT_BEGIN, 1, true)
+  if not startAt then return "absent" end
+  if content:find(SHORTCUT_END, startAt, true) then return "complete" end
+  return "broken"
+end
+
+local function queryBinds(callback)
+  if not noctalia.commandExists(PASTE_TOOL) then
+    callback(nil, "hyprctl is not installed, so the compositor's bindings cannot be read.")
+    return
+  end
+  local accepted = noctalia.runAsync(BINDS_QUERY, function(result)
+    if type(result) ~= "table" or result.exitCode ~= 0 then
+      callback(nil, "hyprctl could not report the compositor's bindings.")
+      return
+    end
+    local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+    local binds = text ~= "" and noctalia.json.decode(text) or nil
+    if type(binds) ~= "table" then
+      callback(nil, "hyprctl's answer about the bindings was not readable.")
+      return
+    end
+    callback(binds, nil)
+  end)
+  if accepted == false then
+    callback(nil, "hyprctl could not be run, so the compositor's bindings are unknown.")
+  end
+end
+
+local function occupyingBind(binds)
+  for _, bind in ipairs(binds) do
+    -- Only the default submap competes: a binding defined inside a submap is not
+    -- active outside it, so it is not an occupant of this chord.
+    local submap = type(bind) == "table" and (bind.submap == nil or bind.submap == "")
+    if submap and bind.modmask == SHORTCUT_MODMASK then
+      local key = type(bind.key) == "string" and string.upper(bind.key) or ""
+      if key == SHORTCUT_KEY then return bind end
+    end
+  end
+  return nil
+end
+
+local function bindIsOurs(bind)
+  if type(bind) ~= "table" then return false end
+  if bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
+  return type(bind.arg) == "string" and string.find(bind.arg, SHORTCUT_COMMAND, 1, true) ~= nil
+end
+
+local function bindLabel(bind)
+  if type(bind) ~= "table" then return "another binding" end
+  if type(bind.description) == "string" and bind.description ~= "" then return bind.description end
+  local dispatcher = type(bind.dispatcher) == "string" and bind.dispatcher or ""
+  local arg = type(bind.arg) == "string" and bind.arg or ""
+  local text = noctalia.string.trim(dispatcher .. " " .. arg)
+  return text ~= "" and text or "another binding"
+end
+
+local shortcutPendingAtMs = nil
+
+local function setShortcut(state, fields)
+  S.shortcut = {
+    state = state,
+    chord = SHORTCUT_CHORD,
+    path = fields.path or "",
+    format = fields.format or "",
+    installed = fields.installed == true,
+    canInstall = fields.canInstall == true,
+    canRemove = fields.canRemove == true,
+    message = fields.message or "",
+  }
+  shortcutPendingAtMs = state == "working" and noctalia.nowMs() or nil
+  publish()
+end
+
+local function expireShortcutWait()
+  if S.shortcut.state ~= "working" or not shortcutPendingAtMs then return end
+  if noctalia.nowMs() - shortcutPendingAtMs <= SHORTCUT_STALL_MS then return end
+  setShortcut("error", {
+    path = S.shortcut.path, format = S.shortcut.format, installed = S.shortcut.installed,
+    canInstall = true, canRemove = S.shortcut.installed,
+    message = "The compositor did not answer, so nothing was confirmed. Check again to see what it reports now.",
+  })
+  noctalia.notifyError("Dictation", S.shortcut.message)
+end
+
+-- What the compositor reports decides the state: a chord that is already taken is
+-- never overwritten, a chord that answers with this setup's own description is
+-- installed, a block that is written but not registered is reported as such, and
+-- anything else is free to install.
+local function applyShortcutStatus(path, format, installed, binds)
+  local occupying = occupyingBind(binds)
+  if occupying and not bindIsOurs(occupying) then
+    setShortcut("conflict", {
+      path = path, format = format, installed = installed, canRemove = installed,
+      message = string.format("%s is already bound to %s, so nothing was changed. Free that chord in %s, then check again.",
+        SHORTCUT_CHORD, bindLabel(occupying), path),
+    })
+  elseif occupying then
+    setShortcut("installed", {
+      path = path, format = format, installed = installed, canInstall = true, canRemove = installed,
+      message = installed
+        and string.format("%s starts and stops recording while another window is focused. Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, path)
+        or string.format("%s is bound to the dictation controller, but not by this setup, so there is no block to undo.", SHORTCUT_CHORD),
+    })
+  elseif installed then
+    setShortcut("error", {
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = string.format("The recording shortcut is written in %s but the compositor did not register it. Undo removes the block, or install it again once the configuration is fixed.", path),
+    })
+  else
+    setShortcut("available", {
+      path = path, format = format, installed = false, canInstall = true,
+      message = string.format("%s is free. Install it to start and stop recording without opening the panel.", SHORTCUT_CHORD),
+    })
+  end
+end
+
+local function refreshShortcut()
+  if not noctalia.commandExists(PASTE_TOOL) then
+    setShortcut("unsupported", {
+      message = "The recording shortcut is a compositor binding, and hyprctl is not installed, so this setup cannot configure one. Recording from the panel and the bar still works.",
+    })
+    return
+  end
+  local path, format = shortcutConfigPath()
+  if not path then
+    setShortcut("unsupported", {
+      message = "No Hyprland configuration file was found in the usual places, so this setup has nowhere to put the binding. Recording from the panel and the bar still works.",
+    })
+    return
+  end
+  local content = noctalia.readFile(path)
+  local block = shortcutBlockState(content)
+  if block == "broken" then
+    setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+    return
+  end
+  local installed = block == "complete"
+  queryBinds(function(binds, reason)
+    if not binds then
+      setShortcut("error", { path = path, format = format, installed = installed, canRemove = installed, message = reason })
+      return
+    end
+    applyShortcutStatus(path, format, installed, binds)
+  end)
+end
+
+local function reloadCompositor(callback)
+  local accepted = noctalia.runAsync(RELOAD_COMMAND, function(result)
+    callback(type(result) == "table" and result.exitCode == 0)
+  end)
+  if accepted == false then callback(false) end
+end
+
+local function confirmInstalledShortcut(path, backup)
+  queryBinds(function(binds, reason)
+    if not binds then
+      setShortcut("error", { path = path, installed = true, canInstall = true, canRemove = true, message = reason .. " The binding is written in " .. path .. "." })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local occupying = occupyingBind(binds)
+    if occupying and bindIsOurs(occupying) then
+      setShortcut("installed", {
+        path = path, installed = true, canInstall = true, canRemove = true,
+        message = string.format("%s now starts and stops recording while another window is focused. The backup is %s; Undo removes the block.", SHORTCUT_CHORD, backup),
+      })
+      noctalia.notify("Dictation", "Recording shortcut installed: " .. SHORTCUT_CHORD .. ".")
+      return
+    end
+    setShortcut("error", {
+      path = path, installed = true, canInstall = true, canRemove = true,
+      message = "The binding is written in " .. path .. " and the compositor reloaded, but " .. SHORTCUT_CHORD .. " did not register. Undo removes the block, or restore " .. backup .. ".",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+  end)
+end
+
+local function writeShortcut(path, format, content)
+  local backup = path .. ".magus-dictation.bak"
+  if not noctalia.writeFile(backup, content) then
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "A copy of " .. path .. " could not be written, so the binding was not added. Check that the file's directory is writable.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local updated = upsertShortcutBlock(content, shortcutBlock(format), SHORTCUT_BEGIN, SHORTCUT_END)
+  local written, writeError = noctalia.writeFile(path, updated)
+  if not written then
+    local reason = type(writeError) == "string" and (" (" .. writeError .. ")") or ""
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "The binding could not be written to " .. path .. reason .. ". The copy is " .. backup .. "; restore it if the file looks wrong.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  setShortcut("working", { path = path, format = format, installed = true, message = "Reloading the compositor." })
+  reloadCompositor(function(ok)
+    if not ok then
+      setShortcut("error", {
+        path = path, format = format, installed = true, canInstall = true, canRemove = true,
+        message = "The binding is written in " .. path .. " but the compositor would not reload. Undo removes the block, or restore " .. backup .. ".",
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    confirmInstalledShortcut(path, backup)
+  end)
+end
+
+-- Only this button path writes a binding. It re-reads the live table right before
+-- the write, so a chord that was taken since the last check is refused instead of
+-- overwritten, and it converges when the binding is already this setup's own.
+local function installShortcut()
+  local path, format = shortcutConfigPath()
+  if not noctalia.commandExists(PASTE_TOOL) or not path then
+    refreshShortcut()
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local content = noctalia.readFile(path)
+  if type(content) ~= "string" then
+    setShortcut("error", {
+      path = path, format = format, canInstall = true,
+      message = "The Hyprland configuration could not be read: " .. path,
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local block = shortcutBlockState(content)
+  if block == "broken" then
+    setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local installed = block == "complete"
+  setShortcut("working", { path = path, format = format, installed = installed, message = "Checking the compositor's bindings before changing anything." })
+  queryBinds(function(binds, reason)
+    if not binds then
+      setShortcut("error", { path = path, format = format, installed = installed, canInstall = true, canRemove = installed, message = reason })
+      noctalia.notifyError("Dictation", reason)
+      return
+    end
+    local occupying = occupyingBind(binds)
+    if occupying and not bindIsOurs(occupying) then
+      applyShortcutStatus(path, format, installed, binds)
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    writeShortcut(path, format, content)
+  end)
+end
+
+-- Undo removes the delimited block and nothing else: later user edits stay, and the
+-- pre-edit copy is never restored over them.
+local function removeShortcut()
+  local path, format = shortcutConfigPath()
+  if not path then
+    refreshShortcut()
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local content = noctalia.readFile(path)
+  if type(content) ~= "string" then
+    setShortcut("error", {
+      path = path, format = format, canInstall = true,
+      message = "The Hyprland configuration could not be read: " .. path,
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local block = shortcutBlockState(content)
+  if block ~= "complete" then
+    refreshShortcut()
+    if block == "broken" then
+      noctalia.notifyError("Dictation", S.shortcut.message)
+    else
+      noctalia.notify("Dictation", "The recording shortcut block is not in " .. path .. ", so there was nothing to remove.")
+    end
+    return
+  end
+  local backup = path .. ".magus-dictation.bak"
+  if not noctalia.writeFile(backup, content) then
+    setShortcut("error", {
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = "A copy of " .. path .. " could not be written, so the binding was left in place. Check that the file's directory is writable.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local written, writeError = noctalia.writeFile(path, stripShortcutBlock(content, SHORTCUT_BEGIN, SHORTCUT_END))
+  if not written then
+    local reason = type(writeError) == "string" and (" (" .. writeError .. ")") or ""
+    setShortcut("error", {
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = "The recording shortcut block could not be removed from " .. path .. reason .. ". It is still there; try again.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  setShortcut("working", { path = path, format = format, message = "Removing the binding from the compositor." })
+  reloadCompositor(function(ok)
+    if not ok then
+      setShortcut("error", {
+        path = path, format = format, canInstall = true,
+        message = "The block was removed from " .. path .. ", but the compositor would not reload, so the chord may still be active until the next reload.",
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    refreshShortcut()
+    noctalia.notify("Dictation", "Recording shortcut removed. Unrelated shortcuts were not touched.")
+  end)
 end
 
 -- ── Microphone ───────────────────────────────────────────────────────────────
@@ -1321,6 +1756,7 @@ local function reportSilence()
 end
 
 function update()
+  expireShortcutWait()
   if S.activity == "idle" then
     pumpDelivery()
     return
@@ -1460,6 +1896,7 @@ if JOBS then noctalia.mkdirAll(JOBS) end
 
 loadMicrophone()
 refreshSetup()
+refreshShortcut()
 restoreJob()
 recallRecording()
 publish()
@@ -1490,5 +1927,11 @@ noctalia.state.watch("dictation.command", function(command)
     selectSource(command.source)
   elseif action == "deliver" then
     deliverNow(command.text)
+  elseif action == "shortcut-install" then
+    installShortcut()
+  elseif action == "shortcut-remove" then
+    removeShortcut()
+  elseif action == "shortcut-refresh" then
+    refreshShortcut()
   end
 end)

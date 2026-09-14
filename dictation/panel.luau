@@ -154,6 +154,48 @@ local function microphoneRow(s)
   })
 end
 
+-- The recording shortcut is a compositor binding, so this row shows the proposed
+-- chord, what the compositor currently reports for it, and the two actions that
+-- change it. Nothing here installs anything by itself: both writes go through the
+-- controller, which refuses a chord somebody else already holds.
+local function shortcutRow(s)
+  local shortcut = type(s.shortcut) == "table" and s.shortcut or {}
+  local state = shortcut.state or "unknown"
+  local chord = type(shortcut.chord) == "string" and shortcut.chord or "Super+Alt+D"
+  local color = "on_surface_variant"
+  if state == "error" then
+    color = "error"
+  elseif state == "conflict" then
+    color = "tertiary"
+  elseif state == "installed" then
+    color = "primary"
+  end
+  local busy = state == "working"
+  local message = type(shortcut.message) == "string" and shortcut.message or "Not checked yet."
+  return ui.column({ gap = 6 }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = "Recording shortcut (" .. chord .. ")", fontSize = 12, color = "on_surface_variant" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = "Check again", variant = "ghost", enabled = not busy, onClick = "onCheckShortcut" }),
+    }),
+    ui.label({ text = message, fontSize = 12, color = color, maxWidth = LABEL_WIDTH }),
+    ui.row({ gap = 8, align = "center" }, {
+      ui.button({
+        text = state == "installed" and "Install again" or "Install shortcut",
+        variant = state == "installed" and "ghost" or "primary",
+        enabled = shortcut.canInstall == true and not busy,
+        onClick = "onInstallShortcut",
+      }),
+      ui.button({
+        text = "Undo shortcut",
+        variant = "ghost",
+        enabled = shortcut.canRemove == true and not busy,
+        onClick = "onRemoveShortcut",
+      }),
+    }),
+  })
+end
+
 local function transcriptArea(s)
   if type(s.transcript) ~= "string" or s.transcript == "" then
     return ui.column({ gap = 8, flexGrow = 1, align = "center", justify = "center" }, {
@@ -259,6 +301,7 @@ local function render()
     ui.label({ text = statusText(s), color = severityColor(s.severity), maxWidth = LABEL_WIDTH }),
     ui.label({ text = info, fontSize = 12, color = "on_surface_variant", maxWidth = LABEL_WIDTH }),
     microphoneRow(s),
+    shortcutRow(s),
     ui.separator(),
     transcriptArea(s),
     deliveryRow(s),
@@ -311,6 +354,18 @@ end
 
 function onRefreshSources()
   sendCommand("sources")
+end
+
+function onInstallShortcut()
+  sendCommand("shortcut-install")
+end
+
+function onRemoveShortcut()
+  sendCommand("shortcut-remove")
+end
+
+function onCheckShortcut()
+  sendCommand("shortcut-refresh")
 end
 
 function onMicrophoneSelected(index, _text)
