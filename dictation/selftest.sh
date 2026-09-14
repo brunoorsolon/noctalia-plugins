@@ -29,6 +29,12 @@ HELP = """usage: fake-engine [options] audio.wav
 if "--help" in sys.argv:
     if os.environ.get("FAKE_HELP_FAIL"):
         sys.exit(2)
+    # A barrier for the check that presses Stop while the helper is still in
+    # preflight: the helper only leaves --help once the gate exists.
+    gate = os.environ.get("FAKE_HELP_GATE")
+    if gate:
+        while not os.path.exists(gate):
+            time.sleep(0.02)
     drop = os.environ.get("FAKE_DROP", "")
     print("\n".join(line for line in HELP.splitlines() if not (drop and drop in line)))
     sys.exit(0)
@@ -647,6 +653,25 @@ check "cancel while finalizing runs no engine" False "$([[ -d "$data/jobs/job-st
 check "cancel while finalizing cleared" False "$([[ -f "$data/jobs/job-stop-cancel.cancel" ]] && echo True || echo False)"
 check "unrelated recorder survives finalizing cancel" alive "$(unrelated_state)"
 REC_MODE=ok
+
+# A Stop that arrives while the helper is still preparing the engine and the
+# source belongs to this job, not to an earlier one: the capture ends and the job
+# reports a verdict. Deleting that request instead left the microphone recording
+# while the controller reported that the recording was being finalized.
+gate="$work/help-gate"
+FAKE_HELP_GATE="$gate" LEASE=6 REC_JSON= helper_record job-early-stop >"$work/rec-early-stop.json" &
+pid=$!
+unset FAKE_HELP_GATE
+for _ in $(seq 1 200); do
+  [[ -f "$data/jobs/job-early-stop/status.json" ]] && break
+  sleep 0.05
+done
+printf 'stop\n' >"$data/jobs/job-early-stop.stop"
+touch "$gate"
+wait "$pid"
+check "stop during startup is honoured" invalid_recording "$(field outcome <"$work/rec-early-stop.json")"
+check "stop during startup opens no microphone" False "$([[ -f "$data/jobs/job-early-stop/recorder.log" ]] && echo True || echo False)"
+check "stop during startup cleared the request" False "$([[ -f "$data/jobs/job-early-stop.stop" ]] && echo True || echo False)"
 
 # A controller that stops refreshing the lease releases the microphone by itself.
 LEASE=6 REC_JSON= helper_record job-lease >"$work/rec-lease.json" &

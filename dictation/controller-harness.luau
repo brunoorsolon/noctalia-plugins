@@ -713,6 +713,23 @@ onWidgetStop()
 check("stop while finalizing is refused", nil, fs[jobDir(panelJob) .. ".stop"])
 check("stop while finalizing says why", finalizingNotices + 1, #notifications)
 
+-- The helper reports the recognition phase once the WAV is finalized. The
+-- microphone is free by then, so the job has to leave the recording activity: the
+-- bar shows the work instead of a live microphone with a Stop button, and Toggle
+-- reports the running job instead of writing a second Stop the helper ignores.
+putTable(jobDir(panelJob) .. "/status.json", { phase = "transcribing", jobId = panelJob }, "status-transcribing")
+update()
+check("transcribing leaves the recording activity", "running", state().activity)
+check("transcribing hides stop on the bar", false, findByHandler(lastBarTree, "onWidgetStop").props.visible)
+check("transcribing shows the working glyph", "loader", find(lastBarTree, "glyph").props.name)
+check("transcribing counts the elapsed time", true, find(lastBarTree, "label", "0:00") ~= nil)
+check("transcribing tooltip names the phase", true, string.find(string.lower(barWidget.tooltip), "transcrib") ~= nil)
+fs[jobDir(panelJob) .. ".stop"] = nil
+local transcribingNotices = #notifications
+command("toggle")
+check("toggle during transcription writes no Stop", nil, fs[jobDir(panelJob) .. ".stop"])
+check("toggle during transcription reports the job", transcribingNotices + 1, #notifications)
+
 onWidgetCancel()
 check("widget cancel routes the cancel", "cancel\n", fs[jobDir(panelJob) .. ".cancel"])
 check("widget controls open no panel", beforePanel, panelsOpened)
@@ -749,4 +766,9 @@ check("panel shows the partial text", "partial text", find(lastTree, "input").pr
 check("panel review label", "The transcript was truncated.", find(lastTree, "label", "The transcript was truncated.").props.text)
 check("panel stays rendered", "column", lastTree.kind)
 
-print(failures == 0 and "controller harness ok" or ("controller harness FAILED: " .. failures))
+-- The check has to fail its process, not only print: a caller and any automation
+-- reading the exit status must see a failed run.
+if failures > 0 then
+  error(("controller harness FAILED: %d"):format(failures), 0)
+end
+print("controller harness ok")

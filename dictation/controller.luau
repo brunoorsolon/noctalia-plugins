@@ -845,6 +845,14 @@ function update()
           if not (S.phase == "finalizing" and status.phase == "recording") then
             S.phase = status.phase
           end
+          -- Capture is over once the helper reports the recognition phase, so the
+          -- job leaves the recording activity: neither surface offers Stop for a
+          -- microphone that is already released, and a Toggle reports the running
+          -- job instead of asking the helper to stop a job that is not recording.
+          if S.phase == "transcribing" then
+            S.activity = "running"
+            S.message = "Transcribing the recording."
+          end
         end
         if S.recording.path ~= "" then
           S.recording.exists = noctalia.fileExists(S.recording.path)

@@ -588,6 +588,7 @@ def command_record(args):
     process group, and the captured audio is preserved before any inference.
     """
     global SUMMARY_PATH
+    started = time.time()
     args.engine = os.path.abspath(args.engine)
     args.model = os.path.abspath(args.model)
     args.data_dir = os.path.abspath(args.data_dir)
@@ -637,12 +638,34 @@ def command_record(args):
         )
         return
 
-    # A stale stop request from an earlier job with the same id never ends this one.
+    # Only a request that predates this helper is stale: it belongs to an earlier
+    # job that reused the id. Stop or Cancel written after this helper started is
+    # this job's own request, so one pressed while the engine and the source were
+    # still being prepared is honoured by the loop below instead of discarded.
+    for path in (stop_file, cancel_file):
+        if os.path.exists(path) and os.path.getmtime(path) < started:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    # A Stop that arrived while the engine and the source were still being prepared
+    # is this job's Stop, so the microphone is never opened for a recording the user
+    # already ended.
     if os.path.exists(stop_file):
         try:
             os.remove(stop_file)
         except OSError:
             pass
+        verdict(
+            "invalid_recording",
+            "error",
+            "The recording was stopped before the microphone was opened, so no audio was captured.",
+            jobId=args.job_id,
+            attempt=0,
+            paths=recording_paths,
+            source=args.source,
+        )
+        return
     argv = [
         "pw-record",
         "--target", args.source,
