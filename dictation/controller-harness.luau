@@ -81,6 +81,10 @@ local backupWriteFails = false
 -- file, and a command line that cannot be read must stop the setup from guessing.
 local psExitCode = 0
 local psOutput = "/usr/bin/Hyprland"
+-- A ps answer can be held back at the stub seam, so a pending installation and a
+-- later Undo can be interleaved the way a slow host would interleave them.
+local deferPs = false
+local psReplies = {}
 
 local SOURCE_LIST = {
   { id = "alsa_input.internal-mic", name = "alsa_input.internal-mic", description = "Built-in Microphone" },
@@ -336,6 +340,7 @@ function noctalia.runAsync(argv, onResult)
   if argv[1] == "ps" then
     -- `ps -o args= -C Hyprland`: the compositor's command line, where --config
     -- is the only visible sign of an explicitly chosen configuration file.
+    if deferPs then table.insert(psReplies, onResult) return true end
     if type(onResult) == "function" then
       onResult({ exitCode = psExitCode, stdout = psOutput or "", stderr = "" })
     end
@@ -1578,20 +1583,24 @@ local beforeUniversal = fs[CONF_PATH]
 command("shortcut-install")
 check("a universal conflict writes nothing", beforeUniversal, fs[CONF_PATH])
 
--- A keycode bind carries no key name: the matcher falls back to the keycode, so a
--- bind on the D key's keycode occupies the chord while `key` is empty.
+-- A keycode bind carries no key name: the matcher falls back to the keycode,
+-- which is positional for the compositor's own keymap. On a Dvorak layout the D
+-- keysym sits on a different keycode than on QWERTY, and the bind table does not
+-- report that layout, so no nameless bind on the chord's modifiers can be
+-- cleared as unrelated.
 fixtureBinds = { { modmask = 72, key = "", keycode = 40, dispatcher = "exec", arg = "existing-launcher" } }
 command("shortcut-refresh")
 check("a keycode bind of the chord is a conflict", "conflict", state().shortcut.state)
 local beforeKeycode = fs[CONF_PATH]
 command("shortcut-install")
 check("a keycode conflict writes nothing", beforeKeycode, fs[CONF_PATH])
+check("a keycode conflict names the keycode", true, string.find(state().shortcut.message, "keycode 40", 1, true) ~= nil)
 
--- The keycode check is not a blanket refusal: a bind on some other keycode leaves
--- the chord free.
-fixtureBinds = { { modmask = 72, key = "", keycode = 24, dispatcher = "exec", arg = "existing-launcher" } }
+-- Any layout can put the D keysym on another positional code (43 on Dvorak), so
+-- the refusal is not keyed to one layout's keycode.
+fixtureBinds = { { modmask = 72, key = "", keycode = 43, dispatcher = "exec", arg = "existing-launcher" } }
 command("shortcut-refresh")
-check("a keycode bind of another key is not a conflict", "available", state().shortcut.state)
+check("a keycode bind on another layout is still a conflict", "conflict", state().shortcut.state)
 
 -- A catchall bind runs on every key in the default submap, so it holds this chord
 -- too, and the compositor would run both bindings on one press.
@@ -1905,6 +1914,58 @@ check("a missing ps is unsupported", "unsupported", state().shortcut.state)
 missingCommands.ps = nil
 psExitCode = 0
 psOutput = "/usr/bin/Hyprland"
+
+-- ps flattens argv with spaces, so a path element holding a space cannot be
+-- delimited from its output: with anything left after the path token the setup
+-- refuses, because the truncated prefix may exist as an unrelated file.
+putFile("/host/session extra.conf", "# active configuration\n")
+putFile("/host/session", "# unrelated configuration\n")
+putFile(CONF_PATH, "# user config\n")
+psOutput = "/usr/bin/Hyprland --config /host/session extra.conf"
+command("shortcut-refresh")
+check("an undelimitable path is unsupported", "unsupported", state().shortcut.state)
+check("an undelimitable path names its reason", true, string.find(state().shortcut.message, "delimited after --config", 1, true) ~= nil)
+local untouchedSpaced = fs["/host/session"]
+command("shortcut-install")
+check("an undelimitable path leaves its prefix alone", untouchedSpaced, fs["/host/session"])
+
+-- Several Hyprland processes cannot be told apart from ps output, so the setup
+-- refuses rather than editing whichever file came first.
+putFile("/host/other.conf", "# other session\n")
+putFile("/host/active.conf", "# current session\n")
+psOutput = "/usr/bin/Hyprland --config /host/other.conf\n/usr/bin/Hyprland --config /host/active.conf\n"
+command("shortcut-refresh")
+check("several compositors are unsupported", "unsupported", state().shortcut.state)
+check("several compositors name the ambiguity", true, string.find(state().shortcut.message, "several Hyprland processes", 1, true) ~= nil)
+command("shortcut-install")
+check("several compositors write nothing", "# other session\n", fs["/host/other.conf"])
+psOutput = "/usr/bin/Hyprland"
+
+-- A pending installation must be busy before its first asynchronous answer: the
+-- row offers no second install while the compositor's command line is being read,
+-- and a duplicate install whose process answer arrives after a completed Undo
+-- must drop instead of writing what the Undo reversed.
+putFile(CONF_PATH, "# user config\n")
+fixtureBinds = {}
+psReplies = {}
+command("shortcut-refresh")
+onOpen({})
+deferPs = true
+command("shortcut-install")
+check("a pending install is busy before the command line answers", "working", state().shortcut.state)
+check("a pending install disables a second install", false, findByHandler(lastTree, "onInstallShortcut").props.enabled)
+command("shortcut-install")
+deferPs = false
+psReplies[1]({ exitCode = 0, stdout = "/usr/bin/Hyprland", stderr = "" })
+check("the first pending install completes", "installed", state().shortcut.state)
+command("shortcut-remove")
+check("undo clears the shortcut", "# user config\n", fs[CONF_PATH])
+psReplies[2]({ exitCode = 0, stdout = "/usr/bin/Hyprland", stderr = "" })
+check("a late duplicate install stays dropped", "# user config\n", fs[CONF_PATH])
+check("a late duplicate install reports no chord", "available", state().shortcut.state)
+onClose()
+deferPs = false
+psReplies = {}
 
 -- The compositor runs every binding on a chord, so a second binding beside this
 -- setup's own block is reported rather than hidden behind "installed".
