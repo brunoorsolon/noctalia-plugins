@@ -1006,6 +1006,17 @@ clockMs = clockMs + 500
 update()
 check("a stale panel draft is not sent", "stale text", clipboard)
 
+-- Copy carries the same text as Paste now: an empty transcript has nothing to copy,
+-- and a draft left from an earlier job must not reach the clipboard in its place.
+clipboard = nil
+activeWindow = EDITOR
+onWidgetRecord()
+local emptyJob = state().job.id
+finishSummary(emptyJob, "empty", "error", "The engine returned no text.", { transcript = "", recording = true, copyable = false })
+update()
+onCopyTranscript()
+check("copy never sends an earlier job's draft", nil, clipboard)
+
 -- A paste tool that accepts the chord and never reports back must not leave the
 -- plugin saying "pasting" for the rest of the session, and must not be asked a
 -- second time: the attempt marker stays unfinished.

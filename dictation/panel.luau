@@ -48,6 +48,17 @@ local function sendCommand(action, extra)
   noctalia.state.set("dictation.command", command)
 end
 
+local function editedDraft(s)
+  -- The panel can show an edited transcript, and that is the text the user sees: it is
+  -- what Copy copies and what Paste now sends. The draft only counts while it
+  -- belongs to the transcript on screen - a draft left over from an earlier job is
+  -- not an edit of this one, and then the saved transcript is used instead.
+  if type(draft) ~= "string" or type(s) ~= "table" then return nil end
+  if draftKey ~= tostring(s.transcriptPath) then return nil end
+  if draft == s.transcript then return nil end
+  return draft
+end
+
 local function jobElapsed(s)
   local job = s.job
   if type(job) ~= "table" or type(job.elapsedSeconds) ~= "number" then return 0 end
@@ -313,16 +324,7 @@ function onMicrophoneSelected(index, _text)
 end
 
 function onDeliver()
-  -- The panel can show an edited transcript, and it is the text the user sees: it is
-  -- what Copy copies and what Paste now sends. The draft only counts while it
-  -- belongs to the transcript on screen - a draft left over from an earlier job is
-  -- not an edit of this one, and then the saved transcript is sent.
-  local s = state()
-  local edited = type(draft) == "string"
-    and type(s) == "table"
-    and draftKey == tostring(s.transcriptPath)
-    and draft ~= s.transcript
-  sendCommand("deliver", { text = edited and draft or nil })
+  sendCommand("deliver", { text = editedDraft(state()) })
 end
 
 function onOpenSettings()
@@ -339,7 +341,7 @@ end
 
 function onCopyTranscript()
   local s = state()
-  local text = type(draft) == "string" and draft or ""
+  local text = editedDraft(s) or ""
   if text == "" then text = type(s.transcript) == "string" and s.transcript or "" end
   if text == "" then return end
   if noctalia.copyToClipboard(text, "text/plain") then
