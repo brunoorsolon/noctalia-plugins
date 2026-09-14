@@ -46,14 +46,14 @@ local jobProcessDrop = 0
 -- nostdout = nothing readable, so only the durable file can help.
 local availability = "ok"
 
--- What the compositor reports as the focused window, what the paste tool answers
--- when it runs, and which tools this runtime does not have. `wtype ""` is the
--- setup probe: it types nothing and only reports whether the compositor accepts a
--- virtual keyboard.
+-- What the compositor reports as the focused window, what it answers to the chord
+-- dispatch, and which tools this runtime does not have. The chord goes out with
+-- `hyprctl dispatch sendshortcut`, and the setup probe dispatches the same command
+-- with no chord, which the dispatcher answers with its own argument error.
 local activeWindow = nil
 local activeWindowExitCode = 0
-local bindsAnswer = nil
-local bindsExitCode = 0
+local chordReply = "ok"
+local probeReply = "sendshortcut: invalid args"
 local pasteExitCode = 0
 local pasteStartRefused = false
 local pasteSilent = false
@@ -203,42 +203,29 @@ end
 putActiveWindow("0x1", "TextEditor", "notes.txt")
 local EDITOR = activeWindow
 
--- The compositor's bind table. The stub decodes by lookup, so the bind table is
--- registered the way a durable file is. Automatic paste is gated on a
--- release-triggered dictation shortcut, so the table can report a press bind too.
-local function putBinds(binds)
-  bindsAnswer = encode(binds)
-  decoded[bindsAnswer] = binds
-end
-putBinds({
-  { release = false, modmask = 64, key = "P", dispatcher = "exec", arg = "noctalia msg panel-toggle magus/dictation:panel" },
-  { release = true, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" },
-  { release = false, modmask = 0, key = "XF86AudioMicMute", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all stop" },
-})
--- The same shortcut as a press bind, for the release gate.
-local PRESS_BIND = { release = false, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" }
-local RELEASE_BIND = { release = true, modmask = 64, key = "D", dispatcher = "exec", arg = "noctalia msg plugin magus/dictation:controller all toggle" }
-
 -- Every helper invocation and every key injection the controller makes, in order.
 function noctalia.runAsync(argv, onResult)
   table.insert(launches, argv)
-  -- The compositor is asked which window is focused; the answer is what the
-  -- controller is allowed to paste into.
+  -- The compositor is asked which window is focused, and it is handed the chord:
+  -- the query answers with a window, the dispatch answers with its own reply.
   if argv[1] == "hyprctl" then
-    local forBinds = argv[3] == "binds"
-    local exitCode = forBinds and bindsExitCode or activeWindowExitCode
-    local stdout = forBinds and bindsAnswer or activeWindow
-    if type(onResult) == "function" then
-      onResult({ exitCode = exitCode, stdout = exitCode == 0 and stdout or "", stderr = "" })
+    if argv[2] == "dispatch" then
+      -- The setup probe asks for a chord with no arguments, so it is answered by
+      -- the dispatcher's own argument error and sends nothing.
+      if argv[4] == nil then
+        if type(onResult) == "function" then onResult({ exitCode = 0, stdout = probeReply, stderr = "" }) end
+        return true
+      end
+      -- The chord is started detached in one test, answers a reply in the others,
+      -- and in one test accepts it without ever reporting back.
+      if pasteStartRefused then return false end
+      if pasteSilent then return true end
+      if type(onResult) == "function" then onResult({ exitCode = pasteExitCode, stdout = pasteExitCode == 0 and chordReply or "", stderr = "" }) end
+      return true
     end
-    return true
-  end
-  -- The paste tool is started detached in one test, answers an exit status in the
-  -- others, and in one test accepts the chord without ever reporting back.
-  if argv[1] == "wtype" then
-    if pasteStartRefused then return false end
-    if pasteSilent then return true end
-    if type(onResult) == "function" then onResult({ exitCode = pasteExitCode, stdout = "", stderr = "" }) end
+    if type(onResult) == "function" then
+      onResult({ exitCode = activeWindowExitCode, stdout = activeWindowExitCode == 0 and activeWindow or "", stderr = "" })
+    end
     return true
   end
   if argv[3] == "sources" and type(onResult) == "function" then
@@ -305,10 +292,10 @@ end
 
 local function state() return stateStore["dictation"] end
 local function lastLaunch()
-  -- The compositor query is not a job launch, and it is what the last recording
-  -- start leaves behind.
+  -- The focused-window query is not a job launch: it is what the last recording
+  -- start or the last delivery check leaves behind. A chord dispatch is one.
   for index = #launches, 1, -1 do
-    if launches[index][1] ~= "hyprctl" then return table.concat(launches[index], ",") end
+    if not (launches[index][1] == "hyprctl" and launches[index][2] == "-j") then return table.concat(launches[index], ",") end
   end
   return ""
 end
@@ -324,12 +311,12 @@ local function jobLaunches()
   return count
 end
 
--- Key injections only: the setup probe runs the same tool with an empty text and
--- types nothing, so it is not a paste.
+-- Key injections only: the window query and the setup probe are hyprctl too, but
+-- they carry no chord, so they are not pastes.
 local function pasteLaunches()
   local count = 0
   for _, argv in ipairs(launches) do
-    if argv[1] == "wtype" and argv[2] ~= "" then count = count + 1 end
+    if argv[2] == "dispatch" and argv[4] ~= nil then count = count + 1 end
   end
   return count
 end
@@ -338,7 +325,7 @@ end
 -- injection is the one ordinary paste chord and nothing else.
 local function chordOnly()
   for _, argv in ipairs(launches) do
-    if argv[1] == "wtype" and argv[2] ~= "" and table.concat(argv, " ") ~= "wtype -M ctrl -k v -m ctrl" then return false end
+    if argv[2] == "dispatch" and argv[4] ~= nil and table.concat(argv, " ") ~= "hyprctl dispatch sendshortcut CTRL,V," then return false end
   end
   return true
 end
@@ -875,13 +862,49 @@ onConfigChanged()
 check("delivery names its mechanism", "untested", state().paste.state)
 
 -- Verify and record tests the mechanism itself, not only the engine: it asks the
--- paste tool to type nothing and reports whether the compositor accepted it.
+-- compositor for a chord with no arguments, which the dispatcher answers with its
+-- own argument error and which sends nothing.
 command("verify")
 putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-ok-delivery")
 update()
 check("verify tests the paste tool", true, state().paste.tested)
 check("tested mechanism is reported", "ok", state().paste.state)
-check("the probe types nothing", "wtype,", lastLaunch())
+check("the probe sends no chord", "hyprctl,dispatch,sendshortcut", lastLaunch())
+
+-- The probe reads the compositor's answer, not the exit status, and a compositor
+-- that does not have the dispatcher can name it in the refusal, so the refusal is
+-- matched before the dispatcher's name is.
+probeReply = "Invalid dispatcher, requested \"sendshortcut\" does not exist"
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-named-refusal-delivery")
+update()
+check("a refusal that names the dispatcher is still a refusal", false, state().paste.tested)
+probeReply = "Invalid dispatcher"
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-refused-delivery")
+update()
+check("a refused probe is not a tested mechanism", false, state().paste.tested)
+check("a refused probe is reported as untested", "untested", state().paste.state)
+
+-- An answer that names neither the dispatcher nor a plain success says nothing
+-- about this mechanism, so it is not accepted as evidence that it is installed.
+probeReply = "Cannot dispatch"
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-foreign-delivery")
+update()
+check("an answer about something else is not a tested mechanism", false, state().paste.tested)
+
+-- A compositor whose dispatchers answer with a plain "ok" accepts the probe too.
+probeReply = "ok"
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-ok-only-delivery")
+update()
+check("an answered probe is a tested mechanism", true, state().paste.tested)
+check("an answered probe is reported as ok", "ok", state().paste.state)
+probeReply = "sendshortcut: invalid args"
+command("verify")
+putTable("/data/setup-summary.json", { outcome = "ok", severity = "ok", message = "Setup verified." }, "probe-restored-delivery")
+update()
 
 -- An unconfirmed window class is held: automatic delivery is only for targets the
 -- user has confirmed once, and the hold is where that confirmation happens.
@@ -917,7 +940,7 @@ check("explicit paste is still settling", beforeExplicit, pasteLaunches())
 clockMs = clockMs + 250
 update()
 check("explicit paste injects one chord", beforeExplicit + 1, pasteLaunches())
-check("explicit paste uses the ordinary shortcut", "wtype,-M,ctrl,-k,v,-m,ctrl", lastLaunch())
+check("explicit paste uses the ordinary shortcut", "hyprctl,dispatch,sendshortcut,CTRL,V,", lastLaunch())
 check("explicit paste carries the transcript", firstText, clipboard)
 check("explicit paste sends text data", "text/plain", clipboardMime)
 check("explicit paste is an attempt", "attempted", state().delivery.state)
@@ -1087,53 +1110,39 @@ check("an unrecordable attempt is notified", "error", notifications[#notificatio
 check("an unrecordable attempt leaves no marker", nil, fs[jobDir(unwritableJob) .. "/delivery.json"])
 markerWriteFails = false
 
--- Automatic paste is release-gated: the compositor dispatches a `bindr` command
--- when the shortcut key is released, so a press-triggered dictation shortcut has
--- no observed release and is held instead of pasted into.
-putBinds({ PRESS_BIND })
+-- A compositor that refuses the chord is a visible failure: hyprctl still exits 0
+-- when it refuses one, so the reply - not the exit status - is what decides, and
+-- nothing is ever reported as pasted.
+chordReply = "Invalid dispatcher"
 clipboard = nil
 activeWindow = EDITOR
 onWidgetRecord()
-local pressJob = state().job.id
-finishSummary(pressJob, "ok", "ok", "Transcription complete.", { transcript = "press text", recording = true, copyable = true })
+local refusedJob = state().job.id
+finishSummary(refusedJob, "ok", "ok", "Transcription complete.", { transcript = "refused text", recording = true, copyable = true })
 update()
 clockMs = clockMs + 500
-local beforePress = pasteLaunches()
 update()
-check("a press-triggered shortcut is held", "held", state().delivery.state)
-check("a press-triggered shortcut sends no keys", beforePress, pasteLaunches())
-check("a press-triggered shortcut copies nothing", nil, clipboard)
-check("the release gate names the bind to add", true, string.find(state().delivery.message, "bindr") ~= nil)
-check("a gated attempt writes no marker", nil, fs[jobDir(pressJob) .. "/delivery.json"])
+check("a refused chord fails the delivery", "failed", state().delivery.state)
+check("a refused chord repeats what the compositor said", true, string.find(state().delivery.message, "Invalid dispatcher") ~= nil)
+check("a refused chord keeps the transcript", "refused text", clipboard)
+check("a refused chord marker is persisted", "failed", noctalia.json.decode(fs[jobDir(refusedJob) .. "/delivery.json"]).state)
+check("a refused chord is notified", "error", notifications[#notifications].kind)
+chordReply = "ok"
 
--- A bind table the compositor cannot report is a hold, not a guess.
-bindsExitCode = 1
-clipboard = nil
-onWidgetRecord()
-local unreadableBindsJob = state().job.id
-finishSummary(unreadableBindsJob, "ok", "ok", "Transcription complete.", { transcript = "unreadable text", recording = true, copyable = true })
-update()
-clockMs = clockMs + 500
-local beforeUnreadable = pasteLaunches()
-update()
-check("an unreadable bind table is held", "held", state().delivery.state)
-check("an unreadable bind table sends no keys", beforeUnreadable, pasteLaunches())
-check("an unreadable bind table says why", true, string.find(state().delivery.message, "keybinds") ~= nil)
-bindsExitCode = 0
-
--- The release bind is what allows the automatic route at all.
-putBinds({ RELEASE_BIND })
+-- The automatic chord is the same literal, addressed to the focused client and
+-- never to a window of its own: `sendshortcut` re-points focus when it is given a
+-- target, and the focus check is what decides the destination.
 clipboard = nil
 activeWindow = EDITOR
 onWidgetRecord()
-local releasedJob = state().job.id
-finishSummary(releasedJob, "ok", "ok", "Transcription complete.", { transcript = "released text", recording = true, copyable = true })
+local selectorJob = state().job.id
+finishSummary(selectorJob, "ok", "ok", "Transcription complete.", { transcript = "selector text", recording = true, copyable = true })
 update()
 clockMs = clockMs + 500
-local beforeReleased = pasteLaunches()
 update()
-check("a release-triggered shortcut pastes", beforeReleased + 1, pasteLaunches())
-check("the released shortcut carries its transcript", "released text", clipboard)
+check("the automatic chord carries the empty window selector", "hyprctl,dispatch,sendshortcut,CTRL,V,", lastLaunch())
+check("the chord names no window of its own", nil, string.find(lastLaunch(), "TextEditor", 1, true))
+check("an automatically delivered job is an attempt", "attempted", state().delivery.state)
 
 -- A paste tool that accepts the chord and never reports back must not leave the
 -- plugin saying "pasting" for the rest of the session, and must not be asked a
@@ -1317,29 +1326,12 @@ CONFIG.delivery = "auto"
 onConfigChanged()
 
 -- The mechanism and the window query are dependencies, not privileges: a missing
--- tool is explained and held, never installed and never escalated.
-missingCommands.wtype = true
+-- tool is explained and held, never installed and never escalated. The chord runs
+-- through the same hyprctl the window query uses, so losing it loses both.
+missingCommands.hyprctl = true
 onConfigChanged()
 check("missing paste tool is reported", "missing", state().paste.state)
-clipboard = nil
-activeWindow = EDITOR
-onWidgetRecord()
-local noToolJob = state().job.id
-finishSummary(noToolJob, "ok", "ok", "Transcription complete.", { transcript = "no tool text", recording = true, copyable = true })
-update()
-clockMs = clockMs + 500
-local beforeNoTool = pasteLaunches()
-update()
-check("missing paste tool holds delivery", "held", state().delivery.state)
-check("missing paste tool sends no keys", beforeNoTool, pasteLaunches())
-check("missing paste tool copies nothing", nil, clipboard)
-check("missing paste tool is named", true, string.find(state().delivery.message, "wtype") ~= nil)
-onDeliver()
-check("explicit paste without the tool sends no keys", beforeNoTool, pasteLaunches())
-missingCommands.wtype = nil
-onConfigChanged()
-
-missingCommands.hyprctl = true
+check("missing paste tool is named in setup", true, string.find(state().paste.message, "hyprctl") ~= nil)
 activeWindow = EDITOR
 onWidgetRecord()
 local noQueryJob = state().job.id
@@ -1351,7 +1343,10 @@ update()
 check("missing window query holds delivery", "held", state().delivery.state)
 check("missing window query sends no keys", beforeNoQuery, pasteLaunches())
 check("missing window query is named", true, string.find(state().delivery.message, "hyprctl") ~= nil)
+onDeliver()
+check("explicit paste without the tool sends no keys", beforeNoQuery, pasteLaunches())
 missingCommands.hyprctl = nil
+onConfigChanged()
 
 -- A crash around the marker is never repeated. With the marker on disk the next
 -- runtime holds the job, and a job recovered from disk never delivers at all: its

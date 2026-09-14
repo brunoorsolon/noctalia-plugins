@@ -24,28 +24,30 @@ local MIC_PATH = DATA and (DATA .. "/microphone.json") or nil
 local LAST_RECORDING_PATH = DATA and (DATA .. "/last-recording") or nil
 
 -- One rootless delivery mechanism: the finished transcript goes on the clipboard,
--- and a single paste chord is injected with wtype, which reaches the compositor
--- through the virtual-keyboard protocol of the user's own session - no daemon, no
--- device access, no privilege. ydotool is refused on purpose: it needs a running
--- daemon and access to the input devices, and this plugin never asks for either.
-local PASTE_TOOL = "wtype"
-local PASTE_CHORD = { PASTE_TOOL, "-M", "ctrl", "-k", "v", "-m", "ctrl" }
+-- and the compositor itself sends the single paste chord. `hyprctl dispatch
+-- sendshortcut CTRL,V,` reaches the focused client through Hyprland's own seat: it
+-- writes the chord's modifier state (ctrl) into that client first, sends the key
+-- straight to the client instead of through the bind matcher, and clears the
+-- modifiers again afterwards. A modifier the user still holds is therefore
+-- replaced rather than consulted - the application receives exactly Ctrl+V
+-- whatever the keyboard holds - and no speech is ever typed as keystrokes.
+-- ydotool is refused on purpose: it needs a running daemon and access to the input
+-- devices, and this plugin never asks for either.
+local PASTE_TOOL = "hyprctl"
+-- The empty window selector is deliberate: `sendshortcut` re-points focus, and
+-- restores it afterwards, when it is given a window to target, so the chord is
+-- addressed to the focused client and the focus check below stays the one thing
+-- that decides where the paste goes. The trailing comma is what carries that
+-- empty selector, and the dispatcher refuses a dispatch with fewer than three
+-- fields as invalid arguments.
+local PASTE_CHORD = { PASTE_TOOL, "dispatch", "sendshortcut", "CTRL,V," }
 -- The focused window is read from the compositor; its address is the identity a
 -- paste is checked against.
-local WINDOW_QUERY = { "hyprctl", "-j", "activewindow" }
--- The bind table is how the plugin checks that its own shortcut was released
--- before the paste chord was sent: a `bindr` command is dispatched by the
--- compositor when the shortcut key is released, so a release-triggered shortcut
--- is an observed release rather than a wait. Hyprland publishes no held-modifier
--- state at all - `hyprctl devices` reports the lock keys, not ctrl/alt/shift/super
--- - so the modifier itself cannot be observed by any rootless client.
-local BINDS_QUERY = { "hyprctl", "-j", "binds" }
-local SHORTCUT_TOKEN = "magus/dictation"
-local SHORTCUT_ACTIONS = { "toggle", "stop" }
--- The chord is sent no sooner than this after a job finished, so a modifier that
--- is still held when the release-triggered shortcut has already been dispatched is
--- not part of it. The wait covers the modifier's own release, which no rootless
--- client can observe.
+local WINDOW_QUERY = { PASTE_TOOL, "-j", "activewindow" }
+-- The chord is sent no sooner than this after a job finished, so a panel that is
+-- closing or a focus change that is landing has a moment to settle. It is not a
+-- modifier wait: the modifier state of the chord comes from the compositor, so a
+-- modifier the user still holds cannot join it either way.
 local PASTE_SETTLE_MS = 500
 -- A compositor answer that never arrives must not leave the panel saying
 -- "checking" for the rest of the session.
@@ -211,15 +213,15 @@ local function refreshPaste()
   if noctalia.getConfig("delivery") == "manual" then
     S.paste = { state = "manual", tested = tested, message = "Manual copy mode: the transcript is only copied when you ask for it." }
   elseif not noctalia.commandExists(PASTE_TOOL) then
-    S.paste = { state = "missing", tested = false, message = "Automatic paste needs " .. PASTE_TOOL .. ", which is not installed. Copying the transcript still works." }
+    S.paste = { state = "missing", tested = false, message = "Automatic paste sends the chord with the compositor's `sendshortcut`, which needs " .. PASTE_TOOL .. ". It is not installed, so only copying works." }
   elseif tested then
     S.paste = {
       state = "ok",
       tested = true,
-      message = "Automatic paste uses " .. PASTE_TOOL .. ", and the compositor accepted it. The transcript is copied to the clipboard first, so a clipboard manager keeps it in its history.",
+      message = "Automatic paste sends `sendshortcut CTRL,V` through " .. PASTE_TOOL .. ", and the compositor accepted it. The transcript is copied to the clipboard first, so a clipboard manager keeps it in its history.",
     }
   else
-    S.paste = { state = "untested", tested = false, message = "Automatic paste uses " .. PASTE_TOOL .. ". Verify and record tests it." }
+    S.paste = { state = "untested", tested = false, message = "Automatic paste sends `sendshortcut CTRL,V` through " .. PASTE_TOOL .. ". Verify and record tests it." }
   end
 end
 
@@ -597,61 +599,43 @@ local function queryDestination(callback)
   end
 end
 
--- A release-triggered dictation shortcut is the release gate: the compositor
--- dispatches a `bindr` command when the shortcut key is released, so automatic
--- paste is only allowed when such a bind exists. A press-triggered shortcut, an
--- unreadable bind table and a missing compositor are all held with the reason, and
--- the explicit Paste now route is never gated this way.
-local function queryShortcutRelease(callback)
-  if not noctalia.commandExists("hyprctl") then
-    callback(false, "The shortcut's release could not be confirmed: hyprctl is not installed.")
-    return
-  end
-  local accepted = noctalia.runAsync(BINDS_QUERY, function(result)
-    if type(result) ~= "table" or result.exitCode ~= 0 then
-      callback(false, "The shortcut's release could not be confirmed: hyprctl could not report the keybinds.")
-      return
-    end
-    local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
-    local binds = text ~= "" and noctalia.json.decode(text) or nil
-    if type(binds) ~= "table" then
-      callback(false, "The shortcut's release could not be confirmed: hyprctl reported no readable keybinds.")
-      return
-    end
-    for _, bind in ipairs(binds) do
-      local arg = type(bind) == "table" and type(bind.arg) == "string" and bind.arg or ""
-      if bind.release == true and string.find(arg, SHORTCUT_TOKEN, 1, true) then
-        for _, action in ipairs(SHORTCUT_ACTIONS) do
-          if string.find(arg, action, 1, true) then
-            callback(true, nil)
-            return
-          end
-        end
-      end
-    end
-    callback(false, "The dictation shortcut is not release-triggered.")
-  end)
-  if accepted == false then
-    callback(false, "The shortcut's release could not be confirmed: hyprctl could not be run.")
-  end
-end
-
 -- At record start the user is still in the window the dictation belongs to, so
--- that is the one window the automatic paste is allowed to reach. The same moment
--- records whether the shortcut that will end the recording is release-triggered.
+-- that is the one window the automatic paste is allowed to reach.
 local function captureDestination(jobId)
   destination = nil
-  queryShortcutRelease(function(released, releaseReason)
+  queryDestination(function(found, reason)
     if not S.job or S.job.id ~= jobId then return end
-    queryDestination(function(found, reason)
-      if not S.job or S.job.id ~= jobId then return end
-      if not found then
-        destination = { jobId = jobId, problem = reason, releaseGate = released, releaseReason = releaseReason }
-        return
-      end
-      destination = { jobId = jobId, address = found.address, class = found.class, releaseGate = released, releaseReason = releaseReason }
-    end)
+    if not found then
+      destination = { jobId = jobId, problem = reason }
+      return
+    end
+    destination = { jobId = jobId, address = found.address, class = found.class }
   end)
+end
+
+-- The compositor answers a dispatch with "ok", and it still exits 0 when it
+-- refuses the chord, so the reply - not the exit status - is what says the chord
+-- was sent into the client.
+local function chordAccepted(result)
+  if type(result) ~= "table" or result.exitCode ~= 0 then
+    return false, "hyprctl exited with status " .. tostring(type(result) == "table" and result.exitCode or nil)
+  end
+  local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+  if text == "ok" then return true end
+  return false, text ~= "" and text or "hyprctl returned no answer"
+end
+
+-- The setup probe sends no key at all: dispatching `sendshortcut` with no
+-- arguments asks the compositor for a chord and lets it answer with its own
+-- argument error, which only a compositor that has the dispatcher can say. Older
+-- compositors answer a successful dispatch with a plain "ok" whatever the
+-- dispatcher does with it, and refuse an unknown dispatcher by name, so both
+-- answers are read here and only the refusal is a missing mechanism.
+local function dispatcherInstalled(result)
+  if type(result) ~= "table" or result.exitCode ~= 0 then return false end
+  local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+  if text == "" or string.find(text, "Invalid dispatcher", 1, true) then return false end
+  return text == "ok" or string.find(text, "sendshortcut", 1, true) ~= nil
 end
 
 -- Copy and paste, once, into the destination that was just checked. The marker is
@@ -697,11 +681,12 @@ local function pasteInto(target, text)
     -- it must not have its report overwritten by a late status.
     if pendingDelivery ~= request then return end
     pendingDelivery = nil
-    -- A successful exit only proves the chord was injected: nothing reads the
-    -- destination's buffer, so the result is "attempted", never "inserted".
-    local exitCode = type(result) == "table" and result.exitCode or nil
-    record.exitCode, record.finishedAt = exitCode, os.time()
-    if exitCode == 0 then
+    -- An accepted chord only proves the requested V was handed to the focused
+    -- client: nothing reads the destination's buffer, so the result is
+    -- "attempted", never "inserted".
+    local sent, why = chordAccepted(result)
+    record.exitCode, record.finishedAt = type(result) == "table" and result.exitCode or nil, os.time()
+    if sent then
       record.state = "attempted"
       writeDelivery(record)
       -- The user confirmed this target by hand, so it can be automatic from now
@@ -710,17 +695,17 @@ local function pasteInto(target, text)
       setDelivery("attempted", "Paste attempted into " .. class .. ". The transcript is on the clipboard.")
       return
     end
-    record.state, record.message = "failed", "the paste tool exited with status " .. tostring(exitCode)
+    record.state, record.message = "failed", "the compositor refused the chord: " .. why
     writeDelivery(record)
-    local message = "The paste chord was not accepted, so nothing was typed. The transcript is on the clipboard; paste it yourself."
+    local message = "The compositor refused the paste chord (" .. why .. "), so nothing was typed. The transcript is on the clipboard; paste it yourself."
     setDelivery("failed", message)
     noctalia.notifyError("Dictation", message)
   end)
   if accepted == false then
     pendingDelivery = nil
-    record.state, record.message = "failed", "the paste tool could not be started"
+    record.state, record.message = "failed", "the chord could not be started"
     writeDelivery(record)
-    local message = "The paste tool could not be started, so nothing was sent. The transcript is on the clipboard; paste it yourself."
+    local message = "The paste chord could not be started, so nothing was sent. The transcript is on the clipboard; paste it yourself."
     setDelivery("failed", message)
     noctalia.notifyError("Dictation", message)
   end
@@ -778,8 +763,8 @@ local function queueDelivery(jobId)
     setDelivery("manual", "Manual copy mode: the transcript is ready to copy.")
     return
   end
-  -- Nothing is injected without the tool that injects it, and the plugin never
-  -- installs or replaces one for you.
+  -- Nothing is injected without the compositor that injects it, and the plugin
+  -- never installs or replaces one for you.
   if not noctalia.commandExists(PASTE_TOOL) then
     holdDelivery("Paste held: automatic paste needs " .. PASTE_TOOL .. ", which is not installed. Copy the transcript and paste it yourself.")
     return
@@ -801,12 +786,12 @@ local function queueDelivery(jobId)
     holdDelivery(HELD_MESSAGE[kind])
     return
   end
-  -- The release gate is checked before the chord, not after: without a
-  -- release-triggered shortcut the shortcut's own release was never observed.
-  if destination.releaseGate ~= true then
-    holdDelivery("Paste held: automatic paste needs the dictation shortcut on a release bind (`bindr`), so the shortcut is released before the paste chord. " .. (destination.releaseReason or "The shortcut's release could not be confirmed.") .. " Use Paste now while the target window is focused, or copy the transcript.")
-    return
-  end
+  -- No release gate is needed here, and none would be sound: Hyprland fires a
+  -- `bindr` command on the key release while the bind's modifiers are still held
+  -- (that is what the bind matches on), and no rootless client can read held
+  -- modifiers at all - `hyprctl devices` reports the lock keys, not ctrl, alt,
+  -- shift or super. The chord is made safe instead of observed: the compositor
+  -- writes the chord's modifier state into the client itself.
   local class = destination.class ~= "" and destination.class or "the focused window"
   -- A GUI target is only automatic once the user has confirmed that pasting there
   -- works, so a window the plugin has never been told about is held instead.
@@ -844,7 +829,7 @@ local function deliverNow(text)
     return
   end
   if not noctalia.commandExists(PASTE_TOOL) then
-    refuse("Automatic paste needs " .. PASTE_TOOL .. ", which is not installed.")
+    refuse("Automatic paste needs " .. PASTE_TOOL .. " for the compositor's `sendshortcut`.")
     return
   end
   if pendingDelivery or S.delivery.state == "checking" or S.delivery.state == "pasting" then
@@ -1264,10 +1249,10 @@ local function finishJob(summary, jobId)
 end
 
 local function probePasteTool()
-  -- wtype with an empty text connects to the compositor and uploads a keymap
-  -- without typing anything, so the mechanism is tested without sending a key.
-  local accepted = noctalia.runAsync({ PASTE_TOOL, "" }, function(result)
-    S.paste.tested = type(result) == "table" and result.exitCode == 0
+  -- Asking for a chord with no arguments is answered by the dispatcher's own
+  -- argument error and sends nothing, so the mechanism is tested without a key.
+  local accepted = noctalia.runAsync({ PASTE_TOOL, "dispatch", "sendshortcut" }, function(result)
+    S.paste.tested = dispatcherInstalled(result)
     refreshPaste()
     publish()
   end)

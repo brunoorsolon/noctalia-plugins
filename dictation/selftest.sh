@@ -785,8 +785,10 @@ check "helper pastes nothing" False \
   "$(grep -qE 'wl-copy|xclip|xsel|wl-paste|wtype|ydotool|dotool' "$helper" && echo True || echo False)"
 check "controller copies for delivery once" 1 "$(grep -c 'copyToClipboard' controller.luau)"
 check "controller injects keys in one place" 1 "$(grep -c 'runAsync(PASTE_CHORD' controller.luau)"
+check "delivery's one mechanism is the compositor" 1 \
+  "$(grep -c 'local PASTE_TOOL = "hyprctl"' controller.luau)"
 check "delivery sends the ordinary paste chord" 1 \
-  "$(grep -c 'PASTE_CHORD = { PASTE_TOOL, "-M", "ctrl", "-k", "v", "-m", "ctrl" }' controller.luau)"
+  "$(grep -c 'PASTE_CHORD = { PASTE_TOOL, "dispatch", "sendshortcut", "CTRL,V," }' controller.luau)"
 for entry in controller widget panel; do
   check "$entry sends no Return" False "$(grep -qE '\bReturn\b|KP_Enter|"Enter"' "$entry.luau" && echo True || echo False)"
 done
