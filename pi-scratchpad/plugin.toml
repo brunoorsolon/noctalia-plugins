@@ -1,0 +1,56 @@
+id = "magus/pi-scratchpad"
+name = "Pi Scratchpad"
+version = "0.1.0"
+plugin_api = 24
+author = "magus"
+license = "MIT"
+dependencies = ["hyprctl", "foot", "pi"]
+tags = ["hyprland", "desktop", "widget", "agent"]
+icon = "terminal-2"
+description = "Parks one long-lived Pi TUI in a Hyprland special workspace, shows its working, waiting or idle state in the bar, and notifies when Pi starts waiting out of sight."
+
+[[setting]]
+key = "workspace"
+type = "string"
+label_key = "settings.workspace.label"
+description_key = "settings.workspace.description"
+default = "pi"
+
+[[setting]]
+key = "terminal"
+type = "string"
+label_key = "settings.terminal.label"
+description_key = "settings.terminal.description"
+default = "foot"
+
+[[setting]]
+key = "spawn"
+type = "string"
+label_key = "settings.spawn.label"
+description_key = "settings.spawn.description"
+default = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
+
+[[setting]]
+key = "working_dir"
+type = "folder"
+label_key = "settings.working_dir.label"
+description_key = "settings.working_dir.description"
+default = "~"
+
+[[setting]]
+key = "geometry"
+type = "string"
+label_key = "settings.geometry.label"
+description_key = "settings.geometry.description"
+default = "900x600"
+
+[[setting]]
+key = "notify"
+type = "bool"
+label_key = "settings.notify.label"
+description_key = "settings.notify.description"
+default = true
+
+[[widget]]
+id = "scratchpad"
+entry = "scratchpad.luau"

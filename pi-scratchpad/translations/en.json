@@ -1,0 +1,14 @@
+{
+  "settings.workspace.label": "Special workspace",
+  "settings.workspace.description": "Hyprland special workspace the scratchpad lives in. Both \"pi\" and \"special:pi\" work.",
+  "settings.terminal.label": "Terminal",
+  "settings.terminal.description": "Terminal emulator the spawned Pi runs in, for example foot, kitty or alacritty.",
+  "settings.spawn.label": "Spawn command",
+  "settings.spawn.description": "Command run inside the terminal. The plugin adds PI_HYPR_MONITOR=1 so the companion extension publishes the status file; a pinned --session-dir keeps the scratchpad session separate from your other Pi sessions.",
+  "settings.working_dir.label": "Working directory",
+  "settings.working_dir.description": "Directory the spawned Pi starts in. The default is your home directory.",
+  "settings.geometry.label": "Window size",
+  "settings.geometry.description": "Floating size of the scratchpad window, as WIDTHxHEIGHT, for example 900x600.",
+  "settings.notify.label": "Notify when Pi starts waiting",
+  "settings.notify.description": "Send a notification when Pi changes to waiting while the special workspace is hidden. Nothing is sent while it is on screen."
+}

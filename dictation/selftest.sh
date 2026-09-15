@@ -1325,11 +1325,11 @@ done
 check "widget touches no clipboard" False "$(grep -q 'copyToClipboard' widget.luau && echo True || echo False)"
 check "panel copy is explicit" True "$(grep -q 'copyToClipboard' panel.luau && echo True || echo False)"
 
-# The catalog row and the package manifest are read together: Noctalia offers an
-# update while the catalog version differs from the materialized manifest's, so a
-# version that drifts between them leaves the update offered forever. The package
-# shape the catalog convention asks for is checked here because nothing else reads
-# the manifest or the thumbnail.
+# The package shape the catalog convention asks for is checked here because
+# nothing else reads the manifest, the entries or the thumbnail. The catalog row
+# itself is compared against the manifest for every plugin, this one included, by
+# the repository-wide check below.
+python3 ../scripts/check-catalog.py
 python3 - <<'PY'
 import os, sys, tomllib
 
@@ -1351,20 +1351,8 @@ def read(name):
 
 
 manifest = tomllib.loads(read("plugin.toml").decode("utf-8"))
-rows = tomllib.loads(read("../catalog.toml").decode("utf-8"))["plugin"]
-row = [entry for entry in rows if entry["id"] == manifest["id"]]
-if len(row) != 1:
-    sys.exit("FAIL: catalog rows for %s: expected [1] got [%d]" % (manifest["id"], len(row)))
-row = row[0]
-
-# name, version and dependencies are what Noctalia reads from the manifest; icon,
-# description, license, tags and author are rendered from the catalog row, so a
-# drift in either file shows the user the wrong package.
-for field in ("name", "icon", "description", "license", "tags", "author", "version", "plugin_api", "dependencies"):
-    eq("catalog %s" % field, manifest[field], row[field])
 eq("version is MAJOR.MINOR.PATCH", 3, len(manifest["version"].split(".")))
 true("license is declared", manifest["license"])
-true("updated_at is not older than added_at", row["updated_at"] >= row["added_at"])
 for kind in ("service", "panel", "widget"):
     for entry in manifest[kind]:
         true("%s entry %s exists" % (kind, entry["entry"]), os.path.isfile(entry["entry"]))
