@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Dictation engine source installer
+Comment=Build the transcribe.cpp recognition engine from source (CPU only)
+Exec=sh -c 'exec python3 "$(dirname "$1")/dictation_source_installer.py"' sh %k
+Terminal=false
+Categories=AudioVideo;Utility;
+Keywords=dictation;speech;transcription;
