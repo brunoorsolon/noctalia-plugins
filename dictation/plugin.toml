@@ -41,6 +41,18 @@ default = 4
 min = 1
 max = 64
 
+# How many finished dictations stay on disk. Pruning runs only after a newer
+# dictation's own result is committed, so a failed or interrupted job is never
+# silently removed to make room for one that did not finish.
+[[setting]]
+key = "retention"
+type = "int"
+label_key = "settings.retention.label"
+description_key = "settings.retention.description"
+default = 10
+min = 1
+max = 1000
+
 # Delivery is one mechanism, not a fallback matrix: the transcript is copied and
 # the ordinary paste chord is dispatched by the compositor through hyprctl,
 # rootless, in the user's own session. Manual copy is a deliberate preference and

@@ -14,6 +14,10 @@ local historyJob = ""
 local historyDraft = nil
 local historyDraftKey = ""
 local historyNote = ""
+-- A destructive action is armed first and only sent on the next confirmation, so
+-- "Delete dictation" is never one stray click away from removing audio.
+local historyConfirm = ""
+local diagnosticsConfirm = false
 
 local PHASE_TEXT = {
   starting = "Starting the recorder.",
@@ -41,6 +45,14 @@ local function severityColor(severity)
   if severity == "review" then return "tertiary" end
   if severity == "cancelled" then return "on_surface_variant" end
   return "primary"
+end
+
+local function sizeLabel(bytes)
+  if type(bytes) ~= "number" then return "unknown" end
+  if bytes >= 1073741824 then return string.format("%.1f GB", bytes / 1073741824) end
+  if bytes >= 1048576 then return string.format("%.1f MB", bytes / 1048576) end
+  if bytes >= 1024 then return string.format("%.0f kB", bytes / 1024) end
+  return tostring(math.floor(bytes)) .. " B"
 end
 
 -- The helper's outcome codes are the durable contract; these are the few that
@@ -348,7 +360,18 @@ end
 
 -- The history is the helper's durable record, so it lists what happened across
 -- panel closes, reloads and restarts. Selecting an entry exposes the whole text;
--- Play and Retry act on that entry's own recording, never on the current job.
+-- Play, Retry, Export text and the two deletes act on that entry's own files,
+-- never on the current job.
+local function confirmBox(text)
+  return ui.column({ gap = 6, fill = "error/0.12", radius = 8, padding = 10 }, {
+    ui.label({ text = text, fontSize = 12, color = "error", maxWidth = LABEL_WIDTH }),
+    ui.row({ gap = 8, align = "center" }, {
+      ui.button({ text = "Confirm delete", variant = "destructive", onClick = "onHistoryConfirm" }),
+      ui.button({ text = "Keep", variant = "ghost", onClick = "onHistoryCancel" }),
+    }),
+  })
+end
+
 local function historySection(s)
   local list, history = historyList(s)
   local idle = (s.activity or "idle") == "idle"
@@ -361,9 +384,37 @@ local function historySection(s)
     ui.row({ gap = 8, align = "center" }, {
       ui.label({ text = "Recent dictations", fontSize = 12, color = "on_surface_variant" }),
       ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = "Clear history", variant = "ghost", enabled = history.state == "ok", onClick = "onHistoryClear" }),
       ui.button({ text = "Refresh", variant = "ghost", onClick = "onRefreshHistory" }),
     }),
   }
+  -- Storage use comes from the helper's own accounting of its data directory, so
+  -- it counts what the plugin saved rather than whatever happens to be on disk.
+  local storage = type(history.storage) == "table" and history.storage or nil
+  if storage then
+    local text = string.format("Stored: %d dictation%s, %s", storage.jobsCount or 0, (storage.jobsCount == 1) and "" or "s", sizeLabel(storage.jobsBytes))
+    if type(storage.freeBytes) == "number" then
+      text = text .. "  \u{00b7}  " .. sizeLabel(storage.freeBytes) .. " free"
+    end
+    table.insert(rows, ui.label({ text = text, fontSize = 10, color = "on_surface_variant", maxWidth = LABEL_WIDTH }))
+  end
+  -- A retention failure is a real partial deletion, so it stays visible next to
+  -- the rows it left behind instead of only in a notification that is gone.
+  local retention = type(history.retention) == "table" and history.retention or nil
+  if retention and type(retention.failures) == "table" and #retention.failures > 0 then
+    table.insert(rows, ui.label({
+      text = "Automatic retention could not remove some files: " .. table.concat(retention.failures, "; "),
+      fontSize = 12,
+      color = "error",
+      maxWidth = LABEL_WIDTH,
+    }))
+  end
+  if type(history.note) == "string" and history.note ~= "" then
+    table.insert(rows, ui.label({ text = history.note, fontSize = 12, color = "tertiary", maxWidth = LABEL_WIDTH }))
+  end
+  if historyConfirm == "clear" then
+    table.insert(rows, confirmBox("Delete every saved dictation, including audio and text, except work that is still running?"))
+  end
   if #options == 0 then
     local failed = history.state == "error"
     local message = failed and (history.message ~= "" and history.message or "Could not read the history.") or "No saved dictations yet."
@@ -410,12 +461,71 @@ local function historySection(s)
       ui.spacer({ flexGrow = 1 }),
       ui.label({ text = entry.id, fontSize = 10, color = "on_surface_variant" }),
     }))
+    -- Explicit intent for the two destructive actions: each is armed here and
+    -- sent only from the confirmation that follows.
+    local armed = historyConfirm == "record:" .. entry.id and "Delete only this recording? The transcript and its attempt history stay, and playback and Retry stop being offered."
+      or historyConfirm == "dictation:" .. entry.id and "Delete this whole dictation: its recording, transcript and every attempt?"
+    if armed then
+      table.insert(rows, confirmBox(armed))
+    else
+      table.insert(rows, ui.row({ gap = 8, align = "center" }, {
+        ui.button({ text = "Export text", variant = "ghost", enabled = key ~= "", onClick = "onHistoryExportText" }),
+        ui.button({ text = "Delete recording", variant = "ghost", enabled = usable, onClick = "onHistoryDeleteRecording" }),
+        ui.button({ text = "Delete dictation", variant = "destructive", onClick = "onHistoryDeleteDictation" }),
+        ui.spacer({ flexGrow = 1 }),
+      }))
+    end
     if not usable then
       local reason = type(entry.recordingMessage) == "string" and entry.recordingMessage ~= "" and entry.recordingMessage or "The saved audio is not usable, so this dictation cannot be played or retried."
       table.insert(rows, ui.label({ text = reason, fontSize = 12, color = "tertiary", maxWidth = LABEL_WIDTH }))
     end
   end
   return ui.column({ gap = 6, }, rows)
+end
+
+-- Diagnostics are opt-in and graphical: opening them prepares this plugin's own
+-- bounded metadata and shows it verbatim, and only the confirmation below
+-- exports those same bytes to a local file. No audio, transcript text, raw
+-- recognition log or environment value is ever included.
+local function diagnosticsSection(s)
+  local d = type(s.diagnostics) == "table" and s.diagnostics or {}
+  local state = type(d.state) == "string" and d.state or "idle"
+  local preview = type(d.preview) == "string" and d.preview or ""
+  local busy = state == "preparing" or state == "exporting"
+  local rows = {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = "Diagnostics", fontSize = 12, color = "on_surface_variant" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = preview ~= "" and "Rebuild preview" or "Open diagnostics", variant = "ghost", enabled = not busy, onClick = "onDiagnosticsPreview" }),
+      ui.button({ text = "Export diagnostics", enabled = preview ~= "" and not busy, onClick = "onDiagnosticsExport" }),
+    }),
+  }
+  local color = state == "error" and "error" or "on_surface_variant"
+  local message = type(d.message) == "string" and d.message or ""
+  if message == "" then
+    message = "Nothing is collected until you ask. The export contains no audio and no transcripts."
+  end
+  table.insert(rows, ui.label({ text = message, fontSize = 12, color = color, maxWidth = LABEL_WIDTH }))
+  if preview ~= "" then
+    -- Read-only rendered text, not an editable field: what is on screen is exactly
+    -- the file the export copies, so the two cannot drift apart.
+    table.insert(rows, ui.scroll({ height = 200, fill = "surface_variant/0.4", radius = 8, padding = 8 }, {
+      ui.markdown({ text = "```json\n" .. preview .. "\n```" }),
+    }))
+    if diagnosticsConfirm then
+      table.insert(rows, ui.column({ gap = 6, fill = "primary/0.12", radius = 8, padding = 10 }, {
+        ui.label({ text = "Export this exact text, unchanged, to a file in your home directory? Nothing leaves this machine.", fontSize = 12, color = "primary", maxWidth = LABEL_WIDTH }),
+        ui.row({ gap = 8, align = "center" }, {
+          ui.button({ text = "Confirm export", variant = "primary", onClick = "onDiagnosticsConfirm" }),
+          ui.button({ text = "Cancel", variant = "ghost", onClick = "onDiagnosticsCancel" }),
+        }),
+      }))
+    end
+    if type(d.exportedPath) == "string" and d.exportedPath ~= "" then
+      table.insert(rows, ui.label({ text = "Exported to " .. d.exportedPath, fontSize = 10, color = "on_surface_variant", maxWidth = LABEL_WIDTH }))
+    end
+  end
+  return ui.column({ gap = 6 }, rows)
 end
 
 local function render()
@@ -426,20 +536,25 @@ local function render()
   local mic = type(s.microphone) == "table" and s.microphone or {}
   local micLabel = mic.state == "ok" and tostring(mic.name) or (mic.id ~= "" and mic.id or "none selected")
   local info = string.format("Backend CPU only. %d threads. Microphone: %s", math.floor(threads), micLabel)
-  panel.render(ui.column({ gap = 10, padding = 16 }, {
-    ui.label({ text = "Dictation", fontSize = 16, fontWeight = "bold" }),
-    setupBanner(s),
-    ui.label({ text = statusText(s), color = severityColor(s.severity), maxWidth = LABEL_WIDTH }),
-    ui.label({ text = info, fontSize = 12, color = "on_surface_variant", maxWidth = LABEL_WIDTH }),
-    microphoneRow(s),
-    shortcutRow(s),
-    ui.separator(),
-    transcriptArea(s),
-    deliveryRow(s),
-    recordingRow(s),
-    jobRow(s, recording, s.activity == "idle" or s.activity == nil),
-    ui.separator(),
-    historySection(s),
+  -- The panel body scrolls: storage accounting and the diagnostics preview add
+  -- real content below the history, and nothing may be reachable only by resizing.
+  panel.render(ui.scroll({ flexGrow = 1 }, {
+    ui.column({ gap = 10, padding = 16 }, {
+      ui.label({ text = "Dictation", fontSize = 16, fontWeight = "bold" }),
+      setupBanner(s),
+      ui.label({ text = statusText(s), color = severityColor(s.severity), maxWidth = LABEL_WIDTH }),
+      ui.label({ text = info, fontSize = 12, color = "on_surface_variant", maxWidth = LABEL_WIDTH }),
+      microphoneRow(s),
+      shortcutRow(s),
+      ui.separator(),
+      transcriptArea(s),
+      deliveryRow(s),
+      recordingRow(s),
+      jobRow(s, recording, s.activity == "idle" or s.activity == nil),
+      ui.separator(),
+      historySection(s),
+      diagnosticsSection(s),
+    }),
   }))
 end
 
@@ -532,6 +647,7 @@ end
 
 function onRefreshHistory()
   historyNote = ""
+  historyConfirm = ""
   sendCommand("history-refresh")
 end
 
@@ -558,6 +674,16 @@ local function selectedHistory(s)
     if entry.id == historyJob then return entry end
   end
   return list[1]
+end
+
+-- Arming is local, so a destructive action shows what it would remove in the same
+-- view the user is already reading before anything is sent to the helper.
+local function armHistory(action)
+  local entry = selectedHistory(state())
+  if type(entry) ~= "table" then return end
+  historyNote = ""
+  historyConfirm = action .. ":" .. entry.id
+  render()
 end
 
 function onHistoryEdited(text)
@@ -590,6 +716,69 @@ function onHistoryRetry()
   if type(entry) ~= "table" then return end
   historyNote = ""
   sendCommand("history-retry", { jobId = entry.id })
+end
+
+-- Two steps for anything destructive: arm, read what it will remove, then confirm.
+function onHistoryDeleteRecording()
+  armHistory("record")
+end
+
+function onHistoryDeleteDictation()
+  armHistory("dictation")
+end
+
+function onHistoryClear()
+  historyNote = ""
+  historyConfirm = "clear"
+  render()
+end
+
+function onHistoryConfirm()
+  local entry = selectedHistory(state())
+  local armed = historyConfirm
+  historyConfirm = ""
+  if armed == "clear" then
+    sendCommand("history-clear")
+  elseif type(entry) == "table" and armed == "record:" .. entry.id then
+    sendCommand("history-delete-recording", { jobId = entry.id })
+  elseif type(entry) == "table" and armed == "dictation:" .. entry.id then
+    sendCommand("history-delete", { jobId = entry.id })
+  end
+  render()
+end
+
+function onHistoryCancel()
+  historyConfirm = ""
+  render()
+end
+
+function onHistoryExportText()
+  local entry = selectedHistory(state())
+  if type(entry) ~= "table" then return end
+  historyNote = ""
+  sendCommand("history-export-text", { jobId = entry.id })
+end
+
+-- Opening the diagnostics is the explicit request; exporting needs a second one.
+function onDiagnosticsPreview()
+  diagnosticsConfirm = false
+  sendCommand("diagnostics-preview")
+end
+
+function onDiagnosticsExport()
+  diagnosticsConfirm = true
+  render()
+end
+
+function onDiagnosticsConfirm()
+  diagnosticsConfirm = false
+  sendCommand("diagnostics-export")
+  render()
+end
+
+function onDiagnosticsCancel()
+  diagnosticsConfirm = false
+  render()
 end
 
 function onCopyTranscript()

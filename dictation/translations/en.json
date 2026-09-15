@@ -7,6 +7,8 @@
   "settings.recording.description": "A saved 16 kHz mono signed-16-bit WAV. It is validated before inference and never modified.",
   "settings.threads.label": "Inference threads",
   "settings.threads.description": "Thread count passed to the engine. The OpenMP and OpenBLAS limits follow it.",
+  "settings.retention.label": "Kept dictations",
+  "settings.retention.description": "How many finished dictations are kept with their audio and text. After a newer dictation's result is safely saved, older finished ones beyond this count are deleted automatically. A failed, interrupted or cancelled job is kept until you delete it yourself, and nothing outside this plugin's own data directory is ever removed.",
   "settings.delivery.label": "Delivery",
   "settings.delivery.description": "Automatic copies the finished transcript and sends the ordinary paste shortcut into the window the recording was started from. It dispatches the chord through the compositor, so it needs hyprctl with the sendshortcut dispatcher, and the transcript goes on the clipboard first, where a clipboard manager keeps it in its history. Nothing is installed or escalated to make a paste work. Manual never pastes, so it needs no paste tool: the transcript is only copied when you ask for it.",
   "settings.delivery.auto": "Automatic (paste into the window you recorded from)",
