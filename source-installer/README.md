@@ -6,7 +6,7 @@ A standalone graphical installer that builds the [transcribe.cpp](https://github
 python3 source-installer/dictation_source_installer.py
 ```
 
-A `dictation-source-installer.desktop` launcher is included; it resolves the script next to itself, so it works while it stays in this directory. To add a menu entry, copy the launcher to `~/.local/share/applications/` and edit its `Exec` line to the absolute path of `dictation_source_installer.py`.
+No menu entry is shipped: a launcher that guesses its own location stops working as soon as it is copied, so the installer does not pretend to have one. To add one, write `~/.local/share/applications/dictation-source-installer.desktop` with `Exec=python3 <absolute path to dictation_source_installer.py>`, a `Name` and `Terminal=false`.
 
 ## Why it is separate
 
@@ -27,7 +27,7 @@ The installer's own boundary is narrow. It will never:
 2. **Explains the plan.** The window shows the source repository and the single pinned revision, the build and install locations, the packages to install, that the source is fetched over the network, and the expected disk and memory use. It states plainly that no prebuilt executable and no model is downloaded.
 3. **Asks for package approval.** It installs only `git cmake gcc-c++ make openblas-devel` through PackageKit (`pkcon`) or the polkit agent (`pkexec dnf`), whichever this desktop provides, so approval happens in the normal graphical prompt. If neither surface exists it shows a blocked state and does not fall back to terminal instructions.
 4. **Fetches one pinned revision.** `git init` / `remote add` / `fetch --depth 1` / `checkout --detach` of revision `9eed7f0919ac97c71c71dcd5dcc765c969aa2b05`, then it verifies that `HEAD` and the `origin` URL match the pin. Any other commit is rejected.
-5. **Builds the ordinary CPU target in staging.** `cmake -B <staging>/build` with `CMAKE_BUILD_TYPE=Release` and `TRANSCRIBE_VULKAN/CUDA/HIP/METAL=OFF`, then `cmake --build --parallel`. The plugin's explicit `--backend cpu --threads 4` invocation is what the built engine is checked against; nothing here advertises portability.
+5. **Builds the ordinary CPU target in staging.** `cmake -B <staging>/build` with `CMAKE_BUILD_TYPE=Release`, `TRANSCRIBE_VULKAN/CUDA/HIP/METAL=OFF` and `TRANSCRIBE_BUILD_TOOLS/TESTS=OFF`, then `cmake --build <staging>/build --parallel <cpus>` with an explicit job count. Upstream builds its test tree by default and that tree shells out through `uv` at build time; turning it off keeps the build to the engine and keeps the installer from resolving a second toolchain through a Python runner. Nothing here advertises portability.
 6. **Publishes only on success.** The built `transcribe-cli` must advertise every flag the plugin's own probe requires — `--backend --threads --timestamps --model --batch --batch-size --batch-jsonl`, matched as whole tokens — before it is copied into place atomically. The manifest records the source revision, build configuration, executable SHA-256, license/attribution and install time, and the upstream license files are copied next to the executable so the attribution survives the staging cleanup.
 7. **Selects into Dictation.** The engine is published under the installer's own data directory and linked into `~/.local/bin` when that name is free, so the setup introduced in #9 can find it. If an engine of the user's own is already there, it is left untouched and the window names the path to select instead.
 
@@ -47,7 +47,7 @@ The installer's own boundary is narrow. It will never:
 
 ## Removing it
 
-`Remove installer files` deletes only what the manifest records: its own engine directory, the `~/.local/bin` link when that link points at its own engine, the manifest and the staging tree. A user's own engine, the user's models and the plugin's transcription history are never touched.
+`Remove installer files` deletes only what the manifest records: its own engine directory, the `~/.local/bin` link when that link points at its own engine, the manifest, the staging tree and the logs directory. A user's own engine, the user's models and the plugin's transcription history are never touched.
 
 ## Repeated use
 

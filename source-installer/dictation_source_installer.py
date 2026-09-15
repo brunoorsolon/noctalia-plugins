@@ -53,7 +53,10 @@ REQUIRED_FLAGS = (
 )
 
 # The ordinary CPU build.  GPU backends are explicitly off, the default
-# ``auto`` device selection is never reached, and no tool is built.
+# ``auto`` device selection is never reached, and neither the tools nor the
+# fixture-backed unit tests are built: upstream turns tests ON by default and
+# their build graph shells out through ``uv``, which is not something a source
+# installer should drag in.
 CMAKE_ARGS = (
     "-DCMAKE_BUILD_TYPE=Release",
     "-DTRANSCRIBE_VULKAN=OFF",
@@ -61,6 +64,7 @@ CMAKE_ARGS = (
     "-DTRANSCRIBE_HIP=OFF",
     "-DTRANSCRIBE_METAL=OFF",
     "-DTRANSCRIBE_BUILD_TOOLS=OFF",
+    "-DTRANSCRIBE_BUILD_TESTS=OFF",
 )
 
 # Fedora development prerequisites for the CPU path only.  openblas-devel is
@@ -128,6 +132,16 @@ def child_env(extra: dict | None = None) -> dict:
     if extra:
         env.update(extra)
     return env
+
+
+def parallel_jobs() -> int:
+    """A bounded job count for ``cmake --build``.
+
+    Omitting the number makes CMake emit a bare ``make -j``, which GNU make
+    reads as unlimited parallelism and can swamp a desktop that is also running
+    the user's session.  One job per available CPU is the explicit bound.
+    """
+    return max(1, os.cpu_count() or 1)
 
 
 def sha256_file(path: Path) -> str:
@@ -400,6 +414,9 @@ class Installer:
 
     def install(self, approve_packages: bool = False) -> dict:
         self.runner.reset()
+        # Start each attempt with a fresh diagnostics directory instead of
+        # appending this run's output to the previous attempt's.
+        shutil.rmtree(self.paths.logs, ignore_errors=True)
         paths = self.paths
         existing = load_manifest(paths)
         if (
@@ -526,7 +543,7 @@ class Installer:
         configure = ["cmake", "-S", str(source), "-B", str(build_dir), *CMAKE_ARGS]
         if self.runner.run(configure, logpath=logpath) != 0:
             return False
-        build = ["cmake", "--build", str(build_dir), "--parallel"]
+        build = ["cmake", "--build", str(build_dir), "--parallel", str(parallel_jobs())]
         return self.runner.run(build, logpath=logpath) == 0
 
     def publish(self, build_dir: Path, source: Path | None = None) -> dict:

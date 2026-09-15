@@ -27,6 +27,19 @@ import dictation_source_installer as inst  # noqa: E402
 
 FAKE_TOOLS: dict[str, str] = {}
 
+# The build configuration the requirement asks for: a Release CPU build with no
+# GPU backend, no tools and no upstream test tree.  Spelled out here rather
+# than read back from the module, so a change to CMAKE_ARGS fails this test.
+EXPECTED_BUILD_FLAGS = [
+    "-DCMAKE_BUILD_TYPE=Release",
+    "-DTRANSCRIBE_VULKAN=OFF",
+    "-DTRANSCRIBE_CUDA=OFF",
+    "-DTRANSCRIBE_HIP=OFF",
+    "-DTRANSCRIBE_METAL=OFF",
+    "-DTRANSCRIBE_BUILD_TOOLS=OFF",
+    "-DTRANSCRIBE_BUILD_TESTS=OFF",
+]
+
 FAKE_TOOLS["git"] = """#!/usr/bin/env python3
 import os, sys
 from pathlib import Path
@@ -44,8 +57,17 @@ elif "-C" in args:
 raise SystemExit(0)
 """ % {"rev": inst.SOURCE_REVISION, "url": inst.SOURCE_URL}
 
-FAKE_TOOLS["cmake"] = """#!/usr/bin/env python3
-import os, stat, sys, time
+ARGV_PRELUDE = """import os, sys
+log = os.environ.get("FAKE_ARGV_LOG")
+if log:
+    with open(log, "a") as handle:
+        handle.write(" ".join(sys.argv[1:]) + chr(10))
+"""
+
+FAKE_TOOLS["cmake"] = (
+    "#!/usr/bin/env python3\n"
+    + ARGV_PRELUDE
+    + """import stat, time
 from pathlib import Path
 args = sys.argv[1:]
 if os.environ.get("FAKE_CMAKE_SLEEP"):
@@ -67,20 +89,34 @@ if build is not None:
         exe.write_text("#!/bin/sh\\n" + flags + "\\n")
         exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
 raise SystemExit(0)
-""".replace("__FLAGS__", repr(list(inst.REQUIRED_FLAGS)))
+"""
+).replace("__FLAGS__", repr(list(inst.REQUIRED_FLAGS)))
 
-FAKE_TOOLS["rpm"] = """#!/usr/bin/env python3
-import os, sys
-pkg = sys.argv[-1]
+FAKE_TOOLS["rpm"] = (
+    "#!/usr/bin/env python3\n"
+    + ARGV_PRELUDE
+    + """from pathlib import Path
+marker = os.environ.get("FAKE_APPROVAL_MARKER")
+if marker and Path(marker).exists():
+    raise SystemExit(0)
 missing = os.environ.get("FAKE_RPM_MISSING", "").split()
-raise SystemExit(1 if pkg in missing else 0)
+raise SystemExit(1 if sys.argv[-1] in missing else 0)
 """
+)
 
-FAKE_TOOLS["pkcon"] = """#!/usr/bin/env python3
-import os, sys
-print("simulated package approval:", " ".join(sys.argv[1:]))
-raise SystemExit(126 if os.environ.get("FAKE_APPROVAL_DENY") else 0)
+_APPROVAL_TOOL = (
+    "#!/usr/bin/env python3\n"
+    + ARGV_PRELUDE
+    + """if os.environ.get("FAKE_APPROVAL_DENY"):
+    raise SystemExit(126)
+marker = os.environ.get("FAKE_APPROVAL_MARKER")
+if marker:
+    open(marker, "w").write(" ".join(sys.argv[1:]))
+raise SystemExit(0)
 """
+)
+FAKE_TOOLS["pkcon"] = _APPROVAL_TOOL
+FAKE_TOOLS["pkexec"] = _APPROVAL_TOOL
 
 
 class Checks:
@@ -130,6 +166,8 @@ class Sandbox:
         os.environ["XDG_STATE_HOME"] = str(self.home / ".local" / "state")
         os.environ["XDG_DATA_HOME"] = str(self.home / ".local" / "share")
         os.environ["PATH"] = f"{self.bin_dir}:{sysbin}"
+        os.environ["FAKE_ARGV_LOG"] = str(self.root / "argv.log")
+        os.environ["FAKE_APPROVAL_MARKER"] = str(self.root / "approved")
         for key in ("FAKE_GIT_REV", "FAKE_GIT_URL", "FAKE_CMAKE_FAIL",
                     "FAKE_CMAKE_SLEEP", "FAKE_RPM_MISSING", "FAKE_APPROVAL_DENY"):
             os.environ.pop(key, None)
@@ -138,6 +176,16 @@ class Sandbox:
 
     def paths(self) -> inst.Paths:
         return inst.default_paths(self.home)
+
+    def argv_lines(self) -> list[str]:
+        log = self.root / "argv.log"
+        return log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+
+    def tool_lines(self, tool: str) -> list[str]:
+        """Recorded argv for one fake tool, keyed by its first argument."""
+        first = {"git": ("init", "-C"), "cmake": ("-S", "--build"),
+                 "pkcon": ("-y",), "pkexec": ("dnf",), "rpm": ("-q",)}[tool]
+        return [line for line in self.argv_lines() if line.split(" ")[0] in first]
 
     def installer(self) -> inst.Installer:
         return inst.Installer(self.paths())
@@ -231,7 +279,7 @@ def test_install_and_converge(checks: Checks) -> None:
                      record["revision"] == inst.SOURCE_REVISION
                      and record["engine_sha256"] == inst.sha256_file(engine))
         checks.check("manifest records build config and license",
-                     record["build_args"] == list(inst.CMAKE_ARGS) and "MIT" in record["license"])
+                     record["build_args"] == EXPECTED_BUILD_FLAGS and "MIT" in record["license"])
         checks.check("upstream license is copied beside the engine",
                      record["license_files"] == ["LICENSE"]
                      and (paths.install / "LICENSE").is_file())
@@ -272,6 +320,8 @@ def test_approval_denied(checks: Checks) -> None:
         result = box.installer().install(approve_packages=True)
         checks.check("denied approval blocks the install",
                      result["state"] == "blocked" and "refused or failed" in result["reason"], str(result))
+        checks.check("denied approval still asked for exactly the missing package",
+                     box.tool_lines("pkcon") == ["-y install cmake"], str(box.tool_lines("pkcon")))
         checks.check("denied approval publishes nothing",
                      not (box.paths().install / inst.ENGINE).exists())
 
@@ -338,6 +388,73 @@ def test_remove_preserves_user_engine(checks: Checks) -> None:
         checks.check("removal keeps unrelated files", unrelated.is_file())
 
 
+def test_build_configuration(checks: Checks) -> None:
+    with Sandbox("config", ["git", "cmake", "pkcon"]) as box:
+        result = box.installer().install(approve_packages=True)
+        checks.check("configured build publishes the engine", result["state"] == "installed", str(result))
+
+        configure = box.tool_lines("cmake")
+        configure = [line for line in configure if line.startswith("-S ")]
+        checks.check("exactly one configure invocation", len(configure) == 1, str(configure))
+        tokens = configure[0].split()
+        checks.check(
+            "configure requests exactly the CPU Release build with no GPU backend, tools or tests",
+            [token for token in tokens if token.startswith("-D")] == EXPECTED_BUILD_FLAGS,
+            str(tokens),
+        )
+        checks.check(
+            "configure runs against the staged checkout and build directories",
+            tokens[1].endswith("/staging/" + inst.SOURCE_REVISION)
+            and tokens[3] == tokens[1] + "/build",
+            str(tokens),
+        )
+
+        build = [line for line in box.tool_lines("cmake") if line.startswith("--build ")]
+        parts = build[0].split() if build else []
+        checks.check("exactly one build invocation", len(build) == 1, str(build))
+        checks.check(
+            "build passes an explicit job count rather than unbounded parallelism",
+            len(parts) == 4 and parts[2] == "--parallel" and parts[3].isdigit()
+            and int(parts[3]) >= 1,
+            str(parts),
+        )
+
+        record = inst.load_manifest(box.paths())
+        checks.check("manifest records the same build configuration",
+                     record["build_args"] == EXPECTED_BUILD_FLAGS, str(record["build_args"]))
+
+
+def test_packagekit_approval_line(checks: Checks) -> None:
+    with Sandbox("approve", ["git", "cmake", "rpm", "pkcon"],
+                 {"FAKE_RPM_MISSING": "cmake openblas-devel"}) as box:
+        result = box.installer().install(approve_packages=True)
+        checks.check("packagekit approval completes the install", result["state"] == "installed", str(result))
+        checks.check(
+            "packagekit approval asks for exactly the missing packages",
+            box.tool_lines("pkcon") == ["-y install cmake openblas-devel"],
+            str(box.tool_lines("pkcon")),
+        )
+
+
+def test_polkit_approval_branch(checks: Checks) -> None:
+    with Sandbox("polkit", ["git", "cmake", "rpm", "pkexec"],
+                 {"FAKE_RPM_MISSING": "cmake openblas-devel"}) as box:
+        detection = box.installer().detect()
+        checks.check(
+            "detect reports the polkit surface when pkcon is absent",
+            detection["approval_surface"] == {"kind": "polkit", "command": "pkexec"},
+            str(detection["approval_surface"]),
+        )
+        result = box.installer().install(approve_packages=True)
+        checks.check("polkit approval completes the install", result["state"] == "installed", str(result))
+        checks.check(
+            "polkit approval uses dnf with weak deps off and only the missing packages",
+            box.tool_lines("pkexec")
+            == ["dnf install -y --setopt=install_weak_deps=False cmake openblas-devel"],
+            str(box.tool_lines("pkexec")),
+        )
+
+
 def main() -> int:
     checks = Checks()
     for test in (
@@ -346,6 +463,9 @@ def main() -> int:
         test_engine_verification,
         test_detection,
         test_install_and_converge,
+        test_build_configuration,
+        test_packagekit_approval_line,
+        test_polkit_approval_branch,
         test_revision_tamper,
         test_blocked_without_surface,
         test_approval_denied,
