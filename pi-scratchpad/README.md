@@ -40,7 +40,7 @@ noctalia msg plugins enable magus/pi-scratchpad
 
 ## Usage
 
-Click the widget. When Pi is running it toggles the special workspace; when it is not, it opens a terminal on the spawn command inside that workspace, floating at the configured size, and shows it.
+Click the widget. When Pi is running it toggles the special workspace; when it is not, it opens a terminal on the spawn command inside that workspace, floating at the configured size, and shows it. Pi takes a few seconds to publish a status file, so a click landing in that window is ignored: a second Pi would share the one session directory and the status file could not tell the two apart. The latch lifts as soon as Pi publishes anything, and lapses on its own after twenty seconds so a spawn that never started cannot wedge the widget.
 
 Hiding a special workspace does not touch the process. Pi keeps running and keeps working; only closing the terminal or the compositor exiting ends it. The default spawn command resumes the same conversation with `pi -c` and a `--session-dir` of its own, so only scrollback is lost across a restart. Nothing here needs tmux or herdr, but if you run one, point the spawn command at it.
 
@@ -55,7 +55,7 @@ The workspace is one Pi, not one per project. It starts in the configured direct
 | Spawn command | `pi -c --session-dir ~/.local/state/pi-scratchpad/sessions` | What the terminal runs. The plugin adds `PI_HYPR_MONITOR=1`. |
 | Working directory | `~` | Where the spawned Pi starts. |
 | Window size | `900x600` | Floating size of the scratchpad window, as `WIDTHxHEIGHT`. |
-| Notify when Pi starts waiting | on | Send a notification when Pi changes to waiting while the workspace is hidden. |
+| Notify when Pi starts waiting | on | Send a notification when Pi changes to waiting while the workspace is hidden. One per turn, even if the widget sits on two bars. |
 
 No Pi configuration ships inside the plugin: the spawn command is the whole of it, so your model, provider and approval settings come from your own Pi setup.
 
@@ -71,7 +71,7 @@ No Pi configuration ships inside the plugin: the spawn command is the whole of i
 
 Unknown is deliberately not "not running". A file that cannot be read still says a session was there, so the widget never reports a live Pi as gone and a click toggles the workspace instead of starting a second Pi.
 
-The status file is `$XDG_RUNTIME_DIR/pi-hypr-agent-monitor/status.json`, or `$XDG_STATE_HOME/pi-hypr-agent-monitor/status.json` when the runtime directory is unset. The extension writes it atomically, removes it on session shutdown, and records `state`, `pid`, `session_id`, `cwd`, `model` and `updated_at`. Liveness is the recorded pid, never the file age: a session legitimately sits in `waiting` for hours. A Pi that was SIGKILLed leaves no removal behind, and its dead pid is what the widget catches.
+The status file is `$XDG_RUNTIME_DIR/pi-hypr-agent-monitor/status.json`, or `$XDG_STATE_HOME/pi-hypr-agent-monitor/status.json` when the runtime directory is unset, with `XDG_STATE_HOME` itself defaulting to `~/.local/state` exactly as the extension resolves it. The extension writes it atomically, removes it on session shutdown, and records `state`, `pid`, `session_id`, `cwd`, `model` and `updated_at`. Liveness is the recorded pid, never the file age: a session legitimately sits in `waiting` for hours. A Pi that was SIGKILLed leaves no removal behind, and its dead pid is what the widget catches.
 
 ## Checking it
 
@@ -81,7 +81,7 @@ The widget's Luau entry can be exercised without a compositor:
 ./pi-scratchpad/selftest.sh
 ```
 
-It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the click routing and the waiting notification. It needs `luau` on `PATH`; without one it skips instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
+It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the click routing, the spawn latch, the waiting notification and the two-placement cases. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
 
 What it cannot check is the host: whether a real Pi turn moves the indicator, whether the first click spawns and later clicks toggle, and whether the window arrives at the configured size. Those need Hyprland, Noctalia, a terminal and the extension.
 

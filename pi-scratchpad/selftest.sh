@@ -9,6 +9,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# The catalog row and the manifest are read together by Noctalia, so the two have
+# to agree. The check walks every plugin, this one included.
+python3 ../scripts/check-catalog.py
+
 LUAU="${LUAU:-$(command -v luau || true)}"
 if [[ -z "$LUAU" ]]; then
   echo "selftest: skipped, no luau on PATH (set LUAU=/path/to/luau)"

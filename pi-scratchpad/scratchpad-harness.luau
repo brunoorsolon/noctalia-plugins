@@ -25,6 +25,8 @@ local RUNTIME_DIR = "/run/user/1000"
 local STATE_DIR = "/home/user/.local/state"
 local STATUS_PATH = RUNTIME_DIR .. "/pi-hypr-agent-monitor/status.json"
 local STATE_STATUS_PATH = STATE_DIR .. "/pi-hypr-agent-monitor/status.json"
+-- What the extension uses when neither XDG_RUNTIME_DIR nor XDG_STATE_HOME is set.
+local HOME_STATUS_PATH = "/home/user/.local/state/pi-hypr-agent-monitor/status.json"
 local LIVE_PID = 4242
 local DEAD_PID = 4243
 
@@ -63,6 +65,19 @@ local ENV = { XDG_RUNTIME_DIR = RUNTIME_DIR, HOME = "/home/user" }
 function noctalia.getenv(name) return ENV[name] end
 
 noctalia.string = { trim = function(value) return (value:gsub("^%s+", ""):gsub("%s+$", "")) end }
+
+-- Entries run in isolated VMs and exchange plain values through this channel, so
+-- the stub keeps one table for the whole run: that is all two placements share.
+local shared = {}
+noctalia.state = {
+  get = function(key) return shared[key] end,
+  set = function(key, value) shared[key] = value end,
+}
+
+-- Wall-clock milliseconds, moved by the harness so a spawn grace can lapse.
+local clock = 1000000
+function noctalia.nowMs() return clock end
+local function advance(ms) clock = clock + ms end
 
 function noctalia.getConfig(key) return CONFIG[key] end
 function noctalia.setUpdateInterval() end
@@ -115,14 +130,17 @@ barWidget = {
 -- ── The entry ────────────────────────────────────────────────────────────────
 
 assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
+local firstUpdate, firstOnClick = update, onClick
+assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
+local secondUpdate, secondOnClick = update, onClick
 
 -- ── Fixtures ─────────────────────────────────────────────────────────────────
 
--- One document per state, built to the extension's shape: state, pid, session_id,
--- cwd, model and updated_at, written atomically and removed on session_shutdown.
+-- One document per state, in the shape the companion extension documents: every
+-- field present, state as one of the three words, updated_at in Unix seconds.
 local function document(state, pid)
-  local raw = ('{"state":"%s","pid":%d,"session_id":"s-1","cwd":"/home/user/project","model":"pi-3","updated_at":1757960000}'):format(state, pid)
-  decoded[raw] = { state = state, pid = pid, session_id = "s-1", cwd = "/home/user/project", model = "pi-3", updated_at = 1757960000 }
+  local raw = ('{"state":"%s","pid":%d,"session_id":"0f3c1a","cwd":"/home/bruno","model":"anthropic/claude-sonnet-4-5","updated_at":1757260800}'):format(state, pid)
+  decoded[raw] = { state = state, pid = pid, session_id = "0f3c1a", cwd = "/home/bruno", model = "anthropic/claude-sonnet-4-5", updated_at = 1757260800 }
   return raw
 end
 
@@ -132,8 +150,8 @@ local IDLE = document("idle", LIVE_PID)
 local UNRECOGNISED = document("thinking", LIVE_PID)
 -- A document with no pid at all: there is no process to check, so it cannot be
 -- reported as gone.
-local PIDLESS = '{"state":"working","session_id":"s-1","cwd":"/home/user/project"}'
-decoded[PIDLESS] = { state = "working", session_id = "s-1", cwd = "/home/user/project" }
+local PIDLESS = '{"state":"working","session_id":"0f3c1a","cwd":"/home/bruno"}'
+decoded[PIDLESS] = { state = "working", session_id = "0f3c1a", cwd = "/home/bruno" }
 local DEAD_PID_DOCUMENT = document("working", DEAD_PID)
 -- A torn write: valid JSON never lands on disk, because the extension writes
 -- atomically, so this is the "cannot be parsed" case.
@@ -194,8 +212,14 @@ ENV.XDG_STATE_HOME = STATE_DIR
 files[STATE_STATUS_PATH] = WORKING
 check("the XDG_STATE_HOME fallback finds the status file", working, glyphFor(nil))
 files[STATE_STATUS_PATH] = nil
-ENV.XDG_RUNTIME_DIR = RUNTIME_DIR
+
+-- And XDG_STATE_HOME itself defaults to ~/.local/state, so a session with neither
+-- variable set is still findable.
 ENV.XDG_STATE_HOME = nil
+files[HOME_STATUS_PATH] = WORKING
+check("the ~/.local/state default finds the status file", working, glyphFor(nil))
+files[HOME_STATUS_PATH] = nil
+ENV.XDG_RUNTIME_DIR = RUNTIME_DIR
 
 -- ── Click routing ────────────────────────────────────────────────────────────
 
@@ -208,6 +232,14 @@ local function hasDispatch(kind)
   return false
 end
 
+local function execCount()
+  local count = 0
+  for _, argv in ipairs(dispatches) do
+    if argv[2] == "dispatch" and argv[3] == "exec" then count = count + 1 end
+  end
+  return count
+end
+
 local function commandText()
   for _, argv in ipairs(dispatches) do
     if argv[2] == "dispatch" and argv[3] == "exec" then return argv[4] end
@@ -218,6 +250,7 @@ end
 -- Nothing running: the click has to spawn, floating at the configured size in
 -- the configured special workspace, with the monitor variable set.
 show(nil)
+advance(60000) -- no spawn is in flight from an earlier case
 dispatches = {}
 onClick()
 local spawn = commandText()
@@ -230,15 +263,35 @@ checkTrue("the spawn reveals the workspace it spawns into", hasDispatch("toggles
 -- directory has to be absolute by the time it is quoted.
 checkTrue("the default working directory resolves before it is quoted", spawn:find("cd '/home/user'", 1, true) ~= nil)
 
-CONFIG.working_dir = "~/project"
+-- Pi is still booting and the click is repeated. It reads as "nothing is running"
+-- for as long as the boot takes, and a second Pi would share the session
+-- directory, so the in-flight spawn has to block it.
+onClick()
+check("a second click while Pi is starting does not spawn again", 1, execCount())
+
+-- The latch also lifts as soon as the session shows up in the status file,
+-- without waiting the grace out.
+show(WORKING)
+update()
+show(nil)
 dispatches = {}
+CONFIG.working_dir = "~/project"
 onClick()
 checkTrue("a ~/ working directory resolves too", commandText():find("cd '/home/user/project'", 1, true) ~= nil)
 CONFIG.working_dir = "~"
 
--- A live session: the click has to toggle, not spawn a second Pi.
+-- And a spawn that never publishes a session at all must not wedge the widget:
+-- once the grace lapses the next click is obeyed again.
+show(nil)
+advance(60000)
 dispatches = {}
+onClick()
+check("the spawn grace lapses", 1, execCount())
+
+-- A live session: the click has to toggle, not spawn a second Pi.
 show(WORKING)
+update()
+dispatches = {}
 onClick()
 checkTrue("a live session toggles the workspace", hasDispatch("togglespecialworkspace"))
 checkTrue("a live session never spawns", not hasDispatch("exec"))
@@ -297,6 +350,29 @@ update()
 check("the notify setting silences it", 0, notifyCount())
 CONFIG.notify = true
 
+-- ── Two placements ───────────────────────────────────────────────────────────
+
+-- A widget placed on two bars runs as two entries in isolated VMs, so the
+-- per-plugin state channel is all they share. It has to be enough for one
+-- notification per waiting turn and one Pi per spawn.
+visible = false
+show(IDLE)
+firstUpdate()
+secondUpdate()
+notifyCount()
+
+show(WAITING)
+firstUpdate()
+check("the first placement announces the waiting turn", 1, notifyCount())
+secondUpdate()
+check("the second placement does not announce it again", 0, notifyCount())
+
+show(nil)
+advance(60000)
+dispatches = {}
+firstOnClick()
+secondOnClick()
+check("two placements do not start two Pis", 1, execCount())
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then

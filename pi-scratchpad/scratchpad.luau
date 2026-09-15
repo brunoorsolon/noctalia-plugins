@@ -18,6 +18,18 @@ local DEFAULT_SPAWN = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions
 local DEFAULT_WORKING_DIR = "~"
 local DEFAULT_GEOMETRY = "900x600"
 
+-- A spawn is dispatched seconds before the extension can publish a status file:
+-- the terminal has to start and Pi has to boot. Clicks landing in that window are
+-- ignored rather than obeyed, because a second Pi would share the one session
+-- directory and the status file could not tell the two apart.
+local SPAWN_GRACE_MS = 20000
+
+-- Keys this plugin publishes on the runtime's per-plugin state channel. Entries
+-- are isolated VMs, so that channel is the only thing two placements of this
+-- widget share - without it each bar announces the same waiting turn.
+local SPAWNED_UNTIL = "spawned_until"
+local LAST_STATE = "last_state"
+
 -- Every state the widget can report, and how it looks. Glyph names are Tabler
 -- names and every state gets a different one, so a screenshot alone tells the
 -- states apart.
@@ -43,8 +55,11 @@ end
 
 local function workspace()
   -- Accept both "pi" and "special:pi": the setting names the workspace, and
-  -- Hyprland spells the selector as "special:<name>".
-  return (text("workspace", DEFAULT_WORKSPACE):gsub("^special:", ""))
+  -- Hyprland spells the selector as "special:<name>". A bare "special:" leaves
+  -- nothing behind, which is the same as having set no name at all.
+  local name = text("workspace", DEFAULT_WORKSPACE):gsub("^special:", "")
+  if name == "" then return DEFAULT_WORKSPACE end
+  return name
 end
 
 local function notificationsEnabled()
@@ -60,12 +75,16 @@ end
 -- ── The status file ───────────────────────────────────────────────────────────
 
 -- The extension keeps the file under XDG_RUNTIME_DIR, or under XDG_STATE_HOME
--- when that is unset. With neither set there is nowhere to look, which reads the
--- same as a missing file.
+-- when that is unset, which itself defaults to ~/.local/state. The search order
+-- here is the one the extension documents, so the two agree on where the file is.
 local function statusPath()
   local dir = noctalia.getenv("XDG_RUNTIME_DIR")
   if type(dir) ~= "string" or dir == "" then dir = noctalia.getenv("XDG_STATE_HOME") end
-  if type(dir) ~= "string" or dir == "" then return nil end
+  if type(dir) ~= "string" or dir == "" then
+    local home = noctalia.getenv("HOME")
+    if type(home) ~= "string" or home == "" then return nil end
+    dir = home .. "/.local/state"
+  end
   return dir .. "/" .. STATUS_DIR .. "/" .. STATUS_FILE
 end
 
@@ -100,6 +119,8 @@ end
 -- spawn line through /bin/sh, but the shell only expands a tilde it can see and
 -- this plugin single-quotes the path, so the expansion has to happen here or the
 -- shipped "~" default would leave `cd '~'` failing and take the terminal with it.
+-- noctalia.expandPath is not used because its handling of a bare "~" is not
+-- documented, and this is the one place where getting it wrong is silent.
 local function absolutePath(path)
   local home = noctalia.getenv("HOME")
   if type(home) == "string" and home ~= "" then
@@ -159,8 +180,6 @@ end
 
 -- ── The widget ────────────────────────────────────────────────────────────────
 
-local lastState = nil
-
 local function paint(state)
   local look = LOOK[state]
   barWidget.render(ui.glyph({ name = look.glyph, size = 14, color = look.color }))
@@ -179,11 +198,36 @@ local function announce(previous, state)
   end)
 end
 
+-- A Pi this widget has just started is not in the status file yet, so a click
+-- cannot tell it apart from a Pi that is not running. The deadline covers the
+-- terminal launch and the boot; it is published as well as kept locally, so the
+-- two placements of a widget on two bars do not both start one.
+local spawnAt = 0
+
+local function spawnInFlight()
+  local now = noctalia.nowMs()
+  if now < spawnAt then return true end
+  local published = noctalia.state.get(SPAWNED_UNTIL)
+  return type(published) == "number" and now < published
+end
+
+local function clearSpawnLatch()
+  spawnAt = 0
+  noctalia.state.set(SPAWNED_UNTIL, 0)
+end
+
 local function tick()
   local state = readState()
+  -- A session in the status file is the one a spawn was for, so the latch lifts
+  -- as soon as Pi publishes anything at all, readable or not.
+  if state ~= "not_running" then clearSpawnLatch() end
   paint(state)
-  announce(lastState, state)
-  lastState = state
+
+  -- Publish before announcing: the other placement has to see the transition as
+  -- already announced when it ticks.
+  local previous = noctalia.state.get(LAST_STATE)
+  if previous ~= state then noctalia.state.set(LAST_STATE, state) end
+  announce(previous, state)
   return state
 end
 
@@ -193,9 +237,16 @@ function update()
 end
 
 function onClick()
+  -- A click on a Pi this widget just started would be read as "nothing is
+  -- running" and start a second one, so it is ignored until the session shows up
+  -- in the status file or the grace expires.
+  if spawnInFlight() then return end
+
   -- Only a missing or dead process spawns. An unreadable file still means a
   -- session was there, so toggling is the safe verb for it.
   if readState() == "not_running" then
+    spawnAt = noctalia.nowMs() + SPAWN_GRACE_MS
+    noctalia.state.set(SPAWNED_UNTIL, spawnAt)
     compositor("spawn")
   else
     compositor("toggle")
