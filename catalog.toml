@@ -18,8 +18,8 @@ dependencies = ["imagemagick"]
 [[plugin]]
 id = "magus/dictation"
 name = "Dictation"
-version = "0.2.0"
-updated_at = 1789386575
+version = "0.3.0"
+updated_at = 1789482471
 added_at = 1789334575
 author = "magus"
 license = "MIT"
@@ -28,4 +28,4 @@ description = "Records the microphone you choose and transcribes the recording w
 deprecated = false
 plugin_api = 24
 tags = ["audio", "dictation", "recording", "service", "panel"]
-dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "transcribe-cli"]
+dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "ps", "transcribe-cli"]

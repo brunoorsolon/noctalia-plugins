@@ -1325,6 +1325,56 @@ done
 check "widget touches no clipboard" False "$(grep -q 'copyToClipboard' widget.luau && echo True || echo False)"
 check "panel copy is explicit" True "$(grep -q 'copyToClipboard' panel.luau && echo True || echo False)"
 
+# The catalog row and the package manifest are read together: Noctalia offers an
+# update while the catalog version differs from the materialized manifest's, so a
+# version that drifts between them leaves the update offered forever. The package
+# shape the catalog convention asks for is checked here because nothing else reads
+# the manifest or the thumbnail.
+python3 - <<'PY'
+import os, sys, tomllib
+
+
+def eq(name, expected, actual):
+    if expected != actual:
+        sys.exit("FAIL: %s: expected %r got %r" % (name, expected, actual))
+
+
+def true(name, value):
+    eq(name, True, bool(value))
+
+
+def read(name):
+    if not os.path.isfile(name):
+        sys.exit("FAIL: %s is missing" % name)
+    with open(name, "rb") as handle:
+        return handle.read()
+
+
+manifest = tomllib.loads(read("plugin.toml").decode("utf-8"))
+rows = tomllib.loads(read("../catalog.toml").decode("utf-8"))["plugin"]
+row = [entry for entry in rows if entry["id"] == manifest["id"]]
+if len(row) != 1:
+    sys.exit("FAIL: catalog rows for %s: expected [1] got [%d]" % (manifest["id"], len(row)))
+row = row[0]
+
+# name, version and dependencies are what Noctalia reads from the manifest; icon,
+# description, license, tags and author are rendered from the catalog row, so a
+# drift in either file shows the user the wrong package.
+for field in ("name", "icon", "description", "license", "tags", "author", "version", "plugin_api", "dependencies"):
+    eq("catalog %s" % field, manifest[field], row[field])
+eq("version is MAJOR.MINOR.PATCH", 3, len(manifest["version"].split(".")))
+true("license is declared", manifest["license"])
+true("updated_at is not older than added_at", row["updated_at"] >= row["added_at"])
+for kind in ("service", "panel", "widget"):
+    for entry in manifest[kind]:
+        true("%s entry %s exists" % (kind, entry["entry"]), os.path.isfile(entry["entry"]))
+true("translations are shipped", os.path.isfile("translations/en.json"))
+thumb = read("thumbnail.webp")
+eq("thumbnail container", b"RIFF", thumb[:4])
+eq("thumbnail type", b"WEBP", thumb[8:12])
+true("thumbnail is not a stub", len(thumb) > 4096)
+PY
+
 if command -v luau-compile >/dev/null 2>&1; then
   for script in ./*.luau; do
     luau-compile --binary "$script" >/dev/null || { echo "FAIL: $script does not compile" >&2; exit 1; }
