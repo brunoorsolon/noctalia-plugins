@@ -448,6 +448,26 @@ def tree_size(path):
     return total
 
 
+def job_audio(job, summary, result):
+    """The audio a job transcribes, and whether its `wav` field named it.
+
+    A recorded job stores the path under `recording`, a retry or an import under
+    `wav`, and an older job only inside its summary's `paths`. The order lives here
+    so every caller that needs to know which file a job plays or reads resolves the
+    same one: reading a single key is how a retry's audio goes unnoticed.
+    """
+    paths = summary.get("paths") if isinstance(summary, dict) and isinstance(summary.get("paths"), dict) else {}
+    if not paths and isinstance(result, dict) and isinstance(result.get("paths"), dict):
+        paths = result["paths"]
+    if isinstance(job.get("recording"), str) and job["recording"] != "":
+        return job["recording"], False
+    if isinstance(paths.get("recording"), str) and paths["recording"] != "":
+        return paths["recording"], False
+    if isinstance(job.get("wav"), str) and job["wav"] != "":
+        return job["wav"], True
+    return "", False
+
+
 def job_entry(name, job_dir):
     """One history entry from the durable files this job already wrote."""
     job = read_json_file(os.path.join(job_dir, "job.json")) or {}
@@ -463,18 +483,12 @@ def job_entry(name, job_dir):
     if not paths and isinstance(result, dict) and isinstance(result.get("paths"), dict):
         paths = result["paths"]
 
-    recording = ""
+    recording, from_wav = job_audio(job, summary, result)
     subject = "saved audio"
-    if isinstance(job.get("recording"), str) and job["recording"] != "":
-        recording = job["recording"]
-    elif isinstance(paths.get("recording"), str) and paths["recording"] != "":
-        recording = paths["recording"]
-    elif isinstance(job.get("wav"), str) and job["wav"] != "":
-        recording = job["wav"]
-        # A retry reads an earlier dictation's own recording, so only a file the
-        # user picked in settings is an import.
-        if not job.get("retriesOf"):
-            subject = "imported recording"
+    # A retry reads an earlier dictation's own recording, so only a file the user
+    # picked in settings is an import.
+    if from_wav and not job.get("retriesOf"):
+        subject = "imported recording"
     if recording == "":
         problem = "There is no saved audio for this dictation, so it cannot be retried."
     else:
@@ -720,7 +734,9 @@ def referenced_recordings(data_dir, skip):
 
     A retry stores the dictation it retried as its own audio, so a job can point
     into another job's directory; the manual delete path already refuses to delete
-    another dictation's recording for the same reason.
+    another dictation's recording for the same reason. The path comes from
+    `job_entry`, which is the resolver the panel plays from, so this cannot read a
+    field a real job does not write.
     """
     jobs_dir = jobs_dir_for(data_dir)
     used = set()
@@ -731,9 +747,11 @@ def referenced_recordings(data_dir, skip):
     for name in names:
         if name in skip or not JOB_NAME.match(name):
             continue
-        job = read_json_file(os.path.join(jobs_dir, name, "job.json")) or {}
-        recording = job.get("recording")
-        if isinstance(recording, str) and recording != "":
+        job_dir = os.path.join(jobs_dir, name)
+        if os.path.islink(job_dir) or not os.path.isdir(job_dir):
+            continue
+        recording = job_entry(name, job_dir).get("recordingPath") or ""
+        if recording != "":
             used.add(os.path.realpath(recording))
     return used
 
@@ -1033,7 +1051,9 @@ def diagnostics_document(data_dir, retention):
                         chars = len(handle.read())
             except OSError:
                 chars = 0
-        recording = job.get("recording")
+        # A retry's audio is the dictation it read, which lives in another job's
+        # directory, so this resolves the path the same way the panel plays it.
+        recording, _from_wav = job_audio(job, summary, None)
         recording_bytes = None
         if isinstance(recording, str) and os.path.isfile(recording) and not os.path.islink(recording):
             try:

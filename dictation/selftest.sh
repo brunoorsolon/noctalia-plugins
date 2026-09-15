@@ -968,29 +968,37 @@ check "a transcript is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/attempt-1
 # A retry names the earlier dictation's recording as its own audio, so retention
 # must not remove a job whose audio a kept dictation still plays: doing so would
 # take Play and Retry away from a dictation inside the retention window, with no
-# failure reported anywhere.
+# failure reported anywhere. The retry is built by the command the panel actually
+# runs, so this exercises the record the plugin writes.
 SDATA="$work/shared-recording"
 python3 - "$SDATA" <<'PY'
 import json, os, struct, sys, wave
 data = sys.argv[1]
-jobs = os.path.join(data, "jobs")
-for name, started in (("job-src", 1000), ("job-retry", 2000)):
-    job = os.path.join(jobs, name)
-    os.makedirs(os.path.join(job, "attempt-1"))
-    json.dump({"jobId": name, "mode": "record", "startedAt": started},
-              open(os.path.join(job, "job.json"), "w"))
-    json.dump({"outcome": "ok", "severity": "ok", "message": "done", "copyable": True},
-              open(os.path.join(job, "summary.json"), "w"))
-with wave.open(os.path.join(jobs, "job-src", "recording.wav"), "wb") as handle:
+job = os.path.join(data, "jobs", "job-src")
+os.makedirs(os.path.join(job, "attempt-1"))
+json.dump({"jobId": "job-src", "mode": "record", "startedAt": 1000,
+           "recording": os.path.join(job, "recording.wav")},
+          open(os.path.join(job, "job.json"), "w"))
+json.dump({"outcome": "ok", "severity": "ok", "message": "done", "copyable": True},
+          open(os.path.join(job, "summary.json"), "w"))
+open(os.path.join(job, "attempt-1", "transcript.txt"), "w").write("kept text\n")
+with wave.open(os.path.join(job, "recording.wav"), "wb") as handle:
     handle.setnchannels(1)
     handle.setsampwidth(2)
     handle.setframerate(16000)
     handle.writeframes(struct.pack("<16000h", *([0] * 16000)))
-record = json.load(open(os.path.join(jobs, "job-retry", "job.json")))
-record["mode"] = "import"
-record["recording"] = os.path.join(jobs, "job-src", "recording.wav")
-record["retriesOf"] = "job-src"
-json.dump(record, open(os.path.join(jobs, "job-retry", "job.json"), "w"))
+PY
+python3 "$helper" run --engine "$engine" --model "$MODEL" --threads "$THREADS" \
+    --wav "$SDATA/jobs/job-src/recording.wav" --job-id job-retry --data-dir "$SDATA" \
+    --timeout "$TIMEOUT" --retries-of job-src >/dev/null
+out=$(python3 "$helper" history --data-dir "$SDATA")
+python3 - "$out" "$SDATA/jobs/job-src/recording.wav" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+entry = next(item for item in doc["jobs"] if item["id"] == "job-retry")
+# Precondition: the retry plays the source dictation's own file. If that stops
+# holding, the guard below is no longer testing what it claims to.
+assert entry["recordingPath"] == sys.argv[2], entry
 PY
 run_into "$SDATA" job-third 2 >/dev/null
 check "retention keeps the audio a kept dictation still plays" True \
