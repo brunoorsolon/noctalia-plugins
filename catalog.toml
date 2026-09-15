@@ -28,4 +28,4 @@ description = "Records the microphone you choose and transcribes the recording w
 deprecated = false
 plugin_api = 24
 tags = ["audio", "dictation", "recording", "service", "panel"]
-dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "transcribe-cli"]
+dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "ps", "transcribe-cli"]
