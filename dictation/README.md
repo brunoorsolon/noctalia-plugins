@@ -11,17 +11,41 @@ The plugin owns the native interface and the settings; `dictation-helper.py` own
 | ID | `magus/dictation` |
 | Entries | Service: `controller`, Panel: `panel`, Widget: `widget` |
 | Minimum plugin API | 24 |
+| Version | 0.3.0 |
 
 The service is the only owner of a job, so closing the panel or the bar widget never interrupts recording or recognition. The panel and the bar widget are thin views of the state the service publishes.
+
+## Supported host and tested applications
+
+| Component | Supported |
+| --- | --- |
+| Noctalia | v5 beta with plugin API 24 or newer, including the argument-vector form of `runAsync` |
+| Compositor | Hyprland with `hyprctl` and the `sendshortcut` dispatcher; automatic paste and the recording shortcut are Hyprland-only |
+| Audio | PipeWire, with `pw-dump`, `pw-record` and `pw-play` |
+| Engine | an installed `transcribe-cli` from transcribe.cpp that accepts `--batch` and `--batch-jsonl` |
+| Model | a GGUF the engine can load |
+| Distribution | Fedora; another distribution works when the tools above are present, but only Fedora with Hyprland is validated |
+
+The validated destination is an editor window and a browser window in that session, reached as ordinary clipboard-paste targets and identified by the compositor window class the plugin reads. The plugin ships no per-application list: the first recording into a window class you have not confirmed is held for **Paste now**, and terminals, password managers, an unreadable class and any window other than the one the recording was started from are always held. Nothing is typed as keystrokes, so the application receives its own normal paste of the clipboard the plugin set.
+
+The release-candidate timings and costs — stop-to-ready, stop-to-paste, idle cost — are host measurements taken with the host validation and are not asserted by this document. The one historical reference, a warm-cache single run, was 5.42 s of recognition for 117.86 s of audio; treat it as an anecdote, not a promise.
 
 ## Requirements
 
 - `python3` (standard library only — the bundled helper has no third-party imports).
 - PipeWire tools: `pw-dump` to list capture sources, `pw-record` to capture, `pw-play` to play a recording back. They ship together in `pipewire-bin` (or `pipewire` on some distributions).
-- `hyprctl` for automatic paste and for the destination check: the chord is dispatched by the compositor itself (`hyprctl dispatch sendshortcut CTRL,V,`), so no daemon and no input-device access is needed, and `hyprctl` is the same tool this plugin already uses to read the focused window. It is deliberately not a hard dependency — without it, and in manual copy mode, the transcript is still copied when you ask for it.
+- `hyprctl` for automatic paste, for the destination check and for the recording shortcut: the chord is dispatched by the compositor itself (`hyprctl dispatch sendshortcut CTRL,V,`), so no daemon and no input-device access is needed, and `hyprctl` is the same tool this plugin already uses to read the focused window. It is required only for automatic paste and the shortcut setup, and it is listed in the catalog's dependency metadata for that reason — without it, and in manual copy mode, the transcript is still copied when you ask for it, and the shortcut row stays actionable instead of pretending.
 - A capture source (microphone) PipeWire reports as an `Audio/Source`.
 - An installed recognition engine from [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), such as `transcribe-cli`.
 - A GGUF model the engine can load.
+
+On Fedora the packages for everything above are:
+
+```sh
+sudo dnf install python3 pipewire-utils hyprland
+```
+
+`pipewire-utils` provides `pw-dump`, `pw-record` and `pw-play`, and `hyprctl` ships with `hyprland`; on Debian and Ubuntu the PipeWire tools come from `pipewire-bin`. The dependency list is metadata: it names the tools the plugin runs, Noctalia does not install packages from it, and the engine and the model are yours to install. A user who has no engine yet cannot finish setup from this plugin alone.
 
 ## Installation
 
@@ -121,7 +145,7 @@ The panel's **Recording shortcut** row writes that binding for **Toggle** in the
 
 ## Where the files go
 
-Everything is under the plugin data directory, normally `~/.local/state/noctalia/plugins/materialized/magus/dictation/`:
+Everything is under the plugin's own data directory, normally `~/.local/state/noctalia/plugins/data/magus/dictation/`. That is the directory Noctalia resolves for a plugin's data (`NOCTALIA_STATE_HOME`, then `XDG_STATE_HOME`, then `~/.local/state`), and it is deliberately not the materialized runtime copy an update replaces, so everything below survives an update:
 
 ```
 setup.json                                  recorded setup: paths, sizes, hashes, engine flags
@@ -225,6 +249,8 @@ Delivery happens at most once per finished recording, and only for a result the 
 
 ## When something looks wrong
 
+Every item here is reachable from the panel, so recovery never needs a terminal.
+
 - **"Setup required"** names the missing piece: the executable, the model, `python3`, or the data directory.
 - **"Choose a microphone before recording"** means no microphone has been selected yet. Open the panel and pick one from the list.
 - **`source_missing`** means the microphone you chose is not in the PipeWire graph. The plugin selects nothing else, not even the default source and not a monitor: reconnect it, press **Refresh**, and pick it again.
@@ -268,10 +294,39 @@ It uses fake `pw-dump`, `pw-record`, `pw-play` and engine executables with gener
 
 It checks the controller's logic — duplicate-toggle convergence, one job at a time, cancel and stop routing, the lease it refreshes, microphone selection and refusal (including a change refused while recording), the phase it keeps once a stop is accepted, the transcribing state that follows a finalized recording, the elapsed time it restores for an adopted job, the low-disk refusal, adopting a recording after a reload, recovery after a restart, the recording it falls back to when its pointer is gone, the durable history it reads back and publishes, the retry that starts a new job under an older dictation's recording without rewriting it and records which dictation it retried, the concurrent retry and the unusable audio it refuses with the reason, the playback that plays the selected dictation, the IPC actions, and what the bar widget and the panel render, including the finalizing and transcribing states, the history list with an interrupted entry, its selection, and the actions its audio allows, the destructive history actions that arm before they send and the confirmation that actually sends them, the storage and retention lines, a retention failure that stays visible, the diagnostics preview that is read-only and the export that waits for its confirmation, and that the retention setting reaches the helper with a value outside 1–1000 clamped instead of passed through — by loading `controller.luau`, `panel.luau` and `widget.luau` into a stubbed `noctalia` API, without PipeWire or Noctalia. It drives delivery against a stubbed compositor as well: the setup probe that sends no chord and the answers that accept or refuse it, the settle wait, one chord per attempt, the chord's empty window selector, the destination check that holds a changed window, the terminal and password-manager holds, the first-time confirmation of a window class, the explicit paste that closes the panel and skips a hold, the empty, malformed, truncated, unknown-token and nonzero-exit results that never paste, the attempt marker that survives a crash, a job recovered from disk that never delivers, an import that starts while a paste is waiting, a marker write that fails, a missing tool, a failed clipboard write, a refused chord that is reported instead of claimed, manual mode, and that every injection over the whole run is the one ordinary chord. The recording-shortcut setup is driven the same way, against a stubbed bind table and configuration files: the free chord that is offered, the exact block written in the hyprlang and the Lua form, the user's own lines and a top-level `return` that survive, the backup taken before the write, the reload that is verified against the bind table instead of its exit status, the second install that converges with no duplicate block, the chord already held by something else that is refused and named, undo that removes only the block and keeps later edits, a write and a backup that fail and say so, a block that is written but never registers, a reload that fails and one that never answers, a block half-deleted by hand that is left alone, a missing `hyprctl` and a missing configuration file that stay actionable, and the panel showing the state with its install, undo and recheck controls. The run fails its process when any check fails, so a caller reading the exit status sees a failed run. If `luau` is not on `PATH`, set `LUAU=/path/to/luau`.
 
-## Updating the plugin
+## Processes, files and network
+
+Processes the plugin starts: `python3 dictation-helper.py` from the plugin package, once per job; `pw-record` for capture; `pw-play` for playback; `pw-dump` to list capture sources; `hyprctl` to read the focused window, to probe and re-check the paste mechanism, to install or undo the shortcut block, and to send the one paste chord; `ps` to read the compositor's command line when choosing which configuration file to edit; and the engine you selected, once per transcription, with the argument vector documented under **How the engine is called**. The engine's `--help` is run during setup verification. Everything else is Noctalia's own IPC between the panel, the bar widget and the controller.
+
+Files the plugin writes: everything listed under **Where the files go**, all inside the per-plugin data directory with `0700` directories and `0600` files, plus one Hyprland configuration file when you press **Install shortcut** or **Undo shortcut** (with a `<file>.magus-dictation.bak` copy taken first), plus the `.txt` export and the diagnostics export in `~/Downloads` (or your home directory) when you explicitly ask for them. Files shipped by the plugin are only ever read. The plugin never writes into its own package, never replaces the executable, the model or the source tree you selected, and never touches the benchmark recordings you use to check the engine.
+
+Network: none. Nothing is downloaded, installed, uploaded or fetched, and no key, transcript or metadata leaves the machine, in the background or on demand. There is no telemetry, no update check and no cloud fallback. You install and update the engine and the model yourself, outside the plugin.
+
+## Updating, disabling and removing
 
 Noctalia updates enabled Git sources automatically by default. To update immediately:
 
 ```sh
 noctalia msg plugins update magus
 ```
+
+An update replaces Noctalia's materialized runtime copy of the plugin. Your data is not there: it lives in the per-plugin data directory described under **Where the files go**, which Noctalia does not rewrite, so setup, the microphone choice, the shortcut record and every saved dictation survive an update. The engine path, the model path and the recorded hashes point at your own files; the plugin never replaces, rebuilds or downloads them, so an update leaves them exactly as they are, and a file that changed underneath is reported as stale instead of being repaired silently. Nothing about an update re-enables the plugin, changes a setting, or performs a setup step for you.
+
+A job that is running when the plugin reloads or is updated is adopted, not replaced: the controller reads the job id back from disk and keeps addressing the same helper and the same recording, so the history survives and nothing is delivered twice. A recording whose controller disappears is released by the helper's lease within ten seconds and stays on disk as `interrupted`, which **Retry** can pick up. An update never pastes a transcript again: delivery happens once, for a recording that this session finished, and is refused for an adopted, retried or imported job; a `delivery.json` marker left behind by a crash makes the next run hold the job and say so.
+
+Disabling or removing the plugin is handled by Noctalia, which stops the service and deletes its materialized copy. The controller cancels the running job on `disable` and `uninstall`, so the recorder or the engine the helper owns is stopped instead of being left running, and a helper that cannot be reached stops its own children because they are tied to its lifetime. Capture therefore does not outlive the plugin: either the cancellation reaches the helper, or the lease expires and the helper releases the microphone on its own, and the last recording stays on disk either way.
+
+Removal touches only Noctalia's own copy of the plugin. It does not delete the per-plugin data directory, and it cannot reach anything else: the delete and retention code refuses any path outside the plugin's own data directory and any file that is not a job's own file, so your engine, your model, the benchmark recordings and sources and the rest of your home directory are never candidates. Retaining private history is the default, and deleting it is a separate, explicit action rather than a step of removal: the plugin never asks to delete your dictations for you, and history that was kept when the plugin went away is still there when it comes back. To remove it, delete the directory explicitly, before or after removing the plugin:
+
+```sh
+rm -rf "${NOCTALIA_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}}/noctalia/plugins/data/magus/dictation"
+```
+
+What removal cannot undo is the one block the shortcut setup wrote into your Hyprland configuration. That file is yours, so it is left alone, and **Undo shortcut** is the supported way to reverse the change (see **Recording shortcut**). Once the plugin is gone the leftover chord runs `noctalia msg plugin magus/dictation:controller all toggle` with no controller to receive it: delete the two marked lines together with the `bindd = …` or `hl.bind(…)` line between them and reload, or re-enable the plugin and press **Undo shortcut**.
+
+## Release scope
+
+- **Requires an installed engine.** Dictation is an existing-engine plugin: a `transcribe-cli` build and a GGUF model must already be installed. The plugin never downloads, bundles, rebuilds, patches or installs an engine, a model or a package, and the catalog's dependency list is metadata rather than an installation step. A user who has no engine yet cannot complete setup from this plugin alone; that graphical source-install route is a separate ticket and is not shipped here.
+- **What this release covers.** Installing from the Git source, setup verification, microphone selection, shortcut-driven recording, automatic paste into the validated editor and browser, history with Retry, cancellation and error recovery, retention and deletion, diagnostics export, and update, reload and removal safety.
+- **What publishing does not authorize.** Publishing this code does not authorize an automatic merge, an installation on anyone's host, or a submission to a community store. Those remain separate human decisions.
+- **No privileged behaviour.** The plugin does not install a package, a permission, a udev rule or a background daemon, does not use `ydotool` or `/dev/uinput`, does not request input-device access, and does not change boost or any global policy. Inference is CPU-only by design.

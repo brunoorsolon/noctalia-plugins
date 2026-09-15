@@ -1,10 +1,10 @@
 id = "magus/dictation"
 name = "Dictation"
-version = "0.2.0"
+version = "0.3.0"
 plugin_api = 24
 author = "magus"
 license = "MIT"
-dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "transcribe-cli"]
+dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "transcribe-cli"]
 tags = ["audio", "dictation", "recording", "service", "panel"]
 icon = "microphone"
 description = "Records the microphone you choose and transcribes the recording with an installed recognition engine and GGUF model."
