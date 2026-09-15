@@ -8,6 +8,12 @@ local isOpen = false
 local draft = nil
 local draftKey = ""
 local commandSeq = 0
+-- The history detail keeps its own draft, so an edit made while reading an older
+-- dictation never becomes the current job's transcript.
+local historyJob = ""
+local historyDraft = nil
+local historyDraftKey = ""
+local historyNote = ""
 
 local PHASE_TEXT = {
   starting = "Starting the recorder.",
@@ -35,6 +41,59 @@ local function severityColor(severity)
   if severity == "review" then return "tertiary" end
   if severity == "cancelled" then return "on_surface_variant" end
   return "primary"
+end
+
+-- The helper's outcome codes are the durable contract; these are the few that
+-- read better as words than as the code with its underscores opened up.
+local OUTCOME_TEXT = {
+  ok = "Transcribed",
+  running = "In progress",
+  interrupted = "Interrupted",
+  cancelled = "Cancelled",
+  invalid_recording = "No usable audio",
+  invalid_wav = "No usable audio",
+  recorder_failed = "Recorder failed",
+  recorder_unavailable = "Recorder unavailable",
+  engine_unavailable = "Engine unavailable",
+  engine_failed = "Engine failed",
+  engine_incompatible = "Engine incompatible",
+}
+
+local function historyList(s)
+  local history = type(s.history) == "table" and s.history or {}
+  return type(history.list) == "table" and history.list or {}, history
+end
+
+-- A job this controller is still working on has no summary yet, so the helper
+-- reports it as interrupted. The live phase is this session's, not the disk's, so
+-- it is named here rather than written back over the durable record.
+local function historyLive(s, entry)
+  local job = type(s.job) == "table" and s.job or nil
+  if not job or type(entry) ~= "table" or entry.id ~= job.id then return false end
+  local activity = s.activity or "idle"
+  return activity == "running" or activity == "recording"
+end
+
+local function historyOutcome(s, entry)
+  if historyLive(s, entry) then return "In progress" end
+  local code = type(entry) == "table" and type(entry.outcome) == "string" and entry.outcome or ""
+  if code == "" then return "Unknown" end
+  return OUTCOME_TEXT[code] or string.gsub(string.gsub(code, "_", " "), "^%l", string.upper)
+end
+
+local function historyLabel(s, entry)
+  local parts = {}
+  if type(entry.timestamp) == "string" and entry.timestamp ~= "" then table.insert(parts, entry.timestamp) end
+  if type(entry.duration) == "string" and entry.duration ~= "" then table.insert(parts, entry.duration) end
+  table.insert(parts, historyOutcome(s, entry))
+  if type(entry.preview) == "string" and entry.preview ~= "" then table.insert(parts, entry.preview) end
+  return table.concat(parts, "  \u{00b7}  ")
+end
+
+local function historyColor(s, entry)
+  if historyLive(s, entry) then return "primary" end
+  if entry.state == "interrupted" then return "tertiary" end
+  return severityColor(entry.severity)
 end
 
 local function sendCommand(action, extra)
@@ -287,6 +346,78 @@ local function jobRow(s, recording, idle)
   })
 end
 
+-- The history is the helper's durable record, so it lists what happened across
+-- panel closes, reloads and restarts. Selecting an entry exposes the whole text;
+-- Play and Retry act on that entry's own recording, never on the current job.
+local function historySection(s)
+  local list, history = historyList(s)
+  local idle = (s.activity or "idle") == "idle"
+  local options, selected = {}, 1
+  for index, entry in ipairs(list) do
+    options[index] = historyLabel(s, entry)
+    if entry.id == historyJob then selected = index end
+  end
+  local rows = {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = "Recent dictations", fontSize = 12, color = "on_surface_variant" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({ text = "Refresh", variant = "ghost", onClick = "onRefreshHistory" }),
+    }),
+  }
+  if #options == 0 then
+    local failed = history.state == "error"
+    local message = failed and (history.message ~= "" and history.message or "Could not read the history.") or "No saved dictations yet."
+    table.insert(rows, ui.label({ text = message, fontSize = 12, color = failed and "error" or "on_surface_variant", maxWidth = LABEL_WIDTH }))
+    return ui.column({ gap = 6, }, rows)
+  end
+  table.insert(rows, ui.select({
+    key = "history",
+    options = options,
+    selectedIndex = selected - 1,
+    onChange = "onHistorySelected",
+  }))
+  local entry = list[selected]
+  if type(entry) == "table" then
+    local key = type(entry.transcriptPath) == "string" and entry.transcriptPath or ""
+    if historyDraftKey ~= key then
+      historyDraftKey = key
+      historyDraft = key ~= "" and (noctalia.readFile(key) or "") or ""
+    end
+    local usable = entry.recordingUsable == true and type(entry.recordingPath) == "string" and entry.recordingPath ~= ""
+    local retriedFrom = type(entry.retriesOf) == "string" and entry.retriesOf or ""
+    table.insert(rows, ui.row({ gap = 8, align = "center" }, {
+      ui.label({ text = historyOutcome(s, entry), fontSize = 12, color = historyColor(s, entry), flexGrow = 1 }),
+      -- A retry is a new job, so "attempt 1" alone would hide which dictation it
+      -- transcribed again; name that dictation instead.
+      ui.label({ text = retriedFrom ~= "" and ("retry of " .. retriedFrom) or ("attempt " .. tostring(entry.attempts or 0)), fontSize = 10, color = "on_surface_variant" }),
+    }))
+    if type(entry.message) == "string" and entry.message ~= "" then
+      table.insert(rows, ui.label({ text = entry.message, fontSize = 12, color = "on_surface_variant", maxLines = 3, maxWidth = LABEL_WIDTH }))
+    end
+    if historyNote ~= "" then
+      table.insert(rows, ui.label({ text = historyNote, fontSize = 12, color = "tertiary", maxWidth = LABEL_WIDTH }))
+    end
+    table.insert(rows, ui.input({
+      key = "history:" .. tostring(entry.id),
+      value = historyDraft or "",
+      multiline = true,
+      onChange = "onHistoryEdited",
+    }))
+    table.insert(rows, ui.row({ gap = 8, align = "center" }, {
+      ui.button({ text = "Copy", enabled = (historyDraft or "") ~= "", onClick = "onHistoryCopy" }),
+      ui.button({ text = "Play", enabled = usable and idle, onClick = "onHistoryPlay" }),
+      ui.button({ text = "Retry", variant = "primary", enabled = usable and idle, onClick = "onHistoryRetry" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.label({ text = entry.id, fontSize = 10, color = "on_surface_variant" }),
+    }))
+    if not usable then
+      local reason = type(entry.recordingMessage) == "string" and entry.recordingMessage ~= "" and entry.recordingMessage or "The saved audio is not usable, so this dictation cannot be played or retried."
+      table.insert(rows, ui.label({ text = reason, fontSize = 12, color = "tertiary", maxWidth = LABEL_WIDTH }))
+    end
+  end
+  return ui.column({ gap = 6, }, rows)
+end
+
 local function render()
   local s = state()
   local recording = configPath("recording")
@@ -307,6 +438,8 @@ local function render()
     deliveryRow(s),
     recordingRow(s),
     jobRow(s, recording, s.activity == "idle" or s.activity == nil),
+    ui.separator(),
+    historySection(s),
   }))
 end
 
@@ -316,6 +449,9 @@ function onOpen(_context)
   -- publishes the fact that it holds the keyboard: a paste sent now would land in
   -- the panel instead of the window the transcript belongs to.
   noctalia.state.set("dictation.panelOpen", true)
+  -- Opening the panel re-reads the durable history, so a job from an earlier
+  -- session is visible without restarting anything.
+  sendCommand("history-refresh")
   render()
 end
 
@@ -392,6 +528,65 @@ end
 
 function onTranscriptEdited(text)
   if type(text) == "string" then draft = text end
+end
+
+function onRefreshHistory()
+  historyNote = ""
+  sendCommand("history-refresh")
+end
+
+function onHistorySelected(index, _text)
+  local s = state()
+  local list = historyList(s)
+  local position = tonumber(index)
+  local entry = position and list[position + 1]
+  if type(entry) ~= "table" then return end
+  historyJob = entry.id
+  historyNote = ""
+  historyDraftKey = ""
+  render()
+end
+
+-- The entry the history buttons act on: the selection, or the newest one the
+-- list shows when nothing has been chosen yet.
+local function selectedHistory(s)
+  local list = historyList(s)
+  for _, entry in ipairs(list) do
+    if entry.id == historyJob then return entry end
+  end
+  return list[1]
+end
+
+function onHistoryEdited(text)
+  if type(text) == "string" then historyDraft = text end
+end
+
+function onHistoryCopy()
+  local text = historyDraft or ""
+  if text == "" then return end
+  -- Copying never starts a recording and never focuses another window, so an
+  -- error is reported here in the panel instead of only in a notification.
+  if noctalia.copyToClipboard(text, "text/plain") then
+    historyNote = "Copied the text you see, not the saved file."
+    noctalia.notify("Dictation", "Transcript copied.")
+  else
+    historyNote = "Could not copy the transcript. Select the text and copy it by hand."
+  end
+  render()
+end
+
+function onHistoryPlay()
+  local entry = selectedHistory(state())
+  if type(entry) ~= "table" then return end
+  historyNote = ""
+  sendCommand("history-play", { jobId = entry.id })
+end
+
+function onHistoryRetry()
+  local entry = selectedHistory(state())
+  if type(entry) ~= "table" then return end
+  historyNote = ""
+  sendCommand("history-retry", { jobId = entry.id })
 end
 
 function onCopyTranscript()

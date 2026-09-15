@@ -64,6 +64,8 @@ CANCEL_GRACE_SECONDS = 3
 DEFAULT_LEASE_SECONDS = 6
 MONITOR_SUFFIX = ".monitor"
 MONITOR_PREFIX = "monitor of "
+HISTORY_LIMIT = 20  # the newest jobs the history interface offers
+HISTORY_PREVIEW_CHARS = 120
 
 # Set per command; every verdict is mirrored here so the plugin, which launches
 # this helper detached, can read the outcome instead of a short-lived callback.
@@ -319,6 +321,218 @@ def pw_dump_sources():
     return enumerate_sources(raw), None
 
 
+def read_json_file(path):
+    """A job file as a dict, or None when it is missing or unreadable."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def wav_duration(path):
+    """Seconds of audio in a finalized WAV, or None when it is not readable."""
+    try:
+        with wave.open(path, "rb") as handle:
+            rate = handle.getframerate()
+            frames = handle.getnframes()
+    except (wave.Error, EOFError, OSError, ValueError):
+        return None
+    if rate <= 0 or frames <= 0:
+        return None
+    return round(frames / float(rate), 1)
+
+
+def duration_label(seconds):
+    if not isinstance(seconds, (int, float)):
+        return ""
+    total = int(round(seconds))
+    return "%d:%02d" % (total // 60, total % 60)
+
+
+def transcript_preview(path):
+    """The first words of a raw engine transcript, on one line."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return ""
+    return " ".join(text.split())[:HISTORY_PREVIEW_CHARS]
+
+
+def latest_attempt(job_dir):
+    """The highest-numbered attempt directory and how many attempts exist."""
+    best, count = None, 0
+    try:
+        names = os.listdir(job_dir)
+    except OSError:
+        return None, 0
+    for name in names:
+        match = re.fullmatch(r"attempt-(\d+)", name)
+        if not match:
+            continue
+        number = int(match.group(1))
+        count += 1
+        if number > (best[0] if best else 0):
+            best = (number, os.path.join(job_dir, name))
+    return (best[1] if best else None), count
+
+
+def job_process_running(job_id):
+    """Whether a helper process for this job id is still alive.
+
+    The id is in the owning helper's own command line (the recorder and the
+    engine are its children), so a match is a live job rather than a leftover
+    file. /proc is the only signal available on the hosts this plugin supports;
+    when it cannot be read the job stays unconfirmed and counts as interrupted,
+    which is what the controller-loss path already does.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(os.path.join("/proc", entry, "cmdline"), "rb") as handle:
+                argv = handle.read().decode("utf-8", "replace").split("\0")
+        except OSError:
+            continue
+        for index, token in enumerate(argv):
+            if token == "--job-id" and index + 1 < len(argv) and argv[index + 1] == job_id:
+                return True
+    return False
+
+
+def job_entry(name, job_dir):
+    """One history entry from the durable files this job already wrote."""
+    job = read_json_file(os.path.join(job_dir, "job.json")) or {}
+    summary = read_json_file(os.path.join(job_dir, "summary.json"))
+    attempt_dir, attempts = latest_attempt(job_dir)
+    result = read_json_file(os.path.join(attempt_dir, "result.json")) if attempt_dir else None
+    transcript_path = ""
+    if attempt_dir:
+        candidate = os.path.join(attempt_dir, "transcript.txt")
+        if os.path.isfile(candidate):
+            transcript_path = candidate
+    paths = summary.get("paths") if isinstance(summary, dict) and isinstance(summary.get("paths"), dict) else {}
+    if not paths and isinstance(result, dict) and isinstance(result.get("paths"), dict):
+        paths = result["paths"]
+
+    recording = ""
+    subject = "saved audio"
+    if isinstance(job.get("recording"), str) and job["recording"] != "":
+        recording = job["recording"]
+    elif isinstance(paths.get("recording"), str) and paths["recording"] != "":
+        recording = paths["recording"]
+    elif isinstance(job.get("wav"), str) and job["wav"] != "":
+        recording = job["wav"]
+        # A retry reads an earlier dictation's own recording, so only a file the
+        # user picked in settings is an import.
+        if job.get("retriesOf"):
+            subject = "saved audio"
+        else:
+            subject = "imported recording"
+    if recording == "":
+        problem = "There is no saved audio for this dictation, so it cannot be retried."
+    else:
+        problem = validate_wav(recording)
+        if problem and not os.path.isfile(recording):
+            problem = "The %s is missing, so this dictation cannot be retried: %s" % (subject, recording)
+        elif problem and subject == "saved audio":
+            # validate_wav speaks about the file the user picked in settings; this
+            # audio is the job's own, so the explanation names that instead.
+            problem = problem.replace("The imported ", "The saved ", 1)
+
+    if isinstance(summary, dict) and isinstance(summary.get("outcome"), str):
+        state = "complete"
+        outcome = summary["outcome"]
+        severity = summary.get("severity") if isinstance(summary.get("severity"), str) else "error"
+        message = summary.get("message") if isinstance(summary.get("message"), str) else ""
+        copyable = summary.get("copyable") is True and transcript_path != ""
+    elif job_process_running(name):
+        state, outcome, severity, message, copyable = (
+            "running",
+            "running",
+            "ok",
+            "This dictation is still running.",
+            False,
+        )
+    else:
+        state, outcome, severity, copyable = (
+            "interrupted",
+            "interrupted",
+            "cancelled",
+            False,
+        )
+        message = "Noctalia stopped holding this job before it reported a result, so it was interrupted. The captured audio was preserved."
+
+    started = job.get("startedAt")
+    if not isinstance(started, (int, float)) and isinstance(result, dict):
+        started = result.get("startedAt")
+        started = started * 1000 if isinstance(started, (int, float)) else None
+    started = int(started) if isinstance(started, (int, float)) else 0
+    duration = wav_duration(recording) if recording != "" else None
+    return {
+        "id": name,
+        "mode": job.get("mode") if isinstance(job.get("mode"), str) else "",
+        "retriesOf": job.get("retriesOf") if isinstance(job.get("retriesOf"), str) else "",
+        "startedAtMs": started,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M", time.localtime(started / 1000)) if started else "",
+        "durationSeconds": duration,
+        "duration": duration_label(duration),
+        "state": state,
+        "outcome": outcome,
+        "severity": severity,
+        "message": message,
+        "attempt": attempts,
+        "attempts": attempts,
+        "preview": transcript_preview(transcript_path),
+        "transcriptPath": transcript_path,
+        "recordingPath": recording,
+        "recordingUsable": problem is None,
+        "recordingMessage": "" if problem is None else problem,
+        "copyable": copyable,
+    }
+
+
+def command_history(args):
+    """List the durable jobs on disk, newest first, for the history interface.
+
+    Read-only: this never starts a recording, an engine or a paste. A job with
+    no summary is interrupted unless a helper for it is still alive, so a
+    restart reports the job that was cut off instead of hiding it.
+    """
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    jobs_dir = os.path.join(args.data_dir, "jobs")
+    try:
+        names = os.listdir(jobs_dir)
+    except OSError:
+        names = []
+    jobs = []
+    for name in sorted(names):
+        if not name.startswith("job-"):
+            continue
+        job_dir = os.path.join(jobs_dir, name)
+        if not os.path.isdir(job_dir):
+            continue
+        jobs.append(job_entry(name, job_dir))
+    jobs = [entry for entry in jobs if entry["startedAtMs"] > 0]
+    jobs.sort(key=lambda entry: entry["startedAtMs"], reverse=True)
+    jobs = jobs[:HISTORY_LIMIT]
+    interrupted = sum(1 for entry in jobs if entry["state"] == "interrupted")
+    message = "Found %d dictation%s." % (len(jobs), "" if len(jobs) == 1 else "s")
+    if interrupted == 1:
+        message += " One was interrupted."
+    elif interrupted > 1:
+        message += " %d were interrupted." % interrupted
+    verdict("ok", "ok", message, jobs=jobs)
+
+
 def command_sources(args):
     """List the capture sources the user can choose from."""
     global SUMMARY_PATH
@@ -524,6 +738,7 @@ def command_run(args):
             "threads": args.threads,
             "startedAt": int(time.time() * 1000),
             "wav": args.wav,
+            "retriesOf": args.retries_of,
         },
     )
     if args.threads < 1 or args.threads > 64:
@@ -1088,6 +1303,9 @@ def main(argv):
     run.add_argument("--job-id", required=True)
     run.add_argument("--data-dir", required=True)
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    # The job a retry reads from, so the new attempt names the dictation it
+    # retried instead of looking like an unrelated file the user picked.
+    run.add_argument("--retries-of", default="")
 
     record = sub.add_parser("record")
     record.add_argument("--engine", required=True)
@@ -1103,11 +1321,16 @@ def main(argv):
     play.add_argument("--wav", required=True)
     play.add_argument("--timeout", type=float, default=DEFAULT_PLAY_TIMEOUT_SECONDS)
 
+    history = sub.add_parser("history")
+    history.add_argument("--data-dir", required=True)
+
     args = parser.parse_args(argv)
     if args.command == "probe":
         command_probe(args)
     elif args.command == "sources":
         command_sources(args)
+    elif args.command == "history":
+        command_history(args)
     elif args.command == "record":
         command_record(args)
     elif args.command == "play":

@@ -123,7 +123,7 @@ RECORD=
 helper_run() {
   FAKE_MODE="$MODE" FAKE_RECORD="$RECORD" python3 "$helper" run \
     --engine "$engine" --model "$MODEL" --threads "$THREADS" --wav "$WAV" \
-    --job-id "$1" --data-dir "$data" --timeout "$TIMEOUT"
+    --job-id "$1" --data-dir "${DATA_ROOT:-$data}" --timeout "$TIMEOUT"
 }
 
 field() { python3 -c 'import json,sys; print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
@@ -575,6 +575,142 @@ else:
     raise AssertionError("the recorder outlived the job: %r" % record)
 PY
 
+# History is read back from the durable job directories alone, so it is what a
+# restart can still list. It is read-only: no recorder, no engine and no paste
+# follow from listing, and a job without a summary is interrupted unless a helper
+# for it is still alive. The tree is its own so the count is the tree's, not every
+# job these other checks left behind.
+HDATA="$work/history-data"
+mkdir -p "$HDATA/jobs"
+python3 - "$HDATA/jobs" <<'PY'
+import json, os, struct, sys, wave
+jobs = sys.argv[1]
+
+def wav(path, seconds):
+    with wave.open(path, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(struct.pack("<%dh" % (16000 * seconds), *([0] * 16000 * seconds)))
+
+finished = os.path.join(jobs, "job-done")
+os.makedirs(os.path.join(finished, "attempt-1"))
+wav(os.path.join(finished, "recording.wav"), 2)
+json.dump({"jobId": "job-done", "mode": "record", "startedAt": 4000, "recording": os.path.join(finished, "recording.wav")}, open(os.path.join(finished, "job.json"), "w"))
+open(os.path.join(finished, "attempt-1", "transcript.txt"), "w").write("hello history\n")
+json.dump({"outcome": "ok", "severity": "ok", "message": "Transcribed 2 words.", "copyable": True, "paths": {"recording": os.path.join(finished, "recording.wav")}}, open(os.path.join(finished, "summary.json"), "w"))
+
+stopped = os.path.join(jobs, "job-stopped")
+os.makedirs(stopped)
+wav(os.path.join(stopped, "recording.wav"), 1)
+json.dump({"jobId": "job-stopped", "mode": "record", "startedAt": 3000, "recording": os.path.join(stopped, "recording.wav")}, open(os.path.join(stopped, "job.json"), "w"))
+
+gone = os.path.join(jobs, "job-gone")
+os.makedirs(gone)
+json.dump({"jobId": "job-gone", "mode": "record", "startedAt": 2000, "recording": os.path.join(gone, "gone.wav")}, open(os.path.join(gone, "job.json"), "w"))
+
+live = os.path.join(jobs, "job-live")
+os.makedirs(live)
+json.dump({"jobId": "job-live", "mode": "record", "startedAt": 0, "recording": os.path.join(live, "recording.wav")}, open(os.path.join(live, "job.json"), "w"))
+PY
+out=$(python3 "$helper" history --data-dir "$HDATA")
+check "history outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "history counts its own tree" "Found 3 dictations. 2 were interrupted." "$(printf '%s' "$out" | field message)"
+python3 - "$out" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+jobs = {entry["id"]: entry for entry in doc["jobs"]}
+assert [entry["id"] for entry in doc["jobs"]] == ["job-done", "job-stopped", "job-gone"], doc["jobs"]
+finished = jobs["job-done"]
+assert finished["state"] == "complete", finished
+assert finished["outcome"] == "ok", finished
+assert finished["preview"] == "hello history", finished
+assert finished["durationSeconds"] == 2.0 and finished["duration"] == "0:02", finished
+assert finished["attempts"] == 1, finished
+assert finished["recordingUsable"] is True, finished
+assert finished["copyable"] is True, finished
+stopped = jobs["job-stopped"]
+assert stopped["state"] == "interrupted", stopped
+assert stopped["outcome"] == "interrupted", stopped
+assert stopped["durationSeconds"] == 1.0, stopped
+assert stopped["transcriptPath"] == "", stopped
+assert stopped["recordingUsable"] is True, stopped
+missing = jobs["job-gone"]
+assert missing["state"] == "interrupted", missing
+assert missing["recordingUsable"] is False, missing
+assert "gone.wav" in missing["recordingMessage"], missing
+PY
+
+# The panel acts on the fields this read reports, so they are checked against the
+# artifacts a real run left behind rather than against the fixture above: the
+# recording and transcript paths must be the ones the job actually wrote, and the
+# preview must be the raw transcript's own first words.
+DATA_ROOT="$HDATA" WAV="$work/good.wav" RECORD= MODE=ok helper_run job-history-real >/dev/null
+out=$(python3 "$helper" history --data-dir "$HDATA")
+python3 - "$out" "$HDATA" "$work/good.wav" <<'PY'
+import json, os, sys
+doc = json.loads(sys.argv[1])
+data, wav = sys.argv[2], sys.argv[3]
+entry = next(item for item in doc["jobs"] if item["id"] == "job-history-real")
+assert entry["state"] == "complete" and entry["outcome"] == "ok", entry
+assert entry["recordingPath"] == wav and os.path.isfile(wav), entry
+assert entry["recordingUsable"] is True and entry["recordingMessage"] == "", entry
+assert entry["transcriptPath"] == os.path.join(data, "jobs", "job-history-real", "attempt-1", "transcript.txt"), entry
+assert open(entry["transcriptPath"]).read().strip() == entry["preview"] == "hello world", entry
+assert entry["attempts"] == 1 and entry["copyable"] is True, entry
+assert entry["startedAtMs"] > 0 and entry["timestamp"] != "", entry
+assert entry["durationSeconds"] > 0 and entry["duration"] != "", entry
+assert entry["retriesOf"] == "", entry
+PY
+
+# A retry transcribes the saved recording as a new job, and the durable record has
+# to name the dictation it retried or nothing on disk links the two attempts.
+python3 "$helper" run --engine "$engine" --model "$MODEL" --threads "$THREADS" \
+    --wav "$work/good.wav" --job-id job-history-retried --data-dir "$HDATA" \
+    --timeout "$TIMEOUT" --retries-of job-history-real >/dev/null
+out=$(python3 "$helper" history --data-dir "$HDATA")
+python3 - "$out" "$HDATA" "$work/good.wav" <<'PY'
+import json, os, sys
+doc = json.loads(sys.argv[1])
+data, wav = sys.argv[2], sys.argv[3]
+entry = next(item for item in doc["jobs"] if item["id"] == "job-history-retried")
+assert entry["retriesOf"] == "job-history-real", entry
+assert entry["recordingPath"] == wav, entry
+assert entry["recordingUsable"] is True, entry
+record = json.load(open(os.path.join(data, "jobs", "job-history-retried", "job.json")))
+assert record["retriesOf"] == "job-history-real", record
+assert record["engine"] and record["model"] and record["threads"], record
+original = json.load(open(os.path.join(data, "jobs", "job-history-real", "job.json")))
+assert original.get("retriesOf", "") == "", original
+PY
+
+# A helper process that still owns the job is what separates running from
+# interrupted, so the id in its command line is the signal, not the files alone.
+python3 - "$HDATA/jobs/job-live" <<'PY'
+import json, os, struct, sys, wave
+live = sys.argv[1]
+with wave.open(os.path.join(live, "recording.wav"), "wb") as handle:
+    handle.setnchannels(1)
+    handle.setsampwidth(2)
+    handle.setframerate(16000)
+    handle.writeframes(struct.pack("<16000h", *([0] * 16000)))
+record = json.load(open(os.path.join(live, "job.json")))
+record["startedAt"] = 1000
+json.dump(record, open(os.path.join(live, "job.json"), "w"))
+PY
+python3 -c 'import time; time.sleep(30)' --job-id job-live &
+live_pid=$!
+sleep 0.5
+out=$(python3 "$helper" history --data-dir "$HDATA")
+python3 - "$out" <<'PY'
+import json, sys
+jobs = {entry["id"]: entry for entry in json.loads(sys.argv[1])["jobs"]}
+assert jobs["job-live"]["state"] == "running", jobs["job-live"]
+assert jobs["job-live"]["outcome"] == "running", jobs["job-live"]
+PY
+kill "$live_pid" 2>/dev/null || true
+wait "$live_pid" 2>/dev/null || true
+
 # One recorder this job never started stays alive through Cancel and controller
 # loss: ownership is the process group the helper created, never a process name,
 # so a broad pkill or a name match would be caught here.
@@ -762,16 +898,16 @@ import re, subprocess, sys
 
 helper, controller = sys.argv[1], sys.argv[2]
 defined = set()
-for command in ("probe", "sources", "record", "run", "play"):
+for command in ("probe", "sources", "record", "run", "play", "history"):
     usage = subprocess.run(["python3", helper, command, "--help"], stdout=subprocess.PIPE).stdout.decode()
     defined.update(re.findall(r"--[a-z][a-z-]*", usage))
 source = open(controller).read()
 passed = set(re.findall(r'"(--[a-z][a-z-]*)"', source))
 commands = set(re.findall(r'HELPER,\s*"([a-z]+)"', source))
 assert commands, "no helper command found in controller.luau"
-unknown = sorted(commands - {"probe", "sources", "record", "run", "play"})
+unknown = sorted(commands - {"probe", "sources", "record", "run", "play", "history"})
 assert not unknown, "controller runs unknown helper commands: %r" % unknown
-assert {"record", "sources", "run", "play"} <= commands, sorted(commands)
+assert {"record", "sources", "run", "play", "history"} <= commands, sorted(commands)
 missing = sorted(passed - defined)
 assert not missing, "controller passes options the helper does not define: %r" % missing
 assert passed, "no helper option found in controller.luau"
