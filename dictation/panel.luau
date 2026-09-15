@@ -379,7 +379,7 @@ local function historySection(s)
   local entry = list[selected]
   if type(entry) == "table" then
     local key = type(entry.transcriptPath) == "string" and entry.transcriptPath or ""
-    if historyDraftKey ~= key then
+    if historyDraft == nil or historyDraftKey ~= key then
       historyDraftKey = key
       historyDraft = key ~= "" and (noctalia.readFile(key) or "") or ""
     end
@@ -543,7 +543,10 @@ function onHistorySelected(index, _text)
   if type(entry) ~= "table" then return end
   historyJob = entry.id
   historyNote = ""
-  historyDraftKey = ""
+  -- Nil is "not loaded yet", so an entry with no transcript still reloads. Clearing
+  -- the key alone would keep the previous dictation's text on screen and copyable,
+  -- because an entry with no transcript has an empty key too.
+  historyDraft = nil
   render()
 end
 

@@ -2070,7 +2070,7 @@ historyJobs = {
     id = interruptedJob, mode = "record", timestamp = "2026-01-02 10:00", duration = "0:07",
     state = "interrupted", outcome = "interrupted", severity = "cancelled",
     message = "Noctalia stopped holding this job before it reported a result.",
-    attempt = 0, attempts = 0, preview = "", transcriptPath = "",
+    attempts = 0, preview = "", transcriptPath = "",
     recordingPath = jobDir(interruptedJob) .. "/recording.wav",
     recordingUsable = true, recordingMessage = "", copyable = false, startedAtMs = 3000, retriesOf = "",
   },
@@ -2078,7 +2078,7 @@ historyJobs = {
     id = goneJob, mode = "record", timestamp = "2026-01-01 09:00", duration = "",
     state = "interrupted", outcome = "interrupted", severity = "cancelled",
     message = "Noctalia stopped holding this job before it reported a result.",
-    attempt = 0, attempts = 0, preview = "", transcriptPath = "",
+    attempts = 0, preview = "", transcriptPath = "",
     recordingPath = jobDir(goneJob) .. "/gone.wav",
     recordingUsable = false, recordingMessage = "The saved audio is missing.",
     copyable = false, startedAtMs = 2000, retriesOf = "",
@@ -2086,7 +2086,7 @@ historyJobs = {
   {
     id = doneJob, mode = "record", timestamp = "2025-12-31 08:00", duration = "0:03",
     state = "complete", outcome = "ok", severity = "ok", message = "Transcribed 3 words.",
-    attempt = 1, attempts = 1, preview = "an older dictation",
+    attempts = 1, preview = "an older dictation",
     transcriptPath = jobDir(doneJob) .. "/attempt-1/transcript.txt",
     recordingPath = jobDir(doneJob) .. "/recording.wav",
     recordingUsable = true, recordingMessage = "", copyable = true, startedAtMs = 1000,
@@ -2158,6 +2158,16 @@ local function historySelect(tree)
   return nil
 end
 
+local function historyField(tree)
+  if type(tree) ~= "table" then return nil end
+  if tree.kind == "input" and tree.props.onChange == "onHistoryEdited" then return tree end
+  for _, child in ipairs(tree.children or {}) do
+    local found = historyField(child)
+    if found then return found end
+  end
+  return nil
+end
+
 local readsBeforeOpen = historyReads
 onOpen({})
 check("opening the panel re-reads the durable history", readsBeforeOpen + 1, historyReads)
@@ -2171,10 +2181,18 @@ check("an option previews the transcript", true, string.find((options and option
 -- actions its audio allows. Missing audio is explained and disables Play and Retry.
 onHistorySelected(2)
 check("selecting a dictation names it", true, findText(lastTree, doneJob) ~= nil)
+local shownField = historyField(lastTree)
+check("selecting a dictation shows its own text", "an older dictation", shownField and shownField.props.value or nil)
 check("selecting a dictation names its outcome", true, findText(lastTree, "Transcribed") ~= nil)
 check("selecting a retry names the dictation it retried", true, findText(lastTree, "retry of " .. interruptedJob) ~= nil)
 check("a finished dictation can be copied", true, findByHandler(lastTree, "onHistoryCopy").props.enabled)
 check("a finished dictation can be retried", true, findByHandler(lastTree, "onHistoryRetry").props.enabled)
+-- An entry that never wrote a transcript must not leave the previous selection's
+-- text on screen, where Copy would put another dictation on the clipboard.
+onHistorySelected(1)
+local emptyField = historyField(lastTree)
+check("an entry with no transcript shows no text", "", emptyField and emptyField.props.value or nil)
+check("an entry with no transcript cannot copy", false, findByHandler(lastTree, "onHistoryCopy").props.enabled)
 onHistorySelected(1)
 check("unusable audio disables history playback", false, findByHandler(lastTree, "onHistoryPlay").props.enabled)
 check("unusable audio disables history retry", false, findByHandler(lastTree, "onHistoryRetry").props.enabled)
@@ -2206,7 +2224,7 @@ historyJobs = {
     id = liveId, mode = "import", timestamp = "2026-01-03 11:00", duration = "0:07",
     state = "interrupted", outcome = "interrupted", severity = "cancelled",
     message = "Noctalia stopped holding this job before it reported a result.",
-    attempt = 0, attempts = 0, preview = "", transcriptPath = "",
+    attempts = 0, preview = "", transcriptPath = "",
     recordingPath = jobDir(interruptedJob) .. "/recording.wav",
     recordingUsable = true, recordingMessage = "", copyable = false, startedAtMs = 4000,
   },

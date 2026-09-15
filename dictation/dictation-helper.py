@@ -431,9 +431,7 @@ def job_entry(name, job_dir):
         recording = job["wav"]
         # A retry reads an earlier dictation's own recording, so only a file the
         # user picked in settings is an import.
-        if job.get("retriesOf"):
-            subject = "saved audio"
-        else:
+        if not job.get("retriesOf"):
             subject = "imported recording"
     if recording == "":
         problem = "There is no saved audio for this dictation, so it cannot be retried."
@@ -487,7 +485,6 @@ def job_entry(name, job_dir):
         "outcome": outcome,
         "severity": severity,
         "message": message,
-        "attempt": attempts,
         "attempts": attempts,
         "preview": transcript_preview(transcript_path),
         "transcriptPath": transcript_path,
