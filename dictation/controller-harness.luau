@@ -287,8 +287,27 @@ end
 putActiveWindow("0x1", "TextEditor", "notes.txt")
 local EDITOR = activeWindow
 
+-- The history read is the helper's own durable record of the jobs, not a job
+-- launch, so it is answered here and counted apart from the launch log. The list
+-- is whatever the helper would have reported for the directories on disk.
+local historyJobs = {}
+local historyReads = 0
+local historyAccepted = true
+
 -- Every helper invocation and every key injection the controller makes, in order.
 function noctalia.runAsync(argv, onResult)
+  if argv[3] == "history" then
+    historyReads = historyReads + 1
+    if not historyAccepted then return false end
+    if type(onResult) == "function" then
+      onResult({
+        exitCode = 0,
+        stdout = noctalia.json.encode({ ok = true, outcome = "ok", severity = "ok", message = "Found dictations.", jobs = historyJobs }),
+        stderr = "",
+      })
+    end
+    return true
+  end
   table.insert(launches, argv)
   -- The compositor is asked which window is focused, and it is handed the chord:
   -- the query answers with a window, the dispatch answers with its own reply.
@@ -714,6 +733,8 @@ command("retry")
 local retried = state().job.id
 check("retry runs again", "running", state().activity)
 check("retry uses the saved recording", jobDir(rec) .. "/recording.wav", launches[#launches][11])
+check("retry passes the flag as a flag", "--retries-of", launches[#launches][16])
+check("retry records the job it retried", rec, launches[#launches][17])
 check("retry is its own job", true, retried ~= rec and retried ~= imported)
 finishSummary(retried, "cancelled", "cancelled", "Cancelled.", { recording = true })
 update()
@@ -2026,6 +2047,196 @@ command("shortcut-refresh")
 check("the chord is this setup's once the duplicate is gone", "installed", state().shortcut.state)
 command("shortcut-remove")
 check("undo clears the reinstalled block", "available", state().shortcut.state)
+
+-- ── History ──────────────────────────────────────────────────────────────────
+
+-- The history is the helper's durable record of the jobs on disk, not this
+-- session's memory, so it is read through the helper and published as it comes.
+CONFIG.engine, CONFIG.model = "/bin/engine", "/models/a.gguf"
+putTable("/data/setup.json", {
+  engine = { path = "/bin/engine", sha256 = string.rep("e", 64), size = #"binary" },
+  model = { path = "/models/a.gguf", sha256 = string.rep("m", 64), size = #"model" },
+}, "setup-history")
+
+local doneJob, interruptedJob, goneJob = "job-h-done", "job-h-interrupted", "job-h-gone"
+-- The history is read from disk, so the controller reads it while it boots rather
+-- than depending on anything this session remembers.
+check("the controller read the durable history during boot", true, historyReads > 0)
+check("the boot read invented no entries", 0, #state().history.list)
+putFile(jobDir(doneJob) .. "/attempt-1/transcript.txt", "an older dictation")
+putFile(jobDir(interruptedJob) .. "/recording.wav", "RIFF")
+historyJobs = {
+  {
+    id = interruptedJob, mode = "record", timestamp = "2026-01-02 10:00", duration = "0:07",
+    state = "interrupted", outcome = "interrupted", severity = "cancelled",
+    message = "Noctalia stopped holding this job before it reported a result.",
+    attempts = 0, preview = "", transcriptPath = "",
+    recordingPath = jobDir(interruptedJob) .. "/recording.wav",
+    recordingUsable = true, recordingMessage = "", copyable = false, startedAtMs = 3000, retriesOf = "",
+  },
+  {
+    id = goneJob, mode = "record", timestamp = "2026-01-01 09:00", duration = "",
+    state = "interrupted", outcome = "interrupted", severity = "cancelled",
+    message = "Noctalia stopped holding this job before it reported a result.",
+    attempts = 0, preview = "", transcriptPath = "",
+    recordingPath = jobDir(goneJob) .. "/gone.wav",
+    recordingUsable = false, recordingMessage = "The saved audio is missing.",
+    copyable = false, startedAtMs = 2000, retriesOf = "",
+  },
+  {
+    id = doneJob, mode = "record", timestamp = "2025-12-31 08:00", duration = "0:03",
+    state = "complete", outcome = "ok", severity = "ok", message = "Transcribed 3 words.",
+    attempts = 1, preview = "an older dictation",
+    transcriptPath = jobDir(doneJob) .. "/attempt-1/transcript.txt",
+    recordingPath = jobDir(doneJob) .. "/recording.wav",
+    recordingUsable = true, recordingMessage = "", copyable = true, startedAtMs = 1000,
+    retriesOf = interruptedJob,
+  },
+}
+command("history-refresh")
+check("history published", "ok", state().history.state)
+check("history lists every durable job", 3, #state().history.list)
+check("history reports an interrupted job", "interrupted", state().history.list[1].outcome)
+check("history reports unusable audio as unusable", false, state().history.list[2].recordingUsable)
+check("history keeps the finished job's transcript", jobDir(doneJob) .. "/attempt-1/transcript.txt", state().history.list[3].transcriptPath)
+
+-- A retry from the history is a new job that reads the recording the selected one
+-- saved; the original job's audio and attempts are not rewritten.
+local beforeRetry = jobLaunches()
+command("history-retry", { jobId = interruptedJob })
+check("a history retry starts one recognition job", beforeRetry + 1, jobLaunches())
+check("a history retry reads that dictation's recording", jobDir(interruptedJob) .. "/recording.wav", launches[#launches][11])
+check("a history retry records the dictation it retried", interruptedJob, launches[#launches][17])
+check("a history retry leaves the original audio alone", "RIFF", fs[jobDir(interruptedJob) .. "/recording.wav"])
+check("the retry is its own job", true, state().job.id ~= interruptedJob)
+
+-- An active job refuses a second recognition, and an entry whose audio is gone is
+-- refused with its reason. Neither may start a job.
+local beforeConcurrent = jobLaunches()
+command("history-retry", { jobId = interruptedJob })
+check("an active job refuses a concurrent history retry", beforeConcurrent, jobLaunches())
+local retriedJob = state().job.id
+finishSummary(retriedJob, "ok", "ok", "Transcribed 2 words.", { transcript = "retried words", recording = jobDir(interruptedJob) .. "/recording.wav", copyable = true })
+update()
+check("the history retry finishes", "idle", state().activity)
+local beforeUnusable = jobLaunches()
+command("history-retry", { jobId = goneJob })
+check("unusable audio starts no job", beforeUnusable, jobLaunches())
+check("unusable audio says why", true, string.find(tostring(state().message), "audio", 1, true) ~= nil)
+onOpen({})
+check("the panel shows why a retry was refused", true, findText(lastTree, "The saved audio is missing.") ~= nil)
+onClose()
+
+-- Play and Copy work from the history without starting a recording, and Play uses
+-- the selected entry's own recording.
+local beforePlay = jobLaunches()
+command("history-play", { jobId = interruptedJob })
+check("history playback plays that dictation", "python3,/plugin/dictation-helper.py,play,--wav," .. jobDir(interruptedJob) .. "/recording.wav", lastLaunch())
+check("history playback starts no recording", beforePlay, jobLaunches())
+command("history-play", { jobId = goneJob })
+check("history playback of unusable audio starts nothing", beforePlay, jobLaunches())
+
+-- The history read is failure-tolerant: an unreadable history keeps the last list
+-- and says so in the panel instead of clearing what the user was reading.
+historyAccepted = false
+command("history-refresh")
+check("an unreadable history is reported", "error", state().history.state)
+check("an unreadable history keeps the last list", 3, #state().history.list)
+historyAccepted = true
+command("history-refresh")
+check("history readable again", "ok", state().history.state)
+
+-- ── History in the panel ─────────────────────────────────────────────────────
+
+local function historySelect(tree)
+  if type(tree) ~= "table" then return nil end
+  if tree.kind == "select" and tree.props.key == "history" then return tree end
+  for _, child in ipairs(tree.children or {}) do
+    local found = historySelect(child)
+    if found then return found end
+  end
+  return nil
+end
+
+local function historyField(tree)
+  if type(tree) ~= "table" then return nil end
+  if tree.kind == "input" and tree.props.onChange == "onHistoryEdited" then return tree end
+  for _, child in ipairs(tree.children or {}) do
+    local found = historyField(child)
+    if found then return found end
+  end
+  return nil
+end
+
+local readsBeforeOpen = historyReads
+onOpen({})
+check("opening the panel re-reads the durable history", readsBeforeOpen + 1, historyReads)
+local options = historySelect(lastTree)
+check("the panel offers the durable history", true, options ~= nil)
+check("the panel lists every dictation", 3, #(options and options.props.options or {}))
+check("the newest option names its outcome", true, string.find((options and options.props.options[1]) or "", "Interrupted", 1, true) ~= nil)
+check("an option previews the transcript", true, string.find((options and options.props.options[3]) or "", "an older dictation", 1, true) ~= nil)
+
+-- Selecting an entry exposes its own record: the whole text, the outcome, and the
+-- actions its audio allows. Missing audio is explained and disables Play and Retry.
+onHistorySelected(2)
+check("selecting a dictation names it", true, findText(lastTree, doneJob) ~= nil)
+local shownField = historyField(lastTree)
+check("selecting a dictation shows its own text", "an older dictation", shownField and shownField.props.value or nil)
+check("selecting a dictation names its outcome", true, findText(lastTree, "Transcribed") ~= nil)
+check("selecting a retry names the dictation it retried", true, findText(lastTree, "retry of " .. interruptedJob) ~= nil)
+check("a finished dictation can be copied", true, findByHandler(lastTree, "onHistoryCopy").props.enabled)
+check("a finished dictation can be retried", true, findByHandler(lastTree, "onHistoryRetry").props.enabled)
+-- An entry that never wrote a transcript must not leave the previous selection's
+-- text on screen, where Copy would put another dictation on the clipboard.
+onHistorySelected(1)
+local emptyField = historyField(lastTree)
+check("an entry with no transcript shows no text", "", emptyField and emptyField.props.value or nil)
+check("an entry with no transcript cannot copy", false, findByHandler(lastTree, "onHistoryCopy").props.enabled)
+onHistorySelected(1)
+check("unusable audio disables history playback", false, findByHandler(lastTree, "onHistoryPlay").props.enabled)
+check("unusable audio disables history retry", false, findByHandler(lastTree, "onHistoryRetry").props.enabled)
+check("unusable audio explains itself", true, findText(lastTree, "The saved audio is missing.") ~= nil)
+onHistorySelected(0)
+check("usable audio enables history playback", true, findByHandler(lastTree, "onHistoryPlay").props.enabled)
+check("usable audio enables history retry", true, findByHandler(lastTree, "onHistoryRetry").props.enabled)
+local readsBeforeRefresh = historyReads
+onRefreshHistory()
+check("the panel's refresh re-reads the durable history", readsBeforeRefresh + 1, historyReads)
+
+-- Copy takes the text on screen, and a refusal to copy is reported in the panel
+-- rather than only in a notification.
+onHistorySelected(2)
+onHistoryCopy()
+check("history copy copies the selected transcript", "an older dictation", tostring(clipboard))
+clipboardWriteFails = true
+onHistoryCopy()
+check("a failed history copy is reported in the panel", true, findText(lastTree, "Could not copy") ~= nil)
+clipboardWriteFails = false
+
+-- The job this session is still running has no summary yet, so the durable list
+-- would call it interrupted; its live phase is named from this session instead,
+-- and its own audio is what a retry would use.
+command("history-retry", { jobId = interruptedJob })
+local liveId = state().job.id
+historyJobs = {
+  {
+    id = liveId, mode = "import", timestamp = "2026-01-03 11:00", duration = "0:07",
+    state = "interrupted", outcome = "interrupted", severity = "cancelled",
+    message = "Noctalia stopped holding this job before it reported a result.",
+    attempts = 0, preview = "", transcriptPath = "",
+    recordingPath = jobDir(interruptedJob) .. "/recording.wav",
+    recordingUsable = true, recordingMessage = "", copyable = false, startedAtMs = 4000,
+  },
+}
+command("history-refresh")
+onOpen({})
+check("a running job reads as in progress", true, findText(lastTree, "In progress") ~= nil)
+check("a running job does not offer a second retry", false, findByHandler(lastTree, "onHistoryRetry").props.enabled)
+check("a running job does not offer playback", false, findByHandler(lastTree, "onHistoryPlay").props.enabled)
+finishSummary(liveId, "ok", "ok", "Transcribed 2 words.", { transcript = "retried words", recording = jobDir(interruptedJob) .. "/recording.wav", copyable = true })
+update()
+check("the live job finishes", "idle", state().activity)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

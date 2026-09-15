@@ -160,6 +160,9 @@ local S = {
   -- setup record for it: unknown | unsupported | available | working | installed |
   -- conflict | error.
   shortcut = { state = "unknown", chord = SHORTCUT_CHORD, message = "Not checked yet.", canInstall = false, canRemove = false, installed = false },
+  -- The helper's durable record of every job, read back from disk: idle | ok |
+  -- error. The list is the helper's own, newest first.
+  history = { state = "idle", message = "", list = {} },
 }
 
 local summaryPath = nil
@@ -1140,6 +1143,50 @@ local function helperSilent()
   return age == nil or age > RUN_SILENT_SECONDS
 end
 
+-- ── History ──────────────────────────────────────────────────────────────────
+
+-- The newest jobs the panel offers. The helper bounds the list too, so the two
+-- limits are a guard rather than a policy.
+local HISTORY_LIMIT = 20
+
+-- The history is the helper's own record of the durable job directories, not this
+-- session's memory, so it survives a panel close, a plugin reload and a shell
+-- restart. Reading it is read-only: no recording, no engine and no paste follow
+-- from reconciliation.
+local function refreshHistory()
+  if not DATA or HELPER == "" then
+    S.history = { state = "error", message = "Could not locate the bundled recognition helper.", list = S.history.list }
+    publish()
+    return
+  end
+  local accepted = noctalia.runAsync({ "python3", HELPER, "history", "--data-dir", DATA }, function(result)
+    local summary = type(result) == "table" and readLastJson(result.stdout) or nil
+    if type(summary) ~= "table" or summary.outcome ~= "ok" or type(summary.jobs) ~= "table" then
+      local message = type(summary) == "table" and type(summary.message) == "string" and summary.message or "Could not read the dictation history."
+      S.history = { state = "error", message = message, list = S.history.list }
+      publish()
+      return
+    end
+    local list = {}
+    for _, entry in ipairs(summary.jobs) do
+      if type(entry) == "table" and type(entry.id) == "string" and entry.id ~= "" then
+        table.insert(list, entry)
+        if #list >= HISTORY_LIMIT then break end
+      end
+    end
+    S.history = {
+      state = "ok",
+      message = type(summary.message) == "string" and summary.message or "",
+      list = list,
+    }
+    publish()
+  end)
+  if accepted == false then
+    S.history = { state = "error", message = "Could not read the dictation history.", list = S.history.list }
+    publish()
+  end
+end
+
 local function refreshLease()
   if S.activity ~= "recording" or not S.job or not JOBS then return end
   noctalia.writeFile(JOBS .. "/" .. S.job.id .. ".lease", noctalia.json.encode({ ts = os.time() }))
@@ -1528,7 +1575,7 @@ end
 -- Import and retry share one path: they transcribe a recording that is already on
 -- disk. Their config is captured when the job starts, so a settings change during
 -- the job never rewrites the arguments it was launched with.
-local function startJob(wav, label)
+local function startJob(wav, label, retriesOf)
   if S.activity ~= "idle" then
     noctalia.notify("Dictation", busyMessage())
     return
@@ -1577,6 +1624,12 @@ local function startJob(wav, label)
     "--data-dir",
     DATA,
   }
+  -- Which dictation a retry read from, so the new attempt names it on disk. The
+  -- controller's label is this session's; this is the durable record.
+  if type(retriesOf) == "string" and retriesOf ~= "" then
+    table.insert(argv, "--retries-of")
+    table.insert(argv, retriesOf)
+  end
   if not noctalia.runAsync(argv) then
     resetActivity()
     fail("Could not start the recognition helper.", "internal")
@@ -1767,8 +1820,8 @@ local function requestCancel()
   end
 end
 
-local function playRecording()
-  local path = S.recording.path
+local function playRecording(path)
+  path = type(path) == "string" and path or S.recording.path
   if path == "" or not noctalia.fileExists(path) then
     refuse("There is no saved recording to play yet.")
     return
@@ -1788,13 +1841,63 @@ local function playRecording()
   noctalia.notify("Dictation", "Playing the saved recording. Nothing is pasted.")
 end
 
+local function recordingJobId(path)
+  -- A job's own recording lives at JOBS/<id>/recording.wav, so that path names the
+  -- dictation. A file imported from anywhere else belongs to no job here.
+  if not JOBS or type(path) ~= "string" then return "" end
+  local prefix = JOBS .. "/"
+  if path:sub(1, #prefix) ~= prefix then return "" end
+  return path:sub(#prefix + 1):match("^([^/]+)/recording%.wav$") or ""
+end
+
 local function retryRecording()
   local path = S.recording.path
   if path == "" or not noctalia.fileExists(path) then
     refuse("There is no saved recording to transcribe again.")
     return
   end
-  startJob(path, "retry")
+  startJob(path, "retry", recordingJobId(path))
+end
+
+-- The entry a history action named, from the last list the helper published.
+local function historyEntry(jobId)
+  if type(jobId) ~= "string" or jobId == "" then return nil end
+  for _, entry in ipairs(S.history.list) do
+    if type(entry) == "table" and entry.id == jobId then return entry end
+  end
+  return nil
+end
+
+-- A history refusal stays in the panel's history section, where the row the user
+-- pressed is, instead of only in a notification.
+local function historyUnusable(entry)
+  if type(entry) ~= "table" then return "That dictation is no longer in the history." end
+  if entry.recordingUsable == true and type(entry.recordingPath) == "string" and entry.recordingPath ~= "" then return nil end
+  if type(entry.recordingMessage) == "string" and entry.recordingMessage ~= "" then return entry.recordingMessage end
+  return "The saved audio for that dictation is not usable, so it cannot be played or retried."
+end
+
+local function playHistoryRecording(jobId)
+  local entry = historyEntry(jobId)
+  local problem = historyUnusable(entry)
+  if problem then
+    refuse(problem)
+    return
+  end
+  playRecording(entry.recordingPath)
+end
+
+-- A retry is a new job that reads the recording the selected one saved. The
+-- helper writes a new job directory, so the original audio, its attempts and
+-- their result files are never replaced or rewritten.
+local function retryHistory(jobId)
+  local entry = historyEntry(jobId)
+  local problem = historyUnusable(entry)
+  if problem then
+    refuse(problem)
+    return
+  end
+  startJob(entry.recordingPath, "retry", jobId)
 end
 
 local function verifySetup()
@@ -1883,6 +1986,9 @@ local function finishJob(summary, jobId)
     setDelivery("idle", "")
   end
   publish()
+  -- The finished job joins the durable history immediately instead of only on the
+  -- next panel open.
+  refreshHistory()
   if S.severity == "error" then
     noctalia.notifyError("Dictation", S.message)
   end
@@ -2105,6 +2211,7 @@ refreshShortcut()
 restoreJob()
 recallRecording()
 publish()
+refreshHistory()
 refreshSources()
 
 noctalia.state.watch("dictation.command", function(command)
@@ -2124,6 +2231,12 @@ noctalia.state.watch("dictation.command", function(command)
     retryRecording()
   elseif action == "play" then
     playRecording()
+  elseif action == "history-refresh" then
+    refreshHistory()
+  elseif action == "history-play" then
+    playHistoryRecording(command.jobId)
+  elseif action == "history-retry" then
+    retryHistory(command.jobId)
   elseif action == "verify" then
     verifySetup()
   elseif action == "sources" then
