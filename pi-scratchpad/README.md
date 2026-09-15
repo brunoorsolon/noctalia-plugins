@@ -18,7 +18,7 @@ The plugin never renders the conversation. Pi's own TUI is the UI, so nothing is
 - **Hyprland.** Niri has no native special workspace, so this plugin is Hyprland only.
 - **The companion Pi extension, [pi-hypr-agent-monitor](https://github.com/brunoorsolon/pi-hypr-agent-monitor).** It is what publishes the status file the widget reads. Without it the widget sits on "Pi is not running". Install the extension in Pi and leave `PI_HYPR_MONITOR` alone; the plugin sets `PI_HYPR_MONITOR=1` for the Pi it spawns, so a Pi you start by hand in another terminal can never overwrite the scratchpad's status.
 - **`hyprctl`** on `PATH`.
-- **A terminal emulator** that accepts a command, such as `foot`, `kitty` or `alacritty`.
+- **A terminal emulator** such as `foot` or `kitty`. The setting is a shell fragment, so a terminal that needs a flag works too: `alacritty -e`, `wezterm start --`.
 - **`pi`** on `PATH`.
 
 ## Installation
@@ -51,7 +51,7 @@ The workspace is one Pi, not one per project. It starts in the configured direct
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | Special workspace | `pi` | The Hyprland special workspace the scratchpad lives in. `pi` and `special:pi` both work. |
-| Terminal | `foot` | The terminal emulator the spawned Pi runs in. |
+| Terminal | `foot` | The terminal emulator the spawned Pi runs in. This is a shell fragment, so flags go here too. |
 | Spawn command | `pi -c --session-dir ~/.local/state/pi-scratchpad/sessions` | What the terminal runs. The plugin adds `PI_HYPR_MONITOR=1`. |
 | Working directory | `~` | Where the spawned Pi starts. |
 | Window size | `900x600` | Floating size of the scratchpad window, as `WIDTHxHEIGHT`. |

@@ -58,14 +58,11 @@ end
 
 noctalia = {}
 
-local ENV = { XDG_RUNTIME_DIR = RUNTIME_DIR }
+local ENV = { XDG_RUNTIME_DIR = RUNTIME_DIR, HOME = "/home/user" }
 
 function noctalia.getenv(name) return ENV[name] end
 
-function noctalia.expandPath(path)
-  if path:sub(1, 2) == "~/" then return "/home/user/" .. path:sub(3) end
-  return path
-end
+noctalia.string = { trim = function(value) return (value:gsub("^%s+", ""):gsub("%s+$", "")) end }
 
 function noctalia.getConfig(key) return CONFIG[key] end
 function noctalia.setUpdateInterval() end
@@ -229,6 +226,15 @@ checkTrue("the spawn sets PI_HYPR_MONITOR", spawn:find("PI_HYPR_MONITOR=1", 1, t
 checkTrue("the spawn floats at the configured size", spawn:find("size 900 600", 1, true) ~= nil)
 checkTrue("the spawn targets the special workspace", spawn:find("workspace special:pi]", 1, true) ~= nil)
 checkTrue("the spawn reveals the workspace it spawns into", hasDispatch("togglespecialworkspace"))
+-- A quoted "~" never expands under the /bin/sh Hyprland runs, so the working
+-- directory has to be absolute by the time it is quoted.
+checkTrue("the default working directory resolves before it is quoted", spawn:find("cd '/home/user'", 1, true) ~= nil)
+
+CONFIG.working_dir = "~/project"
+dispatches = {}
+onClick()
+checkTrue("a ~/ working directory resolves too", commandText():find("cd '/home/user/project'", 1, true) ~= nil)
+CONFIG.working_dir = "~"
 
 -- A live session: the click has to toggle, not spawn a second Pi.
 dispatches = {}

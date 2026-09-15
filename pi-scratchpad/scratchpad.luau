@@ -36,7 +36,7 @@ local KNOWN_STATES = { working = true, waiting = true, idle = true }
 local function text(key, fallback)
   local value = noctalia.getConfig(key)
   if type(value) ~= "string" then return fallback end
-  value = value:match("^%s*(.-)%s*$")
+  value = noctalia.string.trim(value)
   if value == "" then return fallback end
   return value
 end
@@ -96,6 +96,19 @@ local function shellQuote(value)
   return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
+-- A folder setting can be "~", "~/project" or an absolute path. Hyprland runs the
+-- spawn line through /bin/sh, but the shell only expands a tilde it can see and
+-- this plugin single-quotes the path, so the expansion has to happen here or the
+-- shipped "~" default would leave `cd '~'` failing and take the terminal with it.
+local function absolutePath(path)
+  local home = noctalia.getenv("HOME")
+  if type(home) == "string" and home ~= "" then
+    if path == "~" then return home end
+    if path:sub(1, 2) == "~/" then return home .. path:sub(2) end
+  end
+  return path
+end
+
 -- Every compositor call in this plugin goes through this one function. Nothing
 -- else in the file names a compositor, so a niri port rewrites the bodies here
 -- and leaves the widget above untouched.
@@ -134,7 +147,7 @@ local function compositor(op, onDone)
   local width, height = geometry()
   local rules = "[float;center;size " .. width .. " " .. height ..
     ";workspace special:" .. workspace() .. "]"
-  local command = rules .. " cd " .. shellQuote(noctalia.expandPath(text("working_dir", DEFAULT_WORKING_DIR))) ..
+  local command = rules .. " cd " .. shellQuote(absolutePath(text("working_dir", DEFAULT_WORKING_DIR))) ..
     " && PI_HYPR_MONITOR=1 " .. text("terminal", DEFAULT_TERMINAL) .. " " .. text("spawn", DEFAULT_SPAWN)
   return noctalia.runAsync({ "hyprctl", "dispatch", "exec", command }, function()
     -- An exec'd window lands in the special workspace but does not reveal it.

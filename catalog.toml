@@ -43,4 +43,4 @@ description = "Parks one long-lived Pi TUI in a Hyprland special workspace, show
 deprecated = false
 plugin_api = 24
 tags = ["hyprland", "desktop", "widget", "agent"]
-dependencies = ["hyprctl", "pi"]
+dependencies = ["hyprctl", "foot", "pi"]
