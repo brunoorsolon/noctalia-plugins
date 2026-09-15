@@ -26,3 +26,5 @@ noctalia msg plugins enable magus/dictation
 | [Dictation](dictation/) | Records the microphone you choose and transcribes it with an installed recognition engine and GGUF model. |
 
 Each plugin documents its own requirements, setup, and usage in its directory.
+
+The [Dictation](dictation/) plugin consumes an already-installed recognition engine. [source-installer/](source-installer/) is a separate graphical tool that builds that engine from one pinned source revision for users who have none; it is not part of the plugin and Noctalia does not load or run it.
