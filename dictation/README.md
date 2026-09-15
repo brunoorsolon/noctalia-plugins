@@ -11,7 +11,6 @@ The plugin owns the native interface and the settings; `dictation-helper.py` own
 | ID | `magus/dictation` |
 | Entries | Service: `controller`, Panel: `panel`, Widget: `widget` |
 | Minimum plugin API | 24 |
-| Version | 0.3.0 |
 
 The service is the only owner of a job, so closing the panel or the bar widget never interrupts recording or recognition. The panel and the bar widget are thin views of the state the service publishes.
 
@@ -28,12 +27,12 @@ The service is the only owner of a job, so closing the panel or the bar widget n
 
 Automatic paste is aimed at the editor and the browser you work in, reached as ordinary clipboard-paste targets and identified by the compositor window class the plugin reads. The plugin ships no per-application list: the first recording into a window class you have not confirmed is held for **Paste now**, and terminals, password managers, an unreadable class and any window other than the one the recording was started from are always held. Nothing is typed as keystrokes, so the application receives its own normal paste of the clipboard the plugin set.
 
-The release-candidate host measurements — the versions of Noctalia, Hyprland, PipeWire and the engine on the machine this is meant for, the two timings (stop-to-ready, stop-to-paste), idle cost and busy RSS — belong to the target-host run recorded on the release pull request, and this document does not assert them. The one historical reference, a single warm-cache run, was 5.42 s of recognition for 117.86 s of audio; treat it as an anecdote, not a promise.
+The release-candidate host measurements — the versions of Noctalia, Hyprland, PipeWire and the engine on the machine this is meant for, the two timings (stop-to-ready, stop-to-paste), idle cost and busy RSS — are not measured for this release yet. The one historical reference, a single warm-cache run, was 5.42 s of recognition for 117.86 s of audio; treat it as an anecdote, not a promise.
 
 ## Requirements
 
 - `python3` (standard library only — the bundled helper has no third-party imports).
-- PipeWire tools: `pw-dump` to list capture sources, `pw-record` to capture, `pw-play` to play a recording back. They ship together in `pipewire-bin` (or `pipewire` on some distributions).
+- PipeWire tools: `pw-dump` to list capture sources, `pw-record` to capture, `pw-play` to play a recording back.
 - `hyprctl` for automatic paste, for the destination check and for the recording shortcut: the chord is dispatched by the compositor itself (`hyprctl dispatch sendshortcut CTRL,V,`), so no daemon and no input-device access is needed, and `hyprctl` is the same tool this plugin already uses to read the focused window. It is required only for automatic paste and the shortcut setup, and it is listed in the catalog's dependency metadata for that reason — without it, and in manual copy mode, the transcript is still copied when you ask for it, and the shortcut row stays actionable instead of pretending.
 - `ps` to read the compositor's command line when the recording shortcut has to find which configuration file Hyprland loaded. The shortcut row stays actionable without it; recording and paste do not use it.
 - A capture source (microphone) PipeWire reports as an `Audio/Source`.
@@ -249,8 +248,6 @@ The chord is sent no sooner than 500 ms after the job finished, so a panel that 
 Delivery happens at most once per finished recording, and only for a result the plugin trusts: `ok` **and** copyable, with the transcript and result files really on disk. `empty`, `malformed_row`, `truncated`, `unknown_token`, `nonzero_exit` and every other outcome is never pasted on its own, even when partial text is shown and copyable by hand. The attempt is written to the job's `delivery.json` **before** the clipboard is touched, and an attempt that cannot be recorded is not made: if that write fails, nothing is copied and no key is sent. With the marker in place, if the plugin crashes between it and the shortcut, the next run holds the job and says so instead of pasting it a second time, and a job adopted after a restart never delivers at all. Duplicate controller events, a second update tick, and a compositor answer that never arrives cannot repeat the side effects: an attempt in flight is never restarted, and one that never answers is held after 30 seconds.
 
 ## When something looks wrong
-
-Every item here is reachable from the panel, so recovery never needs a terminal.
 
 - **"Setup required"** names the missing piece: the executable, the model, `python3`, or the data directory.
 - **"Choose a microphone before recording"** means no microphone has been selected yet. Open the panel and pick one from the list.

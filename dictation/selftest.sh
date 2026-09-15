@@ -1357,7 +1357,10 @@ if len(row) != 1:
     sys.exit("FAIL: catalog rows for %s: expected [1] got [%d]" % (manifest["id"], len(row)))
 row = row[0]
 
-for field in ("name", "version", "plugin_api", "dependencies"):
+# name, version and dependencies are what Noctalia reads from the manifest; icon,
+# description, license, tags and author are rendered from the catalog row, so a
+# drift in either file shows the user the wrong package.
+for field in ("name", "icon", "description", "license", "tags", "author", "version", "plugin_api", "dependencies"):
     eq("catalog %s" % field, manifest[field], row[field])
 eq("version is MAJOR.MINOR.PATCH", 3, len(manifest["version"].split(".")))
 true("license is declared", manifest["license"])
