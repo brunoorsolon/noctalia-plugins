@@ -102,6 +102,39 @@ local PROCESS_CHECK_RETRY_MS = 5000
 -- older job's files or leave a truncated recording.
 local MIN_FREE_BYTES = 20 * 1024 * 1024
 
+-- Constants for the recording shortcut, which the panel offers in its own section.
+--
+-- The recording shortcut is the user's own compositor binding, so setup proposes
+-- one chord and writes it in the format the active configuration uses. Nothing is
+-- installed without an explicit approval: the chord is checked against the live
+-- bind table first, the edit is one delimited block in the user's own file, the
+-- file is copied aside before it changes, and Undo removes exactly that block
+-- instead of restoring the copy over later edits.
+local SHORTCUT_KEY = "D"
+local SHORTCUT_CHORD = "Super+Alt+D"
+local SHORTCUT_MODS_CONF = "SUPER ALT"
+local SHORTCUT_MODS_LUA = "SUPER + ALT + D"
+-- SUPER (1 << 6) | ALT (1 << 3): the live bind table reports masks, so a conflict
+-- is found without parsing anybody's configuration.
+local SHORTCUT_MODMASK = 72
+-- The description is the bind's identity in the live table: a Lua bind reports the
+-- dispatcher as a reference number rather than the command, so it is the one field
+-- that identifies this setup's binding in both configuration formats.
+local SHORTCUT_DESCRIPTION = "Dictation: start or stop recording"
+local SHORTCUT_BEGIN = "magus/dictation:recording-shortcut:begin"
+local SHORTCUT_END = "magus/dictation:recording-shortcut:end"
+-- The binding drives the singleton controller through the plugin's own IPC, so the
+-- chord and the panel's buttons are the same entry and #11's destination context
+-- is preserved.
+local SHORTCUT_COMMAND = "noctalia msg plugin magus/dictation:controller all toggle"
+-- A compositor answer that never arrives must not leave the row busy forever, so
+-- the wait is bounded and the outcome is read back instead of assumed.
+local SHORTCUT_STALL_MS = 30 * 1000
+-- `hyprctl` is the compositor's control CLI here as well as for automatic paste, so
+-- both read the same constant rather than a second name for one binary.
+local BINDS_QUERY = { PASTE_TOOL, "-j", "binds" }
+local RELOAD_COMMAND = { PASTE_TOOL, "reload" }
+
 local S = {
   activity = "idle", -- idle | recording | running | verifying
   phase = "",
@@ -123,6 +156,10 @@ local S = {
   delivery = { state = "idle", message = "" },
   -- The delivery mechanism itself, so the panel can name it and its state.
   paste = { state = "untested", tested = false, message = "Automatic paste waits for the first verification." },
+  -- The recording shortcut is the user's own compositor binding, and this is the
+  -- setup record for it: unknown | unsupported | available | working | installed |
+  -- conflict | error.
+  shortcut = { state = "unknown", chord = SHORTCUT_CHORD, message = "Not checked yet.", canInstall = false, canRemove = false, installed = false },
 }
 
 local summaryPath = nil
@@ -271,6 +308,609 @@ local function refreshSetup()
     engineSha256 = shortHash(record.engine.sha256),
     modelSha256 = shortHash(record.model.sha256),
   }
+end
+
+-- ── Recording shortcut ───────────────────────────────────────────────────────
+
+local function envValue(name)
+  if type(noctalia.getenv) ~= "function" then return nil end
+  local value = noctalia.getenv(name)
+  return type(value) == "string" and value ~= "" and value or nil
+end
+
+-- Hyprland's own precedence: a --config path on the compositor's command line
+-- wins, then HYPRLAND_CONFIG, then hyprland.lua before hyprland.conf across the
+-- configuration directories (Jeremy.cpp getMainConfigPath). The command line is
+-- the only place --config is visible — hyprctl answers about the configuration
+-- but not which file it came from — and ps flattens argv, so a line it cannot
+-- delimit unambiguously stops the setup instead of sending it to a file the
+-- compositor may not be loading.
+local COMPOSITOR_ARGS_QUERY = { "ps", "-o", "args=", "-C", "Hyprland" }
+
+-- Returns the explicit --config path, nil when the compositor uses the defaults,
+-- or a reason string when the command line cannot be established safely.
+local function explicitConfigPath(args)
+  local lines, withFlag = 0, nil
+  for line in args:gmatch("[^\n]+") do
+    lines = lines + 1
+    local tokens = {}
+    for token in line:gmatch("%S+") do table.insert(tokens, token) end
+    for i, token in ipairs(tokens) do
+      -- The flags are matched as patterns because they are compositor flags, not
+      -- helper options, and the shell check counts every bare "--" string literal
+      -- in this file as the latter.
+      if token:find("^%-%-config=") or token:find("^%-c=") then
+        return nil, "the compositor's command line carries --config in a form this setup does not read"
+      end
+      if token:find("^%-%-config$") or token:find("^%-c$") then
+        withFlag = { path = tokens[i + 1], trailing = #tokens - (i + 1) }
+      end
+    end
+  end
+  if lines > 1 then
+    return nil, "several Hyprland processes are running, so the one this panel belongs to cannot be told apart"
+  end
+  if not withFlag then return nil, nil end
+  -- ps joins argv with spaces, so a path element holding a space is flattened:
+  -- with anything left on the line after the path token, the path's end cannot
+  -- be delimited, and its truncated prefix may well exist as an unrelated file.
+  if not withFlag.path then
+    return nil, "the compositor's command line carries --config without a path"
+  end
+  if withFlag.trailing > 0 then
+    return nil, "the compositor's command line cannot be delimited after --config"
+  end
+  return withFlag.path, nil
+end
+
+-- Returns the active configuration path and its format, or nil with a missing
+-- explicit path that does not exist, or nil with a reason when the active file
+-- cannot be established. Async: the compositor's command line has to be read
+-- before the default search may run.
+local function shortcutConfigPath(callback)
+  if not noctalia.commandExists("ps") then
+    callback(nil, nil, nil, "ps is not installed, so the compositor's command line cannot be read")
+    return
+  end
+  local accepted = noctalia.runAsync(COMPOSITOR_ARGS_QUERY, function(result)
+    if type(result) ~= "table" or result.exitCode ~= 0 then
+      callback(nil, nil, nil, "the compositor's command line could not be read")
+      return
+    end
+    local args = type(result.stdout) == "string" and result.stdout or ""
+    local explicit, whyNot = explicitConfigPath(args)
+    if whyNot then
+      callback(nil, nil, nil, whyNot)
+      return
+    end
+    if explicit then
+      explicit = noctalia.expandPath(explicit)
+      if not noctalia.fileExists(explicit) then callback(nil, nil, explicit) return end
+      callback(explicit, (explicit:sub(-4) == ".lua") and "lua" or "conf")
+      return
+    end
+    local env = envValue("HYPRLAND_CONFIG")
+    if env then
+      -- The compositor takes this path on faith, so a file that is not there is named
+      -- rather than reported as a free chord this setup cannot write.
+      env = noctalia.expandPath(env)
+      if not noctalia.fileExists(env) then callback(nil, nil, env) return end
+      callback(env, (env:sub(-4) == ".lua") and "lua" or "conf")
+      return
+    end
+    local dirs = {}
+    local home = envValue("HOME")
+    local configHome = envValue("XDG_CONFIG_HOME")
+    if configHome then
+      table.insert(dirs, configHome)
+    elseif home then
+      table.insert(dirs, home .. "/.config")
+    end
+    for dir in (envValue("XDG_CONFIG_DIRS") or "/etc/xdg"):gmatch("[^:]+") do
+      table.insert(dirs, dir)
+    end
+    for _, suffix in ipairs({ "lua", "conf" }) do
+      for _, dir in ipairs(dirs) do
+        local path = dir .. "/hypr/hyprland." .. suffix
+        if noctalia.fileExists(path) then callback(path, suffix) return end
+      end
+    end
+    callback(nil, nil)
+  end)
+  if accepted == false then
+    callback(nil, nil, nil, "the compositor's command line could not be read")
+  end
+end
+
+local function unsupportedMessage(missing, reason)
+  if reason then
+    return "Hyprland's active configuration file cannot be established (" .. reason .. "), so whether the compositor was started with --config is unknown. This setup will not guess which file to edit, so no binding is written. Recording from the panel and the bar still works."
+  end
+  if missing then
+    return "The compositor was pointed at " .. missing .. ", which does not exist, so this setup has nowhere to put the binding. Recording from the panel and the bar still works."
+  end
+  return "No Hyprland configuration file was found in the usual places, so this setup has nowhere to put the binding. Recording from the panel and the bar still works."
+end
+
+local function shortcutBlock(format)
+  if format == "lua" then
+    return {
+      "-- " .. SHORTCUT_BEGIN,
+      string.format('hl.bind("%s", hl.dsp.exec_cmd("%s"), { description = "%s" })',
+        SHORTCUT_MODS_LUA, SHORTCUT_COMMAND, SHORTCUT_DESCRIPTION),
+      "-- " .. SHORTCUT_END,
+    }
+  end
+  return {
+    "# " .. SHORTCUT_BEGIN,
+    string.format("bindd = %s, %s, %s, exec, %s",
+      SHORTCUT_MODS_CONF, SHORTCUT_KEY, SHORTCUT_DESCRIPTION, SHORTCUT_COMMAND),
+    "# " .. SHORTCUT_END,
+  }
+end
+
+-- The block is one delimited piece, so removing it never touches a line this setup
+-- did not write and never has to trust the whole-file copy.
+local function stripShortcutBlock(content, beginMark, endMark)
+  local startAt = content:find(beginMark, 1, true)
+  if not startAt then return content end
+  local endAt = content:find(endMark, startAt, true)
+  if not endAt then return content end
+  local head = content:sub(1, startAt - 1):match("^(.*\n)") or ""
+  local lineEnd = content:find("\n", endAt + #endMark - 1, true)
+  local tail = lineEnd and content:sub(lineEnd + 1) or ""
+  return head .. tail
+end
+
+local function upsertShortcutBlock(content, lines, beginMark, endMark)
+  local stripped = stripShortcutBlock(content, beginMark, endMark)
+  -- The block goes in front of the file rather than behind it: a configuration can
+  -- end inside a submap, where a bind is not in effect outside it, and a Lua
+  -- configuration can end in a top-level return, after which nothing may follow.
+  return table.concat(lines, "\n") .. "\n" .. stripped
+end
+
+local function brokenBlockMessage(path)
+  return "The block in " .. path .. " has no closing marker (" .. SHORTCUT_END .. "), so this setup left it alone. Delete the leftover lines from the begin marker through the binding line by hand, then check again."
+end
+
+-- A block that was half-deleted by hand is not "absent": writing beside it would
+-- add a second binding and removing it would claim a removal that never happened.
+local function shortcutBlockState(content)
+  if type(content) ~= "string" then return "absent" end
+  local startAt = content:find(SHORTCUT_BEGIN, 1, true)
+  if not startAt then return "absent" end
+  if content:find(SHORTCUT_END, startAt, true) then return "complete" end
+  return "broken"
+end
+
+local function queryBinds(callback)
+  if not noctalia.commandExists(PASTE_TOOL) then
+    callback(nil, "hyprctl is not installed, so the compositor's bindings cannot be read.")
+    return
+  end
+  local accepted = noctalia.runAsync(BINDS_QUERY, function(result)
+    if type(result) ~= "table" or result.exitCode ~= 0 then
+      callback(nil, "hyprctl could not report the compositor's bindings.")
+      return
+    end
+    local text = type(result.stdout) == "string" and noctalia.string.trim(result.stdout) or ""
+    local binds = text ~= "" and noctalia.json.decode(text) or nil
+    if type(binds) ~= "table" then
+      callback(nil, "hyprctl's answer about the bindings was not readable.")
+      return
+    end
+    -- The chord can only be called free when the report carries the fields binds
+    -- are described with; a report in some other shape must not read as free.
+    for i = 1, #binds do
+      local entry = binds[i]
+      if type(entry) ~= "table" or type(entry.modmask) ~= "number" or type(entry.key) ~= "string" then
+        callback(nil, "hyprctl's answer about the bindings is not in the shape this setup reads, so the chord cannot be checked.")
+        return
+      end
+    end
+    callback(binds, nil)
+  end)
+  if accepted == false then
+    callback(nil, "hyprctl could not be run, so the compositor's bindings are unknown.")
+  end
+end
+
+-- Every bind the compositor would run on this chord, the way the keybind matcher
+-- itself decides: it compares the key name exactly, falls back to the keycode when
+-- a bind carries no name, runs universal binds in every submap including the
+-- default one, and runs a catchall bind on every key in the default submap. A bind
+-- defined inside an ordinary submap is not active outside it, so it does not
+-- occupy this chord.
+local function shortcutOccupants(binds)
+  local found = {}
+  for _, bind in ipairs(binds) do
+    if type(bind) == "table" and bind.modmask == SHORTCUT_MODMASK then
+      local universal = bind.submap_universal == true or bind.submap_universal == "true"
+      if bind.submap == nil or bind.submap == "" or universal then
+        local key = type(bind.key) == "string" and string.upper(bind.key) or ""
+        -- A nameless bind is an occupant whatever its reported keycode, and
+        -- refusing it costs nothing but an install. The key it presses cannot be
+        -- established from here: the keycode is positional for the compositor's
+        -- own keymap, which the bind table does not report (a Dvorak layout puts
+        -- the D keysym on a different keycode than QWERTY), and a Lua numeric
+        -- chord like code:40 never fills the legacy keycode at all — it lives in
+        -- the multi-key list, while the bind table reports key "" and keycode 0.
+        local nameless = key == ""
+        local catchall = bind.catch_all == true or bind.catch_all == "true"
+        if key == SHORTCUT_KEY or nameless or catchall then
+          table.insert(found, bind)
+        end
+      end
+    end
+  end
+  return found
+end
+
+-- A bind is this setup's only when the block it wrote is on disk. Hyprland runs
+-- every bind that matches a chord, so a binding of the same command written by hand
+-- is somebody else's and installing beside it would toggle twice. The description
+-- is what identifies this setup's own bind in a Lua configuration, where the
+-- dispatcher is reported as a reference number rather than the command.
+local function bindIsOurs(bind, installed)
+  if not installed or type(bind) ~= "table" then return false end
+  if bind.has_description == true and bind.description == SHORTCUT_DESCRIPTION then return true end
+  return type(bind.arg) == "string" and noctalia.string.trim(bind.arg) == SHORTCUT_COMMAND
+end
+
+-- The chord is this setup's only when it holds it exactly once: the compositor runs
+-- every binding on a chord, so a second one toggles twice. The returned bind is the
+-- one that has to go, and nil means the chord is free or held by this setup alone.
+local function strayShortcutOccupant(binds, installed)
+  local occupants = shortcutOccupants(binds)
+  local first = nil
+  for _, bind in ipairs(occupants) do
+    if not bindIsOurs(bind, installed) and not first then first = bind end
+  end
+  if first then return first, #occupants end
+  if #occupants > 1 then return occupants[1], #occupants end
+  return nil, #occupants
+end
+
+local function bindLabel(bind)
+  if type(bind) ~= "table" then return "another binding" end
+  local description = type(bind.description) == "string" and bind.description or ""
+  local dispatcher = type(bind.dispatcher) == "string" and bind.dispatcher or ""
+  local arg = type(bind.arg) == "string" and bind.arg or ""
+  -- A Lua bind reports a reference number in place of the command, so only a real
+  -- dispatcher string is named beside the description. A keycode bind is named
+  -- with its keycode, because the key it presses depends on the host's keymap.
+  local command = (dispatcher ~= "" and dispatcher ~= "__lua") and noctalia.string.trim(dispatcher .. " " .. arg) or ""
+  if command ~= "" and description == "" then
+    local keycode = type(bind.keycode) == "number" and bind.keycode or nil
+    local key = type(bind.key) == "string" and bind.key or ""
+    if key == "" and keycode and keycode ~= 0 then
+      command = command .. " (keycode " .. keycode .. ")"
+    end
+  end
+  if description ~= "" and command ~= "" then return description .. " (" .. command .. ")" end
+  if description ~= "" then return description end
+  if command ~= "" then return command end
+  -- A Lua bind reports a reference number where a command would be, so when it
+  -- also carries no description there is nothing more specific to name.
+  if dispatcher == "__lua" then return "a Lua binding" end
+  return "another binding"
+end
+
+local shortcutPendingAtMs = nil
+
+-- A pending shortcut flow is superseded when any other shortcut action reaches a
+-- settled state after it started: another install, an Undo, a re-check. Its
+-- captured settled generation then no longer matches the current one, and every
+-- callback it still owes — a delayed process answer, a reload — must drop
+-- instead of writing what a newer action has already reversed.
+local shortcutSettled = 0
+
+local function beginShortcutFlow() return shortcutSettled end
+local function shortcutSuperseded(startedAt) return startedAt ~= shortcutSettled end
+
+local function setShortcut(state, fields)
+  S.shortcut = {
+    state = state,
+    chord = SHORTCUT_CHORD,
+    path = fields.path or "",
+    format = fields.format or "",
+    installed = fields.installed == true,
+    canInstall = fields.canInstall == true,
+    canRemove = fields.canRemove == true,
+    message = fields.message or "",
+  }
+  shortcutPendingAtMs = state == "working" and noctalia.nowMs() or nil
+  -- Every settled state belongs to the newest flow: a callback of an older one
+  -- must not set anything.
+  if state ~= "working" then shortcutSettled = shortcutSettled + 1 end
+  publish()
+end
+
+local function expireShortcutWait()
+  if S.shortcut.state ~= "working" or not shortcutPendingAtMs then return end
+  if noctalia.nowMs() - shortcutPendingAtMs <= SHORTCUT_STALL_MS then return end
+  setShortcut("error", {
+    path = S.shortcut.path, format = S.shortcut.format, installed = S.shortcut.installed,
+    canInstall = true, canRemove = S.shortcut.installed,
+    message = "The compositor did not answer, so nothing was confirmed. Check again to see what it reports now.",
+  })
+  noctalia.notifyError("Dictation", S.shortcut.message)
+end
+
+-- What the compositor reports decides the state: a chord that is already taken is
+-- never overwritten, a chord that answers with this setup's own description is
+-- installed, a block that is written but not registered is reported as such, and
+-- anything else is free to install.
+local function applyShortcutStatus(path, format, installed, binds)
+  local stray, count = strayShortcutOccupant(binds, installed)
+  if stray then
+    setShortcut("conflict", {
+      path = path, format = format, installed = installed, canRemove = installed,
+      message = installed
+        and string.format("%s is also bound to %s, so the chord would run twice. Remove that extra binding, or Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, bindLabel(stray), path)
+        or string.format("%s is already bound to %s, so nothing was changed and no second binding was added. Remove that binding, then check again.", SHORTCUT_CHORD, bindLabel(stray)),
+    })
+  elseif count > 0 then
+    setShortcut("installed", {
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = string.format("%s starts and stops recording while another window is focused. Undo removes the block this setup wrote in %s.", SHORTCUT_CHORD, path),
+    })
+  elseif installed then
+    setShortcut("error", {
+      path = path, format = format, installed = true, canInstall = true, canRemove = true,
+      message = string.format("The recording shortcut is written in %s but the compositor did not register it. Undo removes the block, or install it again once the configuration is fixed.", path),
+    })
+  else
+    setShortcut("available", {
+      path = path, format = format, installed = false, canInstall = true,
+      message = string.format("%s is free. Install it to start and stop recording without opening the panel.", SHORTCUT_CHORD),
+    })
+  end
+end
+
+local function refreshShortcut()
+  local startedAt = beginShortcutFlow()
+  if not noctalia.commandExists(PASTE_TOOL) then
+    setShortcut("unsupported", {
+      message = "The recording shortcut is a compositor binding, and hyprctl is not installed, so this setup cannot configure one. Recording from the panel and the bar still works.",
+    })
+    return
+  end
+  shortcutConfigPath(function(path, format, missing, reason)
+    if shortcutSuperseded(startedAt) then return end
+    if not path then
+      setShortcut("unsupported", { message = unsupportedMessage(missing, reason) })
+      return
+    end
+    local content = noctalia.readFile(path)
+    local block = shortcutBlockState(content)
+    if block == "broken" then
+      setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+      return
+    end
+    local installed = block == "complete"
+    setShortcut("working", {
+      path = path, format = format, installed = installed, canInstall = not installed,
+      message = "Checking what the compositor holds for " .. SHORTCUT_CHORD .. ".",
+    })
+    queryBinds(function(binds, err)
+      if shortcutSuperseded(startedAt) then return end
+      if not binds then
+        setShortcut("error", { path = path, format = format, installed = installed, canRemove = installed, message = err })
+        return
+      end
+      applyShortcutStatus(path, format, installed, binds)
+    end)
+  end)
+end
+
+local function reloadCompositor(callback)
+  local accepted = noctalia.runAsync(RELOAD_COMMAND, function(result)
+    callback(type(result) == "table" and result.exitCode == 0)
+  end)
+  if accepted == false then callback(false) end
+end
+
+local function confirmInstalledShortcut(path, backup, startedAt)
+  queryBinds(function(binds, reason)
+    if shortcutSuperseded(startedAt) then return end
+    if not binds then
+      setShortcut("error", { path = path, installed = true, canInstall = true, canRemove = true, message = reason .. " The binding is written in " .. path .. "." })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local stray, count = strayShortcutOccupant(binds, true)
+    if count == 1 and not stray then
+      setShortcut("installed", {
+        path = path, installed = true, canInstall = true, canRemove = true,
+        message = string.format("%s now starts and stops recording while another window is focused. The backup is %s; Undo removes the block.", SHORTCUT_CHORD, backup),
+      })
+      noctalia.notify("Dictation", "Recording shortcut installed: " .. SHORTCUT_CHORD .. ".")
+      return
+    end
+    setShortcut("error", {
+      path = path, installed = true, canInstall = true, canRemove = true,
+      message = "The binding is written in " .. path .. " and the compositor reloaded, but " .. SHORTCUT_CHORD .. (count == 0 and " did not register." or " runs more than once: another binding holds the same chord.") .. " Undo removes the block, or restore " .. backup .. ".",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+  end)
+end
+
+local function writeShortcut(path, format, startedAt)
+  -- The file is read again here, after the bind query answered, so an edit made
+  -- while the compositor was answering is not written over.
+  local content = noctalia.readFile(path)
+  local block = shortcutBlockState(content)
+  if block == "broken" then
+    setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  if type(content) ~= "string" then
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "The Hyprland configuration could not be read: " .. path,
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local backup = path .. ".magus-dictation.bak"
+  if not noctalia.writeFile(backup, content) then
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "A copy of " .. path .. " could not be written, so the binding was not added. Check that the file's directory is writable.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  local updated = upsertShortcutBlock(content, shortcutBlock(format), SHORTCUT_BEGIN, SHORTCUT_END)
+  local written, writeError = noctalia.writeFile(path, updated)
+  if not written then
+    local reason = type(writeError) == "string" and (" (" .. writeError .. ")") or ""
+    setShortcut("error", {
+      path = path, format = format, installed = S.shortcut.installed, canInstall = true, canRemove = S.shortcut.installed,
+      message = "The binding could not be written to " .. path .. reason .. ". The copy is " .. backup .. "; restore it if the file looks wrong.",
+    })
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  setShortcut("working", { path = path, format = format, installed = true, message = "Reloading the compositor." })
+  reloadCompositor(function(ok)
+    if shortcutSuperseded(startedAt) then return end
+    if not ok then
+      setShortcut("error", {
+        path = path, format = format, installed = true, canInstall = true, canRemove = true,
+        message = "The binding is written in " .. path .. " but the compositor would not reload. Undo removes the block, or restore " .. backup .. ".",
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    confirmInstalledShortcut(path, backup, startedAt)
+  end)
+end
+
+-- Only this button path writes a binding. It re-reads the live table right before
+-- the write, so a chord that was taken since the last check is refused instead of
+-- overwritten, and it converges when the binding is already this setup's own.
+local function installShortcut()
+  local startedAt = beginShortcutFlow()
+  if not noctalia.commandExists(PASTE_TOOL) then
+    refreshShortcut()
+    noctalia.notifyError("Dictation", S.shortcut.message)
+    return
+  end
+  -- Busy before the first asynchronous step: while the compositor's command line
+  -- is being read the row offers no second install, and a callback that belongs
+  -- to a flow an Undo has already reversed must not write.
+  setShortcut("working", { message = "Establishing which configuration the compositor loads." })
+  shortcutConfigPath(function(path, format, missing, reason)
+    if shortcutSuperseded(startedAt) then return end
+    if not path then
+      refreshShortcut()
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local content = noctalia.readFile(path)
+    if type(content) ~= "string" then
+      setShortcut("error", {
+        path = path, format = format, canInstall = true,
+        message = "The Hyprland configuration could not be read: " .. path,
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local block = shortcutBlockState(content)
+    if block == "broken" then
+      setShortcut("error", { path = path, format = format, installed = true, message = brokenBlockMessage(path) })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local installed = block == "complete"
+    setShortcut("working", { path = path, format = format, installed = installed, message = "Checking the compositor's bindings before changing anything." })
+    queryBinds(function(binds, err)
+      if shortcutSuperseded(startedAt) then return end
+      if not binds then
+        setShortcut("error", { path = path, format = format, installed = installed, canInstall = true, canRemove = installed, message = err })
+        noctalia.notifyError("Dictation", err)
+        return
+      end
+      local stray = strayShortcutOccupant(binds, installed)
+      if stray then
+        applyShortcutStatus(path, format, installed, binds)
+        noctalia.notifyError("Dictation", S.shortcut.message)
+        return
+      end
+      writeShortcut(path, format, startedAt)
+    end)
+  end)
+end
+
+-- Undo removes the delimited block and nothing else: later user edits stay, and the
+-- pre-edit copy is never restored over them.
+local function removeShortcut()
+  local startedAt = beginShortcutFlow()
+  setShortcut("working", { message = "Establishing which configuration the compositor loads." })
+  shortcutConfigPath(function(path, format, missing, reason)
+    if shortcutSuperseded(startedAt) then return end
+    if not path then
+      refreshShortcut()
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local content = noctalia.readFile(path)
+    if type(content) ~= "string" then
+      setShortcut("error", {
+        path = path, format = format, canInstall = true,
+        message = "The Hyprland configuration could not be read: " .. path,
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local block = shortcutBlockState(content)
+    if block ~= "complete" then
+      refreshShortcut()
+      if block == "broken" then
+        noctalia.notifyError("Dictation", S.shortcut.message)
+      else
+        noctalia.notify("Dictation", "The recording shortcut block is not in " .. path .. ", so there was nothing to remove.")
+      end
+      return
+    end
+    local backup = path .. ".magus-dictation.bak"
+    if not noctalia.writeFile(backup, content) then
+      setShortcut("error", {
+        path = path, format = format, installed = true, canInstall = true, canRemove = true,
+        message = "A copy of " .. path .. " could not be written, so the binding was left in place. Check that the file's directory is writable.",
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    local written, writeError = noctalia.writeFile(path, stripShortcutBlock(content, SHORTCUT_BEGIN, SHORTCUT_END))
+    if not written then
+      local err = type(writeError) == "string" and (" (" .. writeError .. ")") or ""
+      setShortcut("error", {
+        path = path, format = format, installed = true, canInstall = true, canRemove = true,
+        message = "The recording shortcut block could not be removed from " .. path .. err .. ". It is still there; try again.",
+      })
+      noctalia.notifyError("Dictation", S.shortcut.message)
+      return
+    end
+    setShortcut("working", { path = path, format = format, message = "Removing the binding from the compositor." })
+    reloadCompositor(function(ok)
+      if shortcutSuperseded(startedAt) then return end
+      if not ok then
+        setShortcut("error", {
+          path = path, format = format, canInstall = true,
+          message = "The block was removed from " .. path .. ", but the compositor would not reload, so the chord may still be active until the next reload.",
+        })
+        noctalia.notifyError("Dictation", S.shortcut.message)
+        return
+      end
+      refreshShortcut()
+      noctalia.notify("Dictation", "Recording shortcut removed. Unrelated shortcuts were not touched.")
+    end)
+  end)
 end
 
 -- ── Microphone ───────────────────────────────────────────────────────────────
@@ -1321,6 +1961,7 @@ local function reportSilence()
 end
 
 function update()
+  expireShortcutWait()
   if S.activity == "idle" then
     pumpDelivery()
     return
@@ -1460,6 +2101,7 @@ if JOBS then noctalia.mkdirAll(JOBS) end
 
 loadMicrophone()
 refreshSetup()
+refreshShortcut()
 restoreJob()
 recallRecording()
 publish()
@@ -1490,5 +2132,11 @@ noctalia.state.watch("dictation.command", function(command)
     selectSource(command.source)
   elseif action == "deliver" then
     deliverNow(command.text)
+  elseif action == "shortcut-install" then
+    installShortcut()
+  elseif action == "shortcut-remove" then
+    removeShortcut()
+  elseif action == "shortcut-refresh" then
+    refreshShortcut()
   end
 end)
