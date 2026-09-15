@@ -230,7 +230,7 @@ Playback runs from the helper too, bounded by a ten-minute limit, so a stuck `pw
 <python3> dictation-helper.py play --wav <jobDir>/recording.wav
 ```
 
-`Stop` sends `SIGINT` to the recorder process the helper started, and only to that process, then waits for it to finish the WAV before validating the audio. `Cancel` and a controller loss send `SIGTERM` to that recorder's own process group and escalate to `SIGKILL` after a three-second grace; the recorder finalizes the WAV on `SIGTERM`, so the captured audio survives.
+`Stop` sends `SIGINT` to the recorder process the helper started, then waits for it to finish the WAV before validating the audio; a recorder that has not finished within five seconds has its process group killed. `Cancel` and a controller loss send `SIGTERM` to that recorder's own process group and escalate to `SIGKILL` after a three-second grace; the recorder finalizes the WAV on `SIGTERM`, so the captured audio survives.
 
 The engine runs with `OMP_NUM_THREADS` and `OPENBLAS_NUM_THREADS` set to the thread count and with niceness 10, so it yields to interactive work. The recorder is never niced, because capture is the real-time path. On the first run against a new executable, the helper checks the `--help` output for every flag above and refuses to guess when one is missing.
 
