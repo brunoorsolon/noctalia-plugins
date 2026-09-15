@@ -29,3 +29,18 @@ deprecated = false
 plugin_api = 24
 tags = ["audio", "dictation", "recording", "service", "panel"]
 dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "ps", "transcribe-cli"]
+
+[[plugin]]
+id = "magus/pi-scratchpad"
+name = "Pi Scratchpad"
+version = "0.1.0"
+updated_at = 1789498045
+added_at = 1789498045
+author = "magus"
+license = "MIT"
+icon = "terminal-2"
+description = "Parks one long-lived Pi TUI in a Hyprland special workspace, shows its working, waiting or idle state in the bar, and notifies when Pi starts waiting out of sight."
+deprecated = false
+plugin_api = 24
+tags = ["hyprland", "desktop", "widget", "agent"]
+dependencies = ["hyprctl", "pi"]
