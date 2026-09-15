@@ -1165,8 +1165,8 @@ end
 -- limits are a guard rather than a policy.
 local HISTORY_LIMIT = 20
 
--- The last deletion, clear or export this session asked for. It rides along with
--- every history refresh, so a partial failure stays visible next to the rows it
+-- The last deletion, clear or export this session asked for. It is shown with the
+-- refresh that follows it, so a partial failure stays visible next to the rows it
 -- left behind instead of only in a notification that is gone.
 local maintenanceNote = ""
 
@@ -1175,6 +1175,14 @@ local function setMaintenanceNote(text)
   -- Shown immediately: a refusal never refreshes the history, and the reason has
   -- to be visible even when no helper run follows it.
   S.history.note = maintenanceNote
+end
+
+-- The note describes the action just taken. It stays visible through the refreshes
+-- that follow on their own — a panel open or a finished job must not wipe a partial
+-- failure before it was read — and goes away when the user asks for a refresh, so a
+-- report cannot outlive the state it describes.
+local function clearMaintenanceNote()
+  maintenanceNote = ""
 end
 
 -- The history is the helper's own record of the durable job directories, not this
@@ -2414,6 +2422,8 @@ noctalia.state.watch("dictation.command", function(command)
   elseif action == "play" then
     playRecording()
   elseif action == "history-refresh" then
+    -- An explicit refresh is the user saying they have read the last report.
+    clearMaintenanceNote()
     refreshHistory()
   elseif action == "history-play" then
     playHistoryRecording(command.jobId)

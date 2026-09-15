@@ -2437,12 +2437,16 @@ check("the export addresses the bytes that were reviewed", "cafebabe", maintenan
 check("the panel names where the export went", true, findText(lastTree, "/home/user/Downloads/dictation-diagnostics-1.json") ~= nil)
 
 -- A retention run that could not remove everything is a partial deletion, so it is
--- reported next to the rows it left behind instead of only in a notification.
+-- reported next to the rows it left behind instead of only in a notification. The
+-- maintenance report describes the action just taken: it is there as soon as that
+-- action reports, and the refresh after it clears it so a stale report cannot
+-- outlive the rows it describes.
+check("the helper's own report stays next to the history", true, findText(lastTree, "Exported the exact diagnostics you previewed.") ~= nil)
 historyRetention = { removed = {}, failures = { "/data/jobs/job-old (Permission denied)" }, at = 1234 }
 command("history-refresh")
 onOpen({})
 check("a retention failure stays visible in the panel", true, findText(lastTree, "could not remove some files") ~= nil)
-check("the helper's own report stays next to the history", true, findText(lastTree, "Exported the exact diagnostics you previewed.") ~= nil)
+check("a later refresh drops the stale report", false, findText(lastTree, "Exported the exact diagnostics you previewed.") ~= nil)
 onClose({})
 
 -- The check has to fail its process, not only print: a caller and any automation

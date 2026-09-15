@@ -534,7 +534,6 @@ def job_entry(name, job_dir):
         "recordingUsable": problem is None,
         "recordingMessage": "" if problem is None else problem,
         "copyable": copyable,
-        "sizeBytes": tree_size(job_dir),
     }
 
 
@@ -716,13 +715,44 @@ def last_prune(data_dir):
     }
 
 
+def referenced_recordings(data_dir, skip):
+    """Real paths of recordings that jobs outside `skip` still name.
+
+    A retry stores the dictation it retried as its own audio, so a job can point
+    into another job's directory; the manual delete path already refuses to delete
+    another dictation's recording for the same reason.
+    """
+    jobs_dir = jobs_dir_for(data_dir)
+    used = set()
+    try:
+        names = os.listdir(jobs_dir)
+    except OSError:
+        return used
+    for name in names:
+        if name in skip or not JOB_NAME.match(name):
+            continue
+        job = read_json_file(os.path.join(jobs_dir, name, "job.json")) or {}
+        recording = job.get("recording")
+        if isinstance(recording, str) and recording != "":
+            used.add(os.path.realpath(recording))
+    return used
+
+
+def holds_referenced_recording(job_dir, used):
+    """Whether a job directory contains a recording a surviving job still needs."""
+    prefix = os.path.realpath(job_dir) + os.sep
+    return any(path.startswith(prefix) for path in used)
+
+
 def prune_jobs(data_dir, retention, keep=None):
     """Delete finished dictations beyond the retention count.
 
     Called only after a successor's own result was committed. Only a finished job
     with a durable summary is a candidate, so a running, failed, interrupted or
     recoverable cancelled job is never silently removed, and a live job is
-    skipped even when it is old.
+    skipped even when it is old. A candidate whose audio a surviving dictation
+    still names is kept: removing it would take Play and Retry away from a
+    dictation that is inside the retention window.
     """
     keep = set(keep or [])
     result = {"removed": [], "failures": []}
@@ -730,14 +760,18 @@ def prune_jobs(data_dir, retention, keep=None):
     if retention < 1:
         return result
     jobs_dir = jobs_dir_for(data_dir)
+    candidates = []
     for index, name in enumerate(completed_names(data_dir)):
-        if index < retention:
+        if index < retention or job_is_live(name, data_dir, keep):
             continue
-        if job_is_live(name, data_dir, keep):
-            continue
+        candidates.append(name)
+    used = referenced_recordings(data_dir, set(candidates))
+    for name in candidates:
         job_dir, problem = owned_job_dir(data_dir, name)
         if problem:
             result["failures"].append("%s (%s)" % (name, problem))
+            continue
+        if holds_referenced_recording(job_dir, used):
             continue
         failures = remove_owned_job(job_dir)
         forget_sidecars(jobs_dir, name)
@@ -889,7 +923,8 @@ def command_clear(args):
         names = sorted(os.listdir(jobs_dir))
     except OSError:
         names = []
-    removed, kept, failures = [], [], []
+    removed, kept, held, failures = [], [], [], []
+    doomed = []
     for name in names:
         if not JOB_NAME.match(name):
             continue
@@ -902,6 +937,15 @@ def command_clear(args):
         owned, problem = owned_job_dir(args.data_dir, name)
         if problem:
             failures.append("%s (%s)" % (name, problem))
+            continue
+        doomed.append((name, owned))
+    # A dictation that survives this clear — the job that is still running, for
+    # instance — keeps needing the recording it names, even when that recording
+    # lives in a job this clear would otherwise remove.
+    used = referenced_recordings(args.data_dir, set(name for name, _owned in doomed))
+    for name, owned in doomed:
+        if holds_referenced_recording(owned, used):
+            held.append(name)
             continue
         job_failures = remove_owned_job(owned)
         forget_sidecars(jobs_dir, name)
@@ -917,14 +961,24 @@ def command_clear(args):
             "job was" if len(kept) == 1 else "jobs were",
             ", ".join(kept),
         )
+    if held:
+        message += " Kept for dictations that still use it: %s." % ", ".join(held)
     if failures:
         message += " Some files could not be removed: " + "; ".join(failures[:5])
+    if removed:
+        # The previous pruning report was about jobs this clear just removed, so a
+        # stale failure line must not outlive them in the panel.
+        try:
+            os.unlink(retention_path(args.data_dir))
+        except OSError:
+            pass
     verdict(
         "clear_partial" if failures else "cleared",
         "error" if failures else "ok",
         message,
         removed=removed,
         kept=kept,
+        held=held,
         failures=failures[:20],
     )
 
@@ -1164,7 +1218,7 @@ def command_export_text(args):
     verdict(
         "ok",
         "ok",
-        "Exported the transcript as a text file. Nothing was pasted.",
+        "Exported the transcript to %s. Nothing was pasted." % destination,
         exportPath=destination,
         bytes=len(content),
         sha256=hashlib.sha256(content).hexdigest(),
@@ -1916,7 +1970,10 @@ def classify(killed, exit_code, parsed):
     if parsed["error"] and TRUNCATION_MARK in parsed["error"].lower():
         return "truncated", "review", "The engine hit its output budget; the transcript is incomplete."
     if parsed["error"]:
-        return "per_file_error", "error", "The engine reported an error for this recording." + ENGINE_NOTE_MARK + parsed["error"].rstrip(".")
+        # The engine's own row text is not this plugin's words, and transcribe appends
+        # the engine's log tail to whatever this returns, so the detail stays in the
+        # result file instead of being named here twice.
+        return "per_file_error", "error", "The engine reported an error for this recording."
     if not parsed["text"].strip():
         return "empty", "error", "The engine returned no text for this recording."
     if exit_code != 0:

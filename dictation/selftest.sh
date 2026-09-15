@@ -959,13 +959,67 @@ doc = json.loads(sys.argv[1])
 assert doc["storage"]["jobsCount"] == 5, doc["storage"]
 assert doc["storage"]["jobsBytes"] > 0, doc["storage"]
 assert sorted(doc["retention"]["removed"]) == ["job-fin-1", "job-fin-2", "job-fin-3"], doc["retention"]
-sizes = {entry["id"]: entry["sizeBytes"] for entry in doc["jobs"]}
-assert sizes["job-new"] > 0, sizes
 PY
 check "jobs directory is private" 700 "$(stat -c %a "$RDATA/jobs")"
 check "a job record is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/job.json")"
 check "a summary is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/summary.json")"
 check "a transcript is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/attempt-1/transcript.txt")"
+
+# A retry names the earlier dictation's recording as its own audio, so retention
+# must not remove a job whose audio a kept dictation still plays: doing so would
+# take Play and Retry away from a dictation inside the retention window, with no
+# failure reported anywhere.
+SDATA="$work/shared-recording"
+python3 - "$SDATA" <<'PY'
+import json, os, struct, sys, wave
+data = sys.argv[1]
+jobs = os.path.join(data, "jobs")
+for name, started in (("job-src", 1000), ("job-retry", 2000)):
+    job = os.path.join(jobs, name)
+    os.makedirs(os.path.join(job, "attempt-1"))
+    json.dump({"jobId": name, "mode": "record", "startedAt": started},
+              open(os.path.join(job, "job.json"), "w"))
+    json.dump({"outcome": "ok", "severity": "ok", "message": "done", "copyable": True},
+              open(os.path.join(job, "summary.json"), "w"))
+with wave.open(os.path.join(jobs, "job-src", "recording.wav"), "wb") as handle:
+    handle.setnchannels(1)
+    handle.setsampwidth(2)
+    handle.setframerate(16000)
+    handle.writeframes(struct.pack("<16000h", *([0] * 16000)))
+record = json.load(open(os.path.join(jobs, "job-retry", "job.json")))
+record["mode"] = "import"
+record["recording"] = os.path.join(jobs, "job-src", "recording.wav")
+record["retriesOf"] = "job-src"
+json.dump(record, open(os.path.join(jobs, "job-retry", "job.json"), "w"))
+PY
+run_into "$SDATA" job-third 2 >/dev/null
+check "retention keeps the audio a kept dictation still plays" True \
+  "$([[ -f "$SDATA/jobs/job-src/recording.wav" ]] && echo True || echo False)"
+out=$(python3 "$helper" history --data-dir "$SDATA")
+python3 - "$out" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+entry = next(item for item in doc["jobs"] if item["id"] == "job-retry")
+assert entry["recordingUsable"] is True and entry["recordingMessage"] == "", entry
+assert doc["retention"]["removed"] == [], doc["retention"]
+PY
+
+# The same guard on the manual path: a clear that keeps a dictation keeps the
+# recording that dictation names, even though it lives in another job's directory.
+python3 "$helper" clear --data-dir "$SDATA" --keep job-retry >/dev/null
+check "clearing keeps the recording of the job it kept" True \
+  "$([[ -f "$SDATA/jobs/job-src/recording.wav" ]] && echo True || echo False)"
+check "clearing removes the dictation nothing needs" False \
+  "$([[ -d "$SDATA/jobs/job-third" ]] && echo True || echo False)"
+
+# The pruning report describes the jobs the last pruning acted on, so clearing
+# those jobs has to drop it: a failure line must not name paths that are gone.
+PDATA="$work/clear-report"
+retention_fixtures "$PDATA" 2
+run_into "$PDATA" job-prune 1 >/dev/null
+check "the fixture left a pruning report" True "$([[ -f "$PDATA/retention.json" ]] && echo True || echo False)"
+python3 "$helper" clear --data-dir "$PDATA" >/dev/null
+check "clearing drops the pruning report" False "$([[ -f "$PDATA/retention.json" ]] && echo True || echo False)"
 
 # A successor whose own result never reached the disk has replaced nothing, so it
 # must not delete the older audio it was going to make room for.
