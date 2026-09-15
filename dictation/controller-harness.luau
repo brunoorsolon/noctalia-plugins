@@ -293,6 +293,39 @@ local EDITOR = activeWindow
 local historyJobs = {}
 local historyReads = 0
 local historyAccepted = true
+local historyStorage = nil
+local historyRetention = nil
+
+-- The maintenance commands the controller runs are recorded here, separate from
+-- the job launches, and answered with whatever the check has arranged. A
+-- destructive or exporting action must be visible as a helper invocation: the
+-- controller is not allowed to delete or write anything itself.
+local maintenanceLaunches = {}
+local maintenanceReplies = {}
+local MAINTENANCE = { "delete", "clear", "diagnostics", "export-diagnostics", "export-text" }
+
+local function maintenanceArgv(action)
+  for index = #maintenanceLaunches, 1, -1 do
+    if maintenanceLaunches[index][3] == action then return maintenanceLaunches[index] end
+  end
+  return nil
+end
+
+local function maintenanceCount(action)
+  local count = 0
+  for _, argv in ipairs(maintenanceLaunches) do
+    if argv[3] == action then count = count + 1 end
+  end
+  return count
+end
+
+local function maintenanceFlag(argv, flag)
+  if type(argv) ~= "table" then return nil end
+  for index, token in ipairs(argv) do
+    if token == flag then return argv[index + 1] end
+  end
+  return nil
+end
 
 -- Every helper invocation and every key injection the controller makes, in order.
 function noctalia.runAsync(argv, onResult)
@@ -302,11 +335,25 @@ function noctalia.runAsync(argv, onResult)
     if type(onResult) == "function" then
       onResult({
         exitCode = 0,
-        stdout = noctalia.json.encode({ ok = true, outcome = "ok", severity = "ok", message = "Found dictations.", jobs = historyJobs }),
+        stdout = noctalia.json.encode({ ok = true, outcome = "ok", severity = "ok", message = "Found dictations.", jobs = historyJobs, storage = historyStorage, retention = historyRetention }),
         stderr = "",
       })
     end
     return true
+  end
+  for _, action in ipairs(MAINTENANCE) do
+    if argv[3] == action then
+      table.insert(maintenanceLaunches, argv)
+      local reply = maintenanceReplies[action]
+      if reply == nil then
+        reply = { ok = true, outcome = action .. "_done", severity = "ok", message = action .. " done." }
+      end
+      if reply.silent then return true end
+      if type(onResult) == "function" then
+        onResult({ exitCode = reply.exitCode or 0, stdout = noctalia.json.encode(reply), stderr = "" })
+      end
+      return true
+    end
   end
   table.insert(launches, argv)
   -- The compositor is asked which window is focused, and it is handed the chord:
@@ -385,6 +432,8 @@ ui.spacer = function(props) return { kind = "spacer", props = props or {} } end
 ui.separator = function(props) return { kind = "separator", props = props or {} } end
 ui.select = function(props) return { kind = "select", props = props or {} } end
 ui.glyph = function(props) return { kind = "glyph", props = props or {} } end
+ui.scroll = function(props, children) return { kind = "scroll", props = props or {}, children = children } end
+ui.markdown = function(props) return { kind = "markdown", props = props or {} } end
 panel.render = function(tree) lastTree = tree end
 panel.close = function() end
 barWidget.render = function(tree) lastBarTree = tree end
@@ -643,7 +692,7 @@ check("recording job id", true, rec:match("^job%-%d") ~= nil)
 check("job pointer recorded", rec, fs["/data/current-job"])
 check(
   "record argv",
-  "python3,/plugin/dictation-helper.py,record,--engine,/bin/engine,--model,/models/a.gguf,--threads,4,--source,alsa_input.usb-mic,--job-id," .. rec .. ",--data-dir,/data",
+  "python3,/plugin/dictation-helper.py,record,--engine,/bin/engine,--model,/models/a.gguf,--threads,4,--source,alsa_input.usb-mic,--job-id," .. rec .. ",--data-dir,/data,--retention,10",
   lastLaunch()
 )
 check("recording path", jobDir(rec) .. "/recording.wav", state().recording.path)
@@ -707,7 +756,7 @@ local imported = state().job.id
 check("import activity", "running", state().activity)
 check(
   "import argv",
-  "python3,/plugin/dictation-helper.py,run,--engine,/bin/engine,--model,/models/a.gguf,--threads,4,--wav,/rec/one.wav,--job-id," .. imported .. ",--data-dir,/data",
+  "python3,/plugin/dictation-helper.py,run,--engine,/bin/engine,--model,/models/a.gguf,--threads,4,--wav,/rec/one.wav,--job-id," .. imported .. ",--data-dir,/data,--retention,10",
   lastLaunch()
 )
 check("each job gets its own directory", true, imported ~= rec)
@@ -733,8 +782,8 @@ command("retry")
 local retried = state().job.id
 check("retry runs again", "running", state().activity)
 check("retry uses the saved recording", jobDir(rec) .. "/recording.wav", launches[#launches][11])
-check("retry passes the flag as a flag", "--retries-of", launches[#launches][16])
-check("retry records the job it retried", rec, launches[#launches][17])
+check("retry passes the flag as a flag", "--retries-of", launches[#launches][18])
+check("retry records the job it retried", rec, launches[#launches][19])
 check("retry is its own job", true, retried ~= rec and retried ~= imported)
 finishSummary(retried, "cancelled", "cancelled", "Cancelled.", { recording = true })
 update()
@@ -910,7 +959,7 @@ mkdirFails = false
 
 local beforePanel = panelsOpened
 onOpen({})
-check("panel rendered", "column", lastTree.kind)
+check("panel rendered", "scroll", lastTree.kind)
 local picker = find(lastTree, "select")
 check("panel lists the microphones", 2, #picker.props.options)
 check("panel marks the chosen microphone", 1, picker.props.selectedIndex)
@@ -1022,7 +1071,7 @@ check("widget review tooltip", "The transcript was truncated.", barWidget.toolti
 onOpen({})
 check("panel shows the partial text", "partial text", find(lastTree, "input").props.value)
 check("panel review label", "The transcript was truncated.", find(lastTree, "label", "The transcript was truncated.").props.text)
-check("panel stays rendered", "column", lastTree.kind)
+check("panel stays rendered", "scroll", lastTree.kind)
 
 -- ── Delivery ─────────────────────────────────────────────────────────────────
 
@@ -2106,7 +2155,7 @@ local beforeRetry = jobLaunches()
 command("history-retry", { jobId = interruptedJob })
 check("a history retry starts one recognition job", beforeRetry + 1, jobLaunches())
 check("a history retry reads that dictation's recording", jobDir(interruptedJob) .. "/recording.wav", launches[#launches][11])
-check("a history retry records the dictation it retried", interruptedJob, launches[#launches][17])
+check("a history retry records the dictation it retried", interruptedJob, launches[#launches][19])
 check("a history retry leaves the original audio alone", "RIFF", fs[jobDir(interruptedJob) .. "/recording.wav"])
 check("the retry is its own job", true, state().job.id ~= interruptedJob)
 
@@ -2237,6 +2286,164 @@ check("a running job does not offer playback", false, findByHandler(lastTree, "o
 finishSummary(liveId, "ok", "ok", "Transcribed 2 words.", { transcript = "retried words", recording = jobDir(interruptedJob) .. "/recording.wav", copyable = true })
 update()
 check("the live job finishes", "idle", state().activity)
+
+-- ── Retention, deletion and diagnostics ─────────────────────────────────────
+
+-- The setting the panel describes is the number the helper prunes with, and a
+-- value outside the supported range is clamped instead of being passed through.
+local function startImport()
+  command("import")
+  local id = state().job.id
+  check("an import started for the retention check", true, type(id) == "string" and id ~= "")
+  return id
+end
+local function finishImport(id)
+  finishSummary(id, "ok", "ok", "Transcription complete.", { transcript = "kept words", copyable = true })
+  update()
+end
+local retentionCases = {
+  { 3, "3" },
+  { 1, "1" },
+  { 0, "1" },
+  { 5000, "1000" },
+  { "lots", "10" },
+}
+for _, case in ipairs(retentionCases) do
+  CONFIG.retention = case[1]
+  local id = startImport()
+  check(("retention %s reaches the helper"):format(tostring(case[1])), case[2], maintenanceFlag(launches[#launches], "--retention"))
+  finishImport(id)
+end
+CONFIG.retention = 10
+
+-- Deletion, clearing and exporting are the helper's work. The controller must
+-- never reach into the data directory itself: the host has no directory delete,
+-- and one process owns every decision about what this plugin may remove.
+command("history-delete-recording", { jobId = "job-panel" })
+check("deleting a recording runs the bundled helper", true, maintenanceArgv("delete") ~= nil)
+check("deleting a recording names the dictation", "job-panel", maintenanceFlag(maintenanceArgv("delete"), "--job-id"))
+check("deleting a recording says what to remove", "recording", maintenanceFlag(maintenanceArgv("delete"), "--what"))
+command("history-delete", { jobId = "job-panel" })
+check("deleting a dictation says what to remove", "dictation", maintenanceFlag(maintenanceArgv("delete"), "--what"))
+
+local liveImport = startImport()
+command("history-clear")
+check("clearing runs the bundled helper", 1, maintenanceCount("clear"))
+check("clearing keeps the job this session is still running", liveImport, maintenanceFlag(maintenanceArgv("clear"), "--keep"))
+finishImport(liveImport)
+
+historyJobs = {
+  {
+    id = "job-panel", mode = "record", timestamp = "2026-01-03 11:00", duration = "0:02",
+    state = "complete", outcome = "ok", severity = "ok", message = "Transcribed 2 words.",
+    attempts = 1, preview = "kept words", transcriptPath = "/data/jobs/job-panel/attempt-1/transcript.txt",
+    recordingPath = "/data/jobs/job-panel/recording.wav", recordingUsable = true, recordingMessage = "",
+    copyable = true, retriesOf = "", startedAtMs = 4000,
+  },
+  {
+    id = "job-audio-gone", mode = "record", timestamp = "2026-01-03 10:00", duration = "0:05",
+    state = "complete", outcome = "ok", severity = "ok", message = "Transcribed 2 words.",
+    attempts = 1, preview = "other words", transcriptPath = "/data/jobs/job-audio-gone/attempt-1/transcript.txt",
+    recordingPath = "", recordingUsable = false, recordingMessage = "That dictation has no saved recording to delete.",
+    copyable = true, retriesOf = "", startedAtMs = 3000,
+  },
+}
+historyStorage = { jobsBytes = 4096, jobsCount = 2, freeBytes = 1024 * 1024 * 1024 }
+historyRetention = { removed = {}, failures = {}, at = 0 }
+command("history-refresh")
+command("history-export-text", { jobId = "job-panel" })
+check("exporting text runs the bundled helper", 1, maintenanceCount("export-text"))
+check("exporting text names the saved transcript", "/data/jobs/job-panel/attempt-1/transcript.txt", maintenanceFlag(maintenanceArgv("export-text"), "--transcript"))
+
+onOpen({})
+check("the panel reports what the plugin stores", true, findText(lastTree, "Stored: 2 dictations") ~= nil)
+
+-- A destructive action is armed first: one stray click must not remove audio.
+onHistorySelected(0)
+local beforeDelete = maintenanceCount("delete")
+onHistoryDeleteRecording()
+check("deleting a recording waits for confirmation", beforeDelete, maintenanceCount("delete"))
+check("the recording confirmation says what survives", true, findText(lastTree, "The transcript and its attempt history stay") ~= nil)
+onHistoryCancel()
+check("cancelling sends nothing", beforeDelete, maintenanceCount("delete"))
+check("cancelling clears the confirmation", nil, findText(lastTree, "The transcript and its attempt history stay"))
+onHistoryDeleteRecording()
+onHistoryConfirm()
+check("confirming deletes the recording", "recording", maintenanceFlag(maintenanceArgv("delete"), "--what"))
+check("confirming deletes the selected dictation", "job-panel", maintenanceFlag(maintenanceArgv("delete"), "--job-id"))
+
+local beforeDictation = maintenanceCount("delete")
+onHistoryDeleteDictation()
+check("deleting a dictation waits for confirmation", beforeDictation, maintenanceCount("delete"))
+check("the dictation confirmation names everything it removes", true, findText(lastTree, "transcript and every attempt") ~= nil)
+onHistoryConfirm()
+check("confirming deletes the whole dictation", "dictation", maintenanceFlag(maintenanceArgv("delete"), "--what"))
+
+-- A dictation whose audio is gone offers neither delete-recording nor playback,
+-- and says why.
+onHistorySelected(1)
+check("deleting a missing recording is offered as unavailable", false, findByHandler(lastTree, "onHistoryDeleteRecording").props.enabled)
+check("a missing recording is explained in the panel", true, findText(lastTree, "no saved recording to delete") ~= nil)
+check("a whole dictation can still be deleted", true, findByHandler(lastTree, "onHistoryDeleteDictation") ~= nil)
+onHistorySelected(0)
+
+local beforeClear = maintenanceCount("clear")
+onHistoryClear()
+check("clearing waits for confirmation", beforeClear, maintenanceCount("clear"))
+check("the clear confirmation names what survives", true, findText(lastTree, "except work that is still running") ~= nil)
+onHistoryConfirm()
+check("confirming clears the history", beforeClear + 1, maintenanceCount("clear"))
+
+-- The text export is the selected dictation's own transcript.
+onHistorySelected(0)
+local beforeText = maintenanceCount("export-text")
+onHistoryExportText()
+check("the panel's text export runs the helper", beforeText + 1, maintenanceCount("export-text"))
+check("the panel's text export names the saved transcript", "/data/jobs/job-panel/attempt-1/transcript.txt", maintenanceFlag(maintenanceArgv("export-text"), "--transcript"))
+
+-- Diagnostics are opt-in, and nothing is exported until the reviewed text is
+-- confirmed. The preview is shown as read-only text so it cannot drift from the
+-- bytes the export copies.
+check("the panel collects no diagnostics on its own", 0, maintenanceCount("diagnostics"))
+check("the panel describes the opt-in collection", true, findText(lastTree, "Nothing is collected until you ask") ~= nil)
+onDiagnosticsExport()
+onDiagnosticsConfirm()
+check("an export before a preview sends nothing", 0, maintenanceCount("export-diagnostics"))
+check("an export before a preview says why", true, findText(lastTree, "review them before exporting") ~= nil)
+
+putFile("/data/diagnostics-preview.json", "{\n  \"format\": \"magus/dictation-diagnostics\"\n}\n")
+maintenanceReplies.diagnostics = {
+  ok = true, outcome = "ok", severity = "ok",
+  message = "Prepared diagnostics for review. Nothing was exported and nothing left this machine.",
+  previewPath = "/data/diagnostics-preview.json", previewBytes = 40, sha256 = "cafebabe", jobs = 2,
+}
+onDiagnosticsPreview()
+check("the preview runs the helper with the retention setting", "10", maintenanceFlag(maintenanceArgv("diagnostics"), "--retention"))
+check("the preview is read-only text", true, (function()
+  local node = find(lastTree, "markdown")
+  return node ~= nil and string.find(node.props.text, "magus/dictation-diagnostics", 1, true) ~= nil
+end)())
+maintenanceReplies["export-diagnostics"] = {
+  ok = true, outcome = "ok", severity = "ok", message = "Exported the exact diagnostics you previewed.",
+  exportPath = "/home/user/Downloads/dictation-diagnostics-1.json", bytes = 40, sha256 = "deadbeef",
+}
+local beforeExport = maintenanceCount("export-diagnostics")
+onDiagnosticsExport()
+check("exporting waits for confirmation", beforeExport, maintenanceCount("export-diagnostics"))
+check("the export confirmation says nothing leaves the machine", true, findText(lastTree, "Nothing leaves this machine") ~= nil)
+onDiagnosticsConfirm()
+check("confirming exports the reviewed preview", beforeExport + 1, maintenanceCount("export-diagnostics"))
+check("the export addresses the bytes that were reviewed", "cafebabe", maintenanceFlag(maintenanceArgv("export-diagnostics"), "--expect-hash"))
+check("the panel names where the export went", true, findText(lastTree, "/home/user/Downloads/dictation-diagnostics-1.json") ~= nil)
+
+-- A retention run that could not remove everything is a partial deletion, so it is
+-- reported next to the rows it left behind instead of only in a notification.
+historyRetention = { removed = {}, failures = { "/data/jobs/job-old (Permission denied)" }, at = 1234 }
+command("history-refresh")
+onOpen({})
+check("a retention failure stays visible in the panel", true, findText(lastTree, "could not remove some files") ~= nil)
+check("the helper's own report stays next to the history", true, findText(lastTree, "Exported the exact diagnostics you previewed.") ~= nil)
+onClose({})
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

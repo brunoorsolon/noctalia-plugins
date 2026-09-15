@@ -890,6 +890,334 @@ check "playback without a recording" missing_recording "$(printf '%s' "$out" | f
 out=$(PATH="$bare" python3 "$helper" play --wav "$data/jobs/job-rec/recording.wav" || true)
 check "pw-play missing" playback_unavailable "$(printf '%s' "$out" | field outcome)"
 
+# ── Retention, deletion, storage and diagnostics ─────────────────────────────
+
+# Only a finished dictation with a durable summary is a retention candidate, and
+# only behind a newer dictation that committed its own result. These fixtures are
+# written by hand, so "older" is a fact of the data rather than a race between
+# processes that all start inside the same second.
+retention_fixtures() { # retention_fixtures <data-dir> <finished-count>
+  python3 - "$1" "$2" <<'PY'
+import json, os, sys
+data, count = sys.argv[1], int(sys.argv[2])
+jobs = os.path.join(data, "jobs")
+def finished(name, started):
+    job = os.path.join(jobs, name)
+    os.makedirs(os.path.join(job, "attempt-1"))
+    recording = os.path.join(job, "recording.wav")
+    open(recording, "wb").write(b"RIFF0000WAVE")
+    json.dump({"jobId": name, "mode": "record", "startedAt": started, "recording": recording},
+              open(os.path.join(job, "job.json"), "w"))
+    open(os.path.join(job, "attempt-1", "transcript.txt"), "w").write("kept text %s\n" % name)
+    json.dump({"outcome": "ok", "severity": "ok", "message": "done", "copyable": True},
+              open(os.path.join(job, "summary.json"), "w"))
+def unfinished(name, started, severity):
+    job = os.path.join(jobs, name)
+    os.makedirs(job)
+    json.dump({"jobId": name, "mode": "record", "startedAt": started},
+              open(os.path.join(job, "job.json"), "w"))
+    if severity:
+        json.dump({"outcome": "failed", "severity": severity, "message": "failed", "copyable": False},
+                  open(os.path.join(job, "summary.json"), "w"))
+for index in range(1, count + 1):
+    finished("job-fin-%d" % index, index * 1000)
+unfinished("job-broken", 60000, None)
+unfinished("job-failed", 70000, "error")
+PY
+}
+
+run_into() { # run_into <data-dir> <job-id> [retention]
+  local extra=()
+  if [[ -n "${3:-}" ]]; then extra=(--retention "$3"); fi
+  RECORD= python3 "$helper" run --engine "$engine" --model "$MODEL" --threads "$THREADS" \
+    --wav "$work/good.wav" --job-id "$2" --data-dir "$1" --timeout "$TIMEOUT" "${extra[@]}"
+}
+
+RDATA="$work/retention"
+retention_fixtures "$RDATA" 5
+run_into "$RDATA" job-new 3 >/dev/null
+python3 - "$RDATA" <<'PY'
+import json, os, sys
+data = sys.argv[1]
+jobs = os.path.join(data, "jobs")
+kept = {name for name in os.listdir(jobs)}
+assert "job-new" in kept, kept
+assert "job-fin-4" in kept and "job-fin-5" in kept, kept
+for old in ("job-fin-1", "job-fin-2", "job-fin-3"):
+    assert old not in kept, kept
+# Unfinished work is not a successor and never a candidate: a failed or
+# interrupted dictation is kept until the user deletes it.
+assert "job-broken" in kept and "job-failed" in kept, kept
+record = json.load(open(os.path.join(data, "retention.json")))
+assert sorted(record["removed"]) == ["job-fin-1", "job-fin-2", "job-fin-3"], record
+assert record["failures"] == [], record
+PY
+out=$(python3 "$helper" history --data-dir "$RDATA")
+python3 - "$out" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+assert doc["storage"]["jobsCount"] == 5, doc["storage"]
+assert doc["storage"]["jobsBytes"] > 0, doc["storage"]
+assert sorted(doc["retention"]["removed"]) == ["job-fin-1", "job-fin-2", "job-fin-3"], doc["retention"]
+sizes = {entry["id"]: entry["sizeBytes"] for entry in doc["jobs"]}
+assert sizes["job-new"] > 0, sizes
+PY
+check "jobs directory is private" 700 "$(stat -c %a "$RDATA/jobs")"
+check "a job record is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/job.json")"
+check "a summary is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/summary.json")"
+check "a transcript is private" 600 "$(stat -c %a "$RDATA/jobs/job-new/attempt-1/transcript.txt")"
+
+# A successor whose own result never reached the disk has replaced nothing, so it
+# must not delete the older audio it was going to make room for.
+CDATA="$work/commit-failure"
+retention_fixtures "$CDATA" 2
+mkdir -p "$CDATA/jobs/job-commit/summary.json"
+run_into "$CDATA" job-commit 1 >/dev/null || true
+check "a failed commit removes nothing" True \
+  "$([[ -d "$CDATA/jobs/job-fin-1" && -d "$CDATA/jobs/job-fin-2" ]] && echo True || echo False)"
+check "a failed commit records no pruning" False "$([[ -f "$CDATA/retention.json" ]] && echo True || echo False)"
+
+# Deleting a recording keeps the transcript and the attempts, and never reaches an
+# imported file or the dictation a retry read from.
+DDATA="$work/deleting"
+python3 - "$DDATA" <<'PY'
+import json, os, sys
+jobs = os.path.join(sys.argv[1], "jobs")
+def base(name, started, extra):
+    job = os.path.join(jobs, name)
+    os.makedirs(os.path.join(job, "attempt-1"))
+    open(os.path.join(job, "attempt-1", "transcript.txt"), "w").write("text %s\n" % name)
+    record = {"jobId": name, "mode": "record", "startedAt": started}
+    record.update(extra(job))
+    json.dump(record, open(os.path.join(job, "job.json"), "w"))
+    json.dump({"outcome": "ok", "severity": "ok", "message": "done", "copyable": True},
+              open(os.path.join(job, "summary.json"), "w"))
+def recorded(job):
+    path = os.path.join(job, "recording.wav")
+    open(path, "wb").write(b"RIFF0000WAVE")
+    return {"recording": path}
+base("job-recorded", 3000, recorded)
+base("job-imported", 2000, lambda job: {})
+base("job-retried", 1000, lambda job: {"recording": os.path.join(jobs, "job-recorded", "recording.wav")})
+PY
+out=$(python3 "$helper" delete --what recording --job-id job-imported --data-dir "$DDATA" || true)
+check "an imported dictation owns no recording" not_owned "$(printf '%s' "$out" | field outcome)"
+check "the imported dictation is untouched" True "$([[ -f "$DDATA/jobs/job-imported/job.json" ]] && echo True || echo False)"
+out=$(python3 "$helper" delete --what recording --job-id job-retried --data-dir "$DDATA" || true)
+check "a retry does not delete the recording it read" not_owned "$(printf '%s' "$out" | field outcome)"
+check "the retried recording survives" True "$([[ -f "$DDATA/jobs/job-recorded/recording.wav" ]] && echo True || echo False)"
+out=$(python3 "$helper" delete --what recording --job-id job-recorded --data-dir "$DDATA")
+check "delete recording outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "the recording is gone" False "$([[ -e "$DDATA/jobs/job-recorded/recording.wav" ]] && echo True || echo False)"
+check "the transcript is kept" True "$([[ -f "$DDATA/jobs/job-recorded/attempt-1/transcript.txt" ]] && echo True || echo False)"
+check "the summary is kept" True "$([[ -f "$DDATA/jobs/job-recorded/summary.json" ]] && echo True || echo False)"
+out=$(python3 "$helper" history --data-dir "$DDATA")
+python3 - "$out" <<'PY'
+import json, sys
+entry = next(item for item in json.loads(sys.argv[1])["jobs"] if item["id"] == "job-recorded")
+# The row survives with its text, and playback and Retry are refused by the same
+# missing-audio check the panel reads; nothing has to remember the deletion.
+assert entry["state"] == "complete" and entry["outcome"] == "ok", entry
+assert entry["recordingUsable"] is False, entry
+assert entry["transcriptPath"].endswith("transcript.txt"), entry
+assert "no longer" in entry["recordingMessage"] or "not" in entry["recordingMessage"], entry
+PY
+out=$(python3 "$helper" delete --what dictation --job-id job-recorded --data-dir "$DDATA")
+check "delete dictation outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "the dictation is gone" False "$([[ -e "$DDATA/jobs/job-recorded" ]] && echo True || echo False)"
+
+# A crafted name, an out-of-tree link and a link inside a job are all refused: no
+# path this plugin did not write is ever removed.
+SDATA="$work/owned-data"
+outside="$work/outside"
+mkdir -p "$SDATA/jobs" "$outside/jobs"
+printf 'precious\n' >"$outside/jobs/precious.txt"
+ln -s "$outside/jobs" "$SDATA/jobs/job-escape"
+python3 - "$SDATA" "$outside" <<'PY'
+import json, os, sys
+data, outside = sys.argv[1], sys.argv[2]
+job = os.path.join(data, "jobs", "job-linked")
+os.makedirs(job)
+json.dump({"jobId": "job-linked", "mode": "record", "startedAt": 1000},
+          open(os.path.join(job, "job.json"), "w"))
+os.symlink(os.path.join(outside, "jobs", "precious.txt"), os.path.join(job, "sneak"))
+PY
+for name in "../escape" "sub/job" ""; do
+  out=$(python3 "$helper" delete --what dictation --job-id "$name" --data-dir "$SDATA" || true)
+  check "a name this plugin did not write is refused ($name)" not_owned "$(printf '%s' "$out" | field outcome)"
+done
+out=$(python3 "$helper" delete --what dictation --job-id job-escape --data-dir "$SDATA" || true)
+check "a linked job directory is refused" not_owned "$(printf '%s' "$out" | field outcome)"
+check "files outside the data directory survive" True "$([[ -f "$outside/jobs/precious.txt" ]] && echo True || echo False)"
+out=$(python3 "$helper" delete --what dictation --job-id job-linked --data-dir "$SDATA")
+check "deleting a linked job succeeds" ok "$(printf '%s' "$out" | field outcome)"
+check "a link inside a job does not reach through" True "$([[ -f "$outside/jobs/precious.txt" ]] && echo True || echo False)"
+check "the link itself is gone" False "$([[ -e "$SDATA/jobs/job-linked/sneak" ]] && echo True || echo False)"
+
+# Clear removes what this plugin owns and explicitly keeps live work: the running
+# helper and the job the controller names are both left alone.
+KDATA="$work/clearing"
+mkdir -p "$KDATA/jobs" "$KDATA/jobs/job-a" "$KDATA/jobs/job-b" "$KDATA/jobs/job-c"
+printf 'job-b\n' >"$KDATA/current-job"
+python3 - "$KDATA" <<'PY'
+import json, os, sys
+for index, name in enumerate(("job-a", "job-b", "job-c"), start=1):
+    json.dump({"jobId": name, "mode": "record", "startedAt": index * 1000},
+              open(os.path.join(sys.argv[1], "jobs", name, "job.json"), "w"))
+PY
+out=$(python3 "$helper" clear --data-dir "$KDATA" --keep job-c)
+check "clear outcome" cleared "$(printf '%s' "$out" | field outcome)"
+check "clear removed the idle dictation" False "$([[ -d "$KDATA/jobs/job-a" ]] && echo True || echo False)"
+check "clear kept the claimed dictation" True "$([[ -d "$KDATA/jobs/job-b" ]] && echo True || echo False)"
+check "clear kept the named dictation" True "$([[ -d "$KDATA/jobs/job-c" ]] && echo True || echo False)"
+python3 - "$out" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+assert doc["removed"] == ["job-a"], doc
+assert sorted(doc["kept"]) == ["job-b", "job-c"], doc
+PY
+python3 -c 'import time; time.sleep(30)' --job-id job-live-clear &
+live_pid=$!
+mkdir -p "$KDATA/jobs/job-live-clear"
+sleep 0.5
+out=$(python3 "$helper" clear --data-dir "$KDATA")
+check "clear keeps a running helper's own job" True "$([[ -d "$KDATA/jobs/job-live-clear" ]] && echo True || echo False)"
+python3 - "$out" <<'PY'
+import json, sys
+doc = json.loads(sys.argv[1])
+assert "job-live-clear" in doc["kept"], doc
+assert doc["removed"] == ["job-c"], doc
+PY
+kill "$live_pid" 2>/dev/null || true
+wait "$live_pid" 2>/dev/null || true
+
+# A removal that could not finish leaves the dictation listed, so a partial
+# deletion stays visible and can be retried instead of silently vanishing.
+if [[ "$(id -u)" != "0" ]]; then
+  PDATA="$work/partial"
+  mkdir -p "$PDATA/jobs/job-partial/attempt-1"
+  printf 'text\n' >"$PDATA/jobs/job-partial/attempt-1/transcript.txt"
+  printf '{"jobId":"job-partial","startedAt":1000}\n' >"$PDATA/jobs/job-partial/job.json"
+  chmod 000 "$PDATA/jobs/job-partial/attempt-1"
+  out=$(python3 "$helper" delete --what dictation --job-id job-partial --data-dir "$PDATA" || true)
+  chmod 700 "$PDATA/jobs/job-partial/attempt-1"
+  check "a partial delete is reported" delete_partial "$(printf '%s' "$out" | field outcome)"
+  check "a partial delete names what survived" True \
+    "$(grep -q 'attempt-1' <<<"$(printf '%s' "$out" | field message)" && echo True || echo False)"
+  check "the surviving file is still there" True "$([[ -f "$PDATA/jobs/job-partial/attempt-1/transcript.txt" ]] && echo True || echo False)"
+  check "the partial dictation stays listed" True \
+    "$(python3 "$helper" history --data-dir "$PDATA" | grep -q job-partial && echo True || echo False)"
+else
+  echo "note: running as root; the permission-denied deletion check was skipped"
+fi
+
+# Diagnostics are opt-in, bounded and redacted: the export contains this plugin's
+# own metadata, never speech, transcript text, raw recognition output or the
+# paths of the files the user chose.
+XDATA="$work/diagnostics"
+python3 - "$XDATA" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+secret = "SENTINEL-SPEECH-9f3a"
+job = os.path.join(root, "jobs", "job-secret")
+os.makedirs(os.path.join(job, "attempt-1"))
+open(os.path.join(job, "recording.wav"), "wb").write(b"RIFFsecret")
+json.dump({"jobId": "job-secret", "mode": "record", "startedAt": 1234,
+           "recording": os.path.join(job, "recording.wav"),
+           "engine": "/home/someone/PRIVATE-PATH-4b7c/engine",
+           "model": "/home/someone/PRIVATE-PATH-4b7c/model.gguf"},
+          open(os.path.join(job, "job.json"), "w"))
+open(os.path.join(job, "attempt-1", "transcript.txt"), "w").write(secret + "\n")
+open(os.path.join(job, "attempt-1", "engine.jsonl"), "w").write(json.dumps({"text": secret}) + "\n")
+open(os.path.join(job, "attempt-1", "engine.log"), "w").write("log " + secret + "\n")
+# The panel keeps the engine's own output on a failure; the export must not.
+json.dump({"outcome": "nonzero_exit", "severity": "error",
+           "diagnosticMessage": "The engine exited with status 1 before producing a result.",
+           "message": "The engine exited with status 1 before producing a result. Engine output: " + secret,
+           "copyable": False},
+          open(os.path.join(job, "summary.json"), "w"))
+# A job written before the engine's half was kept apart still has it inside its
+# message, so an old error is reported without any message at all.
+old = os.path.join(root, "jobs", "job-old-error")
+os.makedirs(old)
+json.dump({"jobId": "job-old-error", "mode": "import", "startedAt": 1234},
+          open(os.path.join(old, "job.json"), "w"))
+json.dump({"outcome": "per_file_error", "severity": "error",
+           "message": "The engine reported: " + secret, "copyable": False},
+          open(os.path.join(old, "summary.json"), "w"))
+PY
+out=$(python3 "$helper" export-diagnostics --data-dir "$XDATA" --out "$work/none.json" || true)
+check "an export before the preview is refused" no_preview "$(printf '%s' "$out" | field outcome)"
+check "a refused export writes nothing" False "$([[ -e "$work/none.json" ]] && echo True || echo False)"
+out=$(python3 "$helper" diagnostics --data-dir "$XDATA" --retention 5)
+check "diagnostics outcome" ok "$(printf '%s' "$out" | field outcome)"
+preview=$(printf '%s' "$out" | field previewPath)
+digest=$(printf '%s' "$out" | field sha256)
+check "the preview is written" True "$([[ -f "$preview" ]] && echo True || echo False)"
+check "the preview is private" 600 "$(stat -c %a "$preview")"
+for sentinel in "SENTINEL-SPEECH-9f3a" "PRIVATE-PATH-4b7c"; do
+  check "diagnostics omit $sentinel" False "$(grep -q "$sentinel" "$preview" && echo True || echo False)"
+done
+python3 - "$preview" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+assert doc["format"] == "magus/dictation-diagnostics" and doc["version"] == 1, doc
+entries = {entry["id"]: entry for entry in doc["jobs"]}
+entry = entries["job-secret"]
+# The plugin's own sentence survives; the engine's half of the same message is cut.
+assert entry["message"] == "The engine exited with status 1 before producing a result.", entry
+assert entry["transcriptChars"] == len("SENTINEL-SPEECH-9f3a") + 1, entry
+assert entry["recordingBytes"] == len(b"RIFFsecret"), entry
+assert entries["job-old-error"]["message"] == "", entries["job-old-error"]
+assert doc["storage"]["jobsCount"] == 2, doc["storage"]
+for phrase in ("audio recordings", "transcripts and transcript previews", "raw recognition logs", "environment variables"):
+    assert phrase in doc["excluded"], doc["excluded"]
+PY
+
+# The export addresses the bytes that were reviewed: a preview that changed
+# after the review is refused rather than exported in its place.
+check "a changed preview is not exported" preview_changed \
+  "$(python3 "$helper" export-diagnostics --data-dir "$XDATA" --out "$work/changed.json" --expect-hash 0000 | field outcome)"
+check "a refused changed export writes nothing" False "$([[ -e "$work/changed.json" ]] && echo True || echo False)"
+
+# The export is the preview: same bytes, a private file, and a destination
+# directory whose own permissions are never changed.
+mkdir -p "$work/exports"
+chmod 755 "$work/exports"
+out=$(python3 "$helper" export-diagnostics --data-dir "$XDATA" --out "$work/exports/diagnostics.json" --expect-hash "$digest")
+check "export outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "the export is the reviewed preview" "" "$(cmp "$preview" "$work/exports/diagnostics.json" 2>&1 || true)"
+check "the export file is private" 600 "$(stat -c %a "$work/exports/diagnostics.json")"
+check "the export leaves its directory alone" 755 "$(stat -c %a "$work/exports")"
+check "the export reports the bytes it wrote" "$(stat -c %s "$work/exports/diagnostics.json")" "$(printf '%s' "$out" | field bytes)"
+check "the export reports the hash of those bytes" \
+  "$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$work/exports/diagnostics.json")" \
+  "$(printf '%s' "$out" | field sha256)"
+
+# With no destination named the export picks one in the user's home and still
+# leaves that directory's permissions untouched.
+mkdir -p "$work/home/Downloads"
+chmod 755 "$work/home/Downloads"
+out=$(HOME="$work/home" python3 "$helper" export-diagnostics --data-dir "$XDATA")
+check "the default export uses Downloads" "$work/home/Downloads" "$(dirname "$(printf '%s' "$out" | field exportPath)")"
+check "the default destination keeps its permissions" 755 "$(stat -c %a "$work/home/Downloads")"
+
+# A text export is a faithful copy of the saved transcript and pastes nothing.
+out=$(python3 "$helper" export-text --data-dir "$XDATA" \
+  --transcript "$XDATA/jobs/job-secret/attempt-1/transcript.txt" --out "$work/exports/text.txt")
+check "text export outcome" ok "$(printf '%s' "$out" | field outcome)"
+check "text export is faithful" "" \
+  "$(cmp "$XDATA/jobs/job-secret/attempt-1/transcript.txt" "$work/exports/text.txt" 2>&1 || true)"
+check "text export is private" 600 "$(stat -c %a "$work/exports/text.txt")"
+check "text export pastes nothing" True "$(grep -q 'Nothing was pasted' <<<"$(printf '%s' "$out" | field message)" && echo True || echo False)"
+out=$(python3 "$helper" export-text --data-dir "$XDATA" --transcript "$work/good.wav" --out "$work/exports/escape.txt" || true)
+check "a transcript outside the data directory is refused" not_owned "$(printf '%s' "$out" | field outcome)"
+ln -s "$outside/jobs/precious.txt" "$XDATA/jobs/job-secret/attempt-1/link.txt"
+out=$(python3 "$helper" export-text --data-dir "$XDATA" \
+  --transcript "$XDATA/jobs/job-secret/attempt-1/link.txt" --out "$work/exports/link.txt" || true)
+check "a linked transcript is refused" not_owned "$(printf '%s' "$out" | field outcome)"
+check "nothing was written for a refused transcript" False "$([[ -e "$work/exports/escape.txt" || -e "$work/exports/link.txt" ]] && echo True || echo False)"
+
 # The controller drives this helper, so the options and subcommands it passes
 # must be the ones the helper actually defines. Without this, the two sides can
 # drift apart and their separate checks still pass.
@@ -897,17 +1225,21 @@ python3 - "$helper" controller.luau <<'PY'
 import re, subprocess, sys
 
 helper, controller = sys.argv[1], sys.argv[2]
+top = subprocess.run(["python3", helper, "--help"], stdout=subprocess.PIPE).stdout.decode()
+listed = re.search(r"\{([a-z0-9,\-]+)\}", top)
+commands = set(listed.group(1).split(",")) if listed else set()
+assert commands, "helper defines no subcommands: %r" % top
 defined = set()
-for command in ("probe", "sources", "record", "run", "play", "history"):
+for command in sorted(commands):
     usage = subprocess.run(["python3", helper, command, "--help"], stdout=subprocess.PIPE).stdout.decode()
     defined.update(re.findall(r"--[a-z][a-z-]*", usage))
 source = open(controller).read()
 passed = set(re.findall(r'"(--[a-z][a-z-]*)"', source))
-commands = set(re.findall(r'HELPER,\s*"([a-z]+)"', source))
-assert commands, "no helper command found in controller.luau"
-unknown = sorted(commands - {"probe", "sources", "record", "run", "play", "history"})
+ran = set(re.findall(r'HELPER,\s*"([a-z-]+)"', source)) | set(re.findall(r'runHelperMaintenance\("([a-z-]+)"', source))
+assert ran, "no helper command found in controller.luau"
+unknown = sorted(ran - commands)
 assert not unknown, "controller runs unknown helper commands: %r" % unknown
-assert {"record", "sources", "run", "play", "history"} <= commands, sorted(commands)
+assert {"record", "sources", "run", "play", "history", "delete", "clear", "diagnostics"} <= ran, sorted(ran)
 missing = sorted(passed - defined)
 assert not missing, "controller passes options the helper does not define: %r" % missing
 assert passed, "no helper option found in controller.luau"

@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,6 +47,9 @@ NICE = 10
 PR_SET_PDEATHSIG = 1  # Linux prctl option: signal the child when its parent dies
 CONTROL_TOKEN = re.compile(r"<\|[^|>]*\|>")
 TRUNCATION_MARK = "truncat"
+# Everything after this mark is the engine's own output: the panel shows it, the
+# diagnostics export never does. Recognised speech and user paths live in there.
+ENGINE_NOTE_MARK = " Engine output: "
 SAFE_ID = re.compile(r"[^A-Za-z0-9._-]")
 
 # Recording is fixed to the format the engine and the plugin validate: a real
@@ -66,6 +70,21 @@ MONITOR_SUFFIX = ".monitor"
 MONITOR_PREFIX = "monitor of "
 HISTORY_LIMIT = 20  # the newest jobs the history interface offers
 HISTORY_PREVIEW_CHARS = 120
+# Every job directory is named by this plugin and sits directly under jobs/, so a
+# deletion target that does not match is not this plugin's to remove.
+JOB_NAME = re.compile(r"^job-[A-Za-z0-9._-]+$")
+# Retention counts finished dictations. A job that produced a result the plugin
+# can show is finished; a failed, interrupted or recoverable cancelled job is not,
+# and is only ever removed when the user asks for it.
+COMPLETED_SEVERITIES = ("ok", "review")
+DEFAULT_RETENTION = 10
+# Diagnostics are metadata about this plugin's own job directories, never the
+# recognised speech, the raw engine output or anything outside the data directory.
+DIAGNOSTIC_FORMAT = "magus/dictation-diagnostics"
+DIAGNOSTIC_VERSION = 1
+DIAGNOSTIC_PREVIEW_NAME = "diagnostics-preview.json"
+DIAGNOSTIC_MESSAGE_CHARS = 200
+EXPORT_PREFIX = "dictation"
 
 # Set per command; every verdict is mirrored here so the plugin, which launches
 # this helper detached, can read the outcome instead of a short-lived callback.
@@ -86,11 +105,17 @@ def verdict(outcome, severity, message, **extra):
 
 
 def emit(payload):
+    """Report an outcome, and say whether its durable summary was committed.
+
+    Retention runs on that answer alone: pruning older audio for a successor
+    whose own result never reached the disk would hide the newer dictation and
+    delete the older one for nothing.
+    """
     line = json.dumps(payload)
     sys.stdout.write(line + "\n")
     sys.stdout.flush()
     if not SUMMARY_PATH:
-        return
+        return True
     try:
         private_dir(os.path.dirname(SUMMARY_PATH))
         temporary = SUMMARY_PATH + ".tmp"
@@ -98,7 +123,8 @@ def emit(payload):
         os.replace(temporary, SUMMARY_PATH)
     except OSError:
         # The plugin keeps its own stall guard; the verdict on stdout is what matters.
-        pass
+        return False
+    return True
 
 
 def sha256_file(path):
@@ -395,6 +421,10 @@ def job_process_running(job_id):
     for entry in entries:
         if not entry.isdigit():
             continue
+        # A maintenance command carries the id it was asked to act on, so this
+        # process would otherwise match itself and refuse to touch anything.
+        if int(entry) == os.getpid():
+            continue
         try:
             with open(os.path.join("/proc", entry, "cmdline"), "rb") as handle:
                 argv = handle.read().decode("utf-8", "replace").split("\0")
@@ -404,6 +434,18 @@ def job_process_running(job_id):
             if token == "--job-id" and index + 1 < len(argv) and argv[index + 1] == job_id:
                 return True
     return False
+
+
+def tree_size(path):
+    """Bytes this plugin's own tree occupies, never following a link out of it."""
+    total = 0
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                total += os.stat(os.path.join(root, name), follow_symlinks=False).st_size
+            except OSError:
+                pass
+    return total
 
 
 def job_entry(name, job_dir):
@@ -492,6 +534,7 @@ def job_entry(name, job_dir):
         "recordingUsable": problem is None,
         "recordingMessage": "" if problem is None else problem,
         "copyable": copyable,
+        "sizeBytes": tree_size(job_dir),
     }
 
 
@@ -527,7 +570,605 @@ def command_history(args):
         message += " One was interrupted."
     elif interrupted > 1:
         message += " %d were interrupted." % interrupted
-    verdict("ok", "ok", message, jobs=jobs)
+    verdict("ok", "ok", message, jobs=jobs, storage=storage_summary(args.data_dir), retention=last_prune(args.data_dir))
+
+
+# ── Retention, deletion and export ───────────────────────────────────────────
+#
+# The plugin's own data directory is the only thing these commands may touch.
+# Every path is rebuilt from the data directory and a job name this plugin
+# writes, checked to be a direct child of jobs/, and then removed without ever
+# following a symlink, so a link or a crafted name cannot reach an engine, a
+# model, a benchmark recording or a home file.
+
+
+def jobs_dir_for(data_dir):
+    return os.path.join(os.path.abspath(data_dir), "jobs")
+
+
+def owned_job_dir(data_dir, job_id):
+    """A job directory this plugin owns, or (None, reason) for anything else."""
+    name = job_id if isinstance(job_id, str) else ""
+    if not JOB_NAME.match(name) or ".." in name:
+        return None, "That is not a dictation this plugin owns, so nothing was deleted."
+    jobs_dir = jobs_dir_for(data_dir)
+    candidate = os.path.join(jobs_dir, name)
+    if os.path.islink(candidate):
+        return None, "That dictation's directory is a link, so it was left alone."
+    if os.path.dirname(os.path.realpath(candidate)) != os.path.realpath(jobs_dir):
+        return None, "That dictation is outside the plugin's own data directory, so it was left alone."
+    if not os.path.isdir(candidate):
+        return None, "That dictation is no longer on disk."
+    return candidate, None
+
+
+def remove_tree(root):
+    """Remove a directory tree without ever entering a symlink.
+
+    A link inside the tree is unlinked as a link, so it can never reach the file
+    or directory it names. Returns the paths that survived.
+    """
+    failures = []
+
+    def remove(path):
+        try:
+            entries = list(os.scandir(path))
+        except OSError as exc:
+            failures.append("%s (%s)" % (path, exc.strerror or exc))
+            return
+        for entry in entries:
+            target = entry.path
+            try:
+                if entry.is_symlink():
+                    os.unlink(target)
+                elif entry.is_dir(follow_symlinks=False):
+                    remove(target)
+                    os.rmdir(target)
+                else:
+                    os.unlink(target)
+            except OSError as exc:
+                failures.append("%s (%s)" % (target, exc.strerror or exc))
+
+    remove(root)
+    try:
+        os.rmdir(root)
+    except OSError as exc:
+        failures.append("%s (%s)" % (root, exc.strerror or exc))
+    return failures
+
+
+def forget_sidecars(jobs_dir, name):
+    for suffix in (".stop", ".cancel", ".lease"):
+        path = os.path.join(jobs_dir, name + suffix)
+        if os.path.lexists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def current_job_id(data_dir):
+    """The job the controller last claimed, as the plain string it writes."""
+    try:
+        with open(os.path.join(os.path.abspath(data_dir), "current-job"), "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def job_is_live(name, data_dir, keep):
+    """Work this plugin must not delete: a live helper, the claimed job, a kept one."""
+    return name in keep or name == current_job_id(data_dir) or job_process_running(name)
+
+
+def forget_last_recording(data_dir, removed_prefix):
+    """Drop the playback pointer once the recording it named is gone."""
+    path = os.path.join(os.path.abspath(data_dir), "last-recording")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            named = handle.read().strip()
+    except OSError:
+        return
+    if named == "" or named.startswith(removed_prefix) or not os.path.isfile(named):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def completed_names(data_dir):
+    """Owned job directories that finished with a result, newest first."""
+    jobs_dir = jobs_dir_for(data_dir)
+    try:
+        names = os.listdir(jobs_dir)
+    except OSError:
+        return []
+    finished = []
+    for name in names:
+        if not JOB_NAME.match(name):
+            continue
+        job_dir = os.path.join(jobs_dir, name)
+        if os.path.islink(job_dir) or not os.path.isdir(job_dir):
+            continue
+        summary = read_json_file(os.path.join(job_dir, "summary.json"))
+        if not isinstance(summary, dict) or summary.get("severity") not in COMPLETED_SEVERITIES:
+            continue
+        job = read_json_file(os.path.join(job_dir, "job.json")) or {}
+        started = job.get("startedAt")
+        finished.append((int(started) if isinstance(started, (int, float)) else 0, name))
+    finished.sort(reverse=True)
+    return [name for _started, name in finished]
+
+
+def retention_path(data_dir):
+    return os.path.join(os.path.abspath(data_dir), "retention.json")
+
+
+def last_prune(data_dir):
+    """The last automatic pruning, so a partial failure stays visible."""
+    record = read_json_file(retention_path(data_dir))
+    if not isinstance(record, dict):
+        return {"removed": [], "failures": [], "at": 0}
+    return {
+        "removed": record.get("removed") if isinstance(record.get("removed"), list) else [],
+        "failures": record.get("failures") if isinstance(record.get("failures"), list) else [],
+        "at": record.get("at") if isinstance(record.get("at"), (int, float)) else 0,
+    }
+
+
+def prune_jobs(data_dir, retention, keep=None):
+    """Delete finished dictations beyond the retention count.
+
+    Called only after a successor's own result was committed. Only a finished job
+    with a durable summary is a candidate, so a running, failed, interrupted or
+    recoverable cancelled job is never silently removed, and a live job is
+    skipped even when it is old.
+    """
+    keep = set(keep or [])
+    result = {"removed": [], "failures": []}
+    retention = int(retention)
+    if retention < 1:
+        return result
+    jobs_dir = jobs_dir_for(data_dir)
+    for index, name in enumerate(completed_names(data_dir)):
+        if index < retention:
+            continue
+        if job_is_live(name, data_dir, keep):
+            continue
+        job_dir, problem = owned_job_dir(data_dir, name)
+        if problem:
+            result["failures"].append("%s (%s)" % (name, problem))
+            continue
+        failures = remove_owned_job(job_dir)
+        forget_sidecars(jobs_dir, name)
+        if failures:
+            result["failures"].extend(failures)
+            continue
+        forget_last_recording(data_dir, job_dir + os.sep)
+        result["removed"].append(name)
+    if result["removed"] or result["failures"]:
+        atomic_write(
+            retention_path(data_dir),
+            json.dumps({"at": int(time.time()), "removed": result["removed"], "failures": result["failures"][:20]}) + "\n",
+        )
+    return result
+
+
+def storage_summary(data_dir):
+    """How much the plugin's own data occupies, and how much disk is left."""
+    jobs_dir = jobs_dir_for(data_dir)
+    try:
+        names = os.listdir(jobs_dir)
+    except OSError:
+        names = []
+    total, count = 0, 0
+    for name in names:
+        if not JOB_NAME.match(name):
+            continue
+        job_dir = os.path.join(jobs_dir, name)
+        if os.path.islink(job_dir) or not os.path.isdir(job_dir):
+            continue
+        total += tree_size(job_dir)
+        count += 1
+    try:
+        free = shutil.disk_usage(os.path.abspath(data_dir)).free
+    except OSError:
+        free = None
+    return {"jobsBytes": total, "jobsCount": count, "freeBytes": free}
+
+
+def owned_recording(data_dir, job_id):
+    """The one recording file this job owns, or (None, reason)."""
+    job_dir, problem = owned_job_dir(data_dir, job_id)
+    if problem:
+        return None, problem
+    job = read_json_file(os.path.join(job_dir, "job.json")) or {}
+    candidate = job.get("recording")
+    if not isinstance(candidate, str) or candidate == "":
+        return None, "This dictation has no recording the plugin owns: the audio is the file you imported, so it was left alone."
+    if os.path.basename(candidate) != "recording.wav":
+        return None, "This dictation's recording is not a file the plugin owns, so it was left alone."
+    # A retry reads an earlier dictation's recording, so the file has to be in
+    # this job's own directory before this job may delete it.
+    if os.path.islink(candidate) or os.path.realpath(os.path.dirname(candidate)) != os.path.realpath(job_dir):
+        return None, "This dictation's recording belongs to another dictation, so it was left alone."
+    if not os.path.isfile(candidate):
+        return None, "That dictation has no saved recording to delete."
+    return candidate, None
+
+
+def remove_owned_job(job_dir):
+    """Remove one owned job directory, keeping its record if anything survived.
+
+    A partial removal that also deleted job.json would drop the dictation from the
+    history while its files were still on disk, and the user could neither see nor
+    retry it. The record is rewritten on failure so the row stays where it was.
+    """
+    job_file = os.path.join(job_dir, "job.json")
+    try:
+        with open(job_file, "rb") as handle:
+            job_bytes = handle.read()
+    except OSError:
+        job_bytes = None
+    failures = remove_tree(job_dir)
+    if failures and job_bytes is not None:
+        try:
+            os.makedirs(job_dir, mode=0o700, exist_ok=True)
+            with private_open(job_file) as handle:
+                handle.write(job_bytes)
+        except OSError:
+            pass
+    return failures
+
+
+def command_delete(args):
+    """Delete one plugin-owned recording, or one whole plugin-owned dictation."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    job_id = args.job_id
+    job_dir, problem = owned_job_dir(args.data_dir, job_id)
+    if problem:
+        verdict("not_owned", "error", problem, jobId=job_id)
+        return
+    if job_is_live(job_id, args.data_dir, set()):
+        verdict(
+            "job_active",
+            "error",
+            "That dictation is still running, so nothing was deleted. Cancel it first.",
+            jobId=job_id,
+        )
+        return
+    if args.what == "recording":
+        recording, recording_problem = owned_recording(args.data_dir, job_id)
+        if recording_problem:
+            verdict("not_owned", "error", recording_problem, jobId=job_id)
+            return
+        try:
+            os.unlink(recording)
+        except OSError as exc:
+            verdict(
+                "delete_failed",
+                "error",
+                "Could not delete the recording: %s. It is still on disk." % (exc.strerror or exc),
+                jobId=job_id,
+                failures=[recording],
+            )
+            return
+        forget_last_recording(args.data_dir, job_dir + os.sep)
+        verdict(
+            "ok",
+            "ok",
+            "Deleted the recording. The transcript and its attempts were kept; playback and Retry are no longer offered.",
+            jobId=job_id,
+        )
+        return
+    failures = remove_owned_job(job_dir)
+    forget_sidecars(jobs_dir_for(args.data_dir), job_id)
+    if failures:
+        verdict(
+            "delete_partial",
+            "error",
+            "Deleted part of the dictation, but these files could not be removed: " + "; ".join(failures[:5]),
+            jobId=job_id,
+            failures=failures[:20],
+        )
+        return
+    forget_last_recording(args.data_dir, job_dir + os.sep)
+    verdict("ok", "ok", "Deleted the dictation, including its recording, transcript and attempts.", jobId=job_id)
+
+
+def command_clear(args):
+    """Delete every plugin-owned dictation except work that is still live."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    jobs_dir = jobs_dir_for(args.data_dir)
+    keep = set(name for name in (args.keep or []) if isinstance(name, str) and name != "")
+    try:
+        names = sorted(os.listdir(jobs_dir))
+    except OSError:
+        names = []
+    removed, kept, failures = [], [], []
+    for name in names:
+        if not JOB_NAME.match(name):
+            continue
+        job_dir = os.path.join(jobs_dir, name)
+        if os.path.islink(job_dir) or not os.path.isdir(job_dir):
+            continue
+        if job_is_live(name, args.data_dir, keep):
+            kept.append(name)
+            continue
+        owned, problem = owned_job_dir(args.data_dir, name)
+        if problem:
+            failures.append("%s (%s)" % (name, problem))
+            continue
+        job_failures = remove_owned_job(owned)
+        forget_sidecars(jobs_dir, name)
+        if job_failures:
+            failures.extend(job_failures)
+            continue
+        forget_last_recording(args.data_dir, owned + os.sep)
+        removed.append(name)
+    message = "Deleted %d dictation%s." % (len(removed), "" if len(removed) == 1 else "s")
+    if kept:
+        message += " %d still running %s kept: %s." % (
+            len(kept),
+            "job was" if len(kept) == 1 else "jobs were",
+            ", ".join(kept),
+        )
+    if failures:
+        message += " Some files could not be removed: " + "; ".join(failures[:5])
+    verdict(
+        "clear_partial" if failures else "cleared",
+        "error" if failures else "ok",
+        message,
+        removed=removed,
+        kept=kept,
+        failures=failures[:20],
+    )
+
+
+def diagnostic_message(summary):
+    """This plugin's own words about a job, never the engine's output.
+
+    The engine's output is where recognised speech and the user's file paths
+    appear, and a diagnostics file is exported rather than read on screen, so it
+    is dropped. A job written before the separate field existed carries the
+    engine's half inside its message, so an error-severity job is reported
+    without one rather than guessing where its text ends.
+    """
+    if not isinstance(summary, dict):
+        return ""
+    brief = summary.get("diagnosticMessage")
+    if not isinstance(brief, str):
+        if summary.get("severity") == "error":
+            return ""
+        brief = summary.get("message") if isinstance(summary.get("message"), str) else ""
+    return brief.split(ENGINE_NOTE_MARK, 1)[0].strip()[:DIAGNOSTIC_MESSAGE_CHARS]
+
+
+def diagnostics_document(data_dir, retention):
+    """Bounded metadata about this plugin's jobs. No audio, no transcript text.
+
+    The raw recognition log is where recognised speech and user paths would leak,
+    so it is summarised as counts and sizes, never copied. Only the plugin's own
+    outcome messages are included verbatim.
+    """
+    jobs_dir = jobs_dir_for(data_dir)
+    try:
+        names = sorted(os.listdir(jobs_dir))
+    except OSError:
+        names = []
+    jobs = []
+    for name in names:
+        if not JOB_NAME.match(name):
+            continue
+        job_dir = os.path.join(jobs_dir, name)
+        if os.path.islink(job_dir) or not os.path.isdir(job_dir):
+            continue
+        job = read_json_file(os.path.join(job_dir, "job.json")) or {}
+        summary = read_json_file(os.path.join(job_dir, "summary.json"))
+        attempt_dir, attempts = latest_attempt(job_dir)
+        chars = 0
+        if attempt_dir:
+            candidate = os.path.join(attempt_dir, "transcript.txt")
+            try:
+                if os.path.isfile(candidate) and not os.path.islink(candidate):
+                    with open(candidate, "r", encoding="utf-8", errors="replace") as handle:
+                        chars = len(handle.read())
+            except OSError:
+                chars = 0
+        recording = job.get("recording")
+        recording_bytes = None
+        if isinstance(recording, str) and os.path.isfile(recording) and not os.path.islink(recording):
+            try:
+                recording_bytes = os.stat(recording, follow_symlinks=False).st_size
+            except OSError:
+                recording_bytes = None
+        jobs.append(
+            {
+                "id": name,
+                "mode": job.get("mode") if isinstance(job.get("mode"), str) else "",
+                "startedAtMs": job.get("startedAt") if isinstance(job.get("startedAt"), (int, float)) else 0,
+                "state": "complete" if isinstance(summary, dict) else "interrupted",
+                "outcome": summary.get("outcome") if isinstance(summary, dict) and isinstance(summary.get("outcome"), str) else "",
+                "severity": summary.get("severity") if isinstance(summary, dict) and isinstance(summary.get("severity"), str) else "",
+                "message": diagnostic_message(summary),
+                "attempts": attempts,
+                "transcriptChars": chars,
+                "recordingBytes": recording_bytes,
+            }
+        )
+    jobs.sort(key=lambda entry: entry["startedAtMs"], reverse=True)
+    return {
+        "format": DIAGNOSTIC_FORMAT,
+        "version": DIAGNOSTIC_VERSION,
+        "generatedAt": int(time.time()),
+        "plugin": {"id": "magus/dictation", "historyLimit": HISTORY_LIMIT},
+        "storage": storage_summary(data_dir),
+        "retention": {"count": int(retention), "last": last_prune(data_dir)},
+        "jobs": jobs,
+        "excluded": [
+            "audio recordings",
+            "transcripts and transcript previews",
+            "raw recognition logs",
+            "engine logs",
+            "setup file paths",
+            "environment variables",
+        ],
+    }
+
+
+def command_diagnostics(args):
+    """Write the exact bytes the preview shows, so exporting them is faithful."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    document = diagnostics_document(args.data_dir, args.retention)
+    text = json.dumps(document, indent=2) + "\n"
+    path = os.path.join(private_dir(args.data_dir), DIAGNOSTIC_PREVIEW_NAME)
+    try:
+        atomic_write(path, text)
+    except OSError as exc:
+        verdict("diagnostics_failed", "error", "Could not write the diagnostics preview: %s" % (exc.strerror or exc))
+        return
+    verdict(
+        "ok",
+        "ok",
+        "Prepared diagnostics for review. Nothing was exported and nothing left this machine.",
+        previewPath=path,
+        previewBytes=len(text.encode("utf-8")),
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        jobs=len(document["jobs"]),
+    )
+
+
+def export_destination(name):
+    home = os.environ.get("HOME", "")
+    if home == "":
+        return None, "HOME is not set, so there is no place to export to."
+    downloads = os.path.join(home, "Downloads")
+    directory = downloads if os.path.isdir(downloads) else home
+    candidate = os.path.join(directory, name)
+    stem, extension = os.path.splitext(name)
+    for index in range(2, 100):
+        if not os.path.exists(candidate):
+            return candidate, None
+        candidate = os.path.join(directory, "%s-%d%s" % (stem, index, extension))
+    return None, "Could not find an unused export name."
+
+
+def write_export(destination, content):
+    """Write an export atomically with user-only permissions.
+
+    The destination directory is created when missing but never chmod'ed, so an
+    export into a directory the user already had cannot change its permissions.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(destination)), mode=0o700, exist_ok=True)
+    temporary = destination + ".tmp"
+    handle = os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb")
+    with handle:
+        handle.write(content)
+    os.replace(temporary, destination)
+    return destination
+
+
+def command_export_diagnostics(args):
+    """Copy the preview the user reviewed, byte for byte, to a file they own."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    preview_path = os.path.join(args.data_dir, DIAGNOSTIC_PREVIEW_NAME)
+    try:
+        with open(preview_path, "rb") as handle:
+            content = handle.read()
+    except OSError:
+        verdict("no_preview", "error", "Preview the diagnostics first, then export that exact content.")
+        return
+    digest = hashlib.sha256(content).hexdigest()
+    if args.expect_hash != "" and args.expect_hash != digest:
+        verdict(
+            "preview_changed",
+            "error",
+            "The diagnostics changed after you reviewed them. Open them again and export that text.",
+        )
+        return
+    destination = args.out
+    if destination == "":
+        destination, problem = export_destination("%s-diagnostics-%s.json" % (EXPORT_PREFIX, time.strftime("%Y%m%d-%H%M%S")))
+        if problem:
+            verdict("export_failed", "error", problem)
+            return
+    try:
+        write_export(destination, content)
+    except OSError as exc:
+        verdict("export_failed", "error", "Could not write the diagnostics export: %s" % (exc.strerror or exc))
+        return
+    verdict(
+        "ok",
+        "ok",
+        "Exported the exact diagnostics you previewed. It contains no audio and no transcripts.",
+        exportPath=destination,
+        bytes=len(content),
+        sha256=digest,
+    )
+
+
+def owned_transcript(data_dir, path):
+    """A transcript this plugin wrote, or (None, reason)."""
+    if not isinstance(path, str) or path == "":
+        return None, "There is no transcript to export."
+    if os.path.islink(path):
+        return None, "That transcript path is a link, so it was not read."
+    real = os.path.realpath(path)
+    attempt_dir = os.path.dirname(real)
+    job_dir = os.path.dirname(attempt_dir)
+    if os.path.dirname(job_dir) != os.path.realpath(jobs_dir_for(data_dir)):
+        return None, "That transcript is not one this plugin owns, so it was not exported."
+    if not JOB_NAME.match(os.path.basename(job_dir)) or not re.fullmatch(r"attempt-\d+", os.path.basename(attempt_dir)):
+        return None, "That transcript is not one this plugin owns, so it was not exported."
+    if os.path.basename(real) != "transcript.txt" or not os.path.isfile(real):
+        return None, "That file is not a saved transcript, so it was not exported."
+    return real, None
+
+
+def command_export_text(args):
+    """Export one saved transcript as a text file. Nothing is pasted."""
+    global SUMMARY_PATH
+    args.data_dir = os.path.abspath(args.data_dir)
+    SUMMARY_PATH = None
+    transcript, problem = owned_transcript(args.data_dir, args.transcript)
+    if problem:
+        verdict("not_owned", "error", problem)
+        return
+    try:
+        with open(transcript, "rb") as handle:
+            content = handle.read()
+    except OSError as exc:
+        verdict("export_failed", "error", "Could not read the transcript: %s" % (exc.strerror or exc))
+        return
+    destination = args.out
+    if destination == "":
+        job_name = os.path.basename(os.path.dirname(os.path.dirname(transcript)))
+        attempt_name = os.path.basename(os.path.dirname(transcript))
+        destination, problem = export_destination("%s-%s-%s.txt" % (EXPORT_PREFIX, job_name, attempt_name))
+        if problem:
+            verdict("export_failed", "error", problem)
+            return
+    try:
+        write_export(destination, content)
+    except OSError as exc:
+        verdict("export_failed", "error", "Could not write the transcript export: %s" % (exc.strerror or exc))
+        return
+    verdict(
+        "ok",
+        "ok",
+        "Exported the transcript as a text file. Nothing was pasted.",
+        exportPath=destination,
+        bytes=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
 
 
 def command_sources(args):
@@ -1132,10 +1773,14 @@ def transcribe(args, heartbeat_path, status_dir=None, status_job=None, recording
     private_write(transcript_path, text)
 
     outcome, severity, message = classify(killed, exit_code, parsed)
+    # The panel shows the engine's own output on a failure, because that is what
+    # explains it. The diagnostics export must not: it carries this plugin's
+    # words only, so the engine's half is captured apart from it.
+    diagnostic_message = message.split(ENGINE_NOTE_MARK, 1)[0].strip()
     if severity == "error":
         detail = log_tail(log_path)
         if detail:
-            message = message + " Engine output: " + detail
+            message = message + ENGINE_NOTE_MARK + detail
     result = {
         "jobId": args.job_id,
         "attempt": attempt,
@@ -1169,12 +1814,13 @@ def transcribe(args, heartbeat_path, status_dir=None, status_job=None, recording
         },
     }
     write_result(result)
-    emit(
+    committed = emit(
         {
             "ok": severity in ("ok", "review"),
             "outcome": outcome,
             "severity": severity,
             "message": message,
+            "diagnosticMessage": diagnostic_message,
             "copyable": severity in ("ok", "review") and bool(text.strip()),
             "jobId": args.job_id,
             "attempt": attempt,
@@ -1183,6 +1829,11 @@ def transcribe(args, heartbeat_path, status_dir=None, status_job=None, recording
             "paths": result["paths"],
         }
     )
+    # Retention runs only after this job's own result is durable, so a write that
+    # failed cannot delete older audio for a successor the user cannot see. A job
+    # that produced no transcript is not a successor and never prunes.
+    if committed and severity in COMPLETED_SEVERITIES:
+        prune_jobs(args.data_dir, getattr(args, "retention", DEFAULT_RETENTION))
 
 
 def write_result(result):
@@ -1265,7 +1916,7 @@ def classify(killed, exit_code, parsed):
     if parsed["error"] and TRUNCATION_MARK in parsed["error"].lower():
         return "truncated", "review", "The engine hit its output budget; the transcript is incomplete."
     if parsed["error"]:
-        return "per_file_error", "error", "The engine reported: %s." % parsed["error"].rstrip(".")
+        return "per_file_error", "error", "The engine reported an error for this recording." + ENGINE_NOTE_MARK + parsed["error"].rstrip(".")
     if not parsed["text"].strip():
         return "empty", "error", "The engine returned no text for this recording."
     if exit_code != 0:
@@ -1300,6 +1951,8 @@ def main(argv):
     run.add_argument("--job-id", required=True)
     run.add_argument("--data-dir", required=True)
     run.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    # How many finished dictations stay on disk after this one is committed.
+    run.add_argument("--retention", type=int, default=DEFAULT_RETENTION)
     # The job a retry reads from, so the new attempt names the dictation it
     # retried instead of looking like an unrelated file the user picked.
     run.add_argument("--retries-of", default="")
@@ -1312,6 +1965,7 @@ def main(argv):
     record.add_argument("--job-id", required=True)
     record.add_argument("--data-dir", required=True)
     record.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
+    record.add_argument("--retention", type=int, default=DEFAULT_RETENTION)
     record.add_argument("--lease-seconds", type=float, default=DEFAULT_LEASE_SECONDS)
 
     play = sub.add_parser("play")
@@ -1321,6 +1975,33 @@ def main(argv):
     history = sub.add_parser("history")
     history.add_argument("--data-dir", required=True)
 
+    delete = sub.add_parser("delete")
+    delete.add_argument("--job-id", required=True)
+    delete.add_argument("--what", choices=("recording", "dictation"), required=True)
+    delete.add_argument("--data-dir", required=True)
+
+    clear = sub.add_parser("clear")
+    clear.add_argument("--data-dir", required=True)
+    # Repeatable: the controller names whatever job it is still working on, so a
+    # clear never races a live recording.
+    clear.add_argument("--keep", action="append", default=[])
+
+    diagnostics = sub.add_parser("diagnostics")
+    diagnostics.add_argument("--data-dir", required=True)
+    diagnostics.add_argument("--retention", type=int, default=DEFAULT_RETENTION)
+
+    export_diagnostics = sub.add_parser("export-diagnostics")
+    export_diagnostics.add_argument("--data-dir", required=True)
+    export_diagnostics.add_argument("--out", default="")
+    # The reviewed preview is addressed by its own bytes: a second preview written
+    # between the review and the export must not be exported instead.
+    export_diagnostics.add_argument("--expect-hash", default="")
+
+    export_text = sub.add_parser("export-text")
+    export_text.add_argument("--data-dir", required=True)
+    export_text.add_argument("--transcript", required=True)
+    export_text.add_argument("--out", default="")
+
     args = parser.parse_args(argv)
     if args.command == "probe":
         command_probe(args)
@@ -1328,6 +2009,16 @@ def main(argv):
         command_sources(args)
     elif args.command == "history":
         command_history(args)
+    elif args.command == "delete":
+        command_delete(args)
+    elif args.command == "clear":
+        command_clear(args)
+    elif args.command == "diagnostics":
+        command_diagnostics(args)
+    elif args.command == "export-diagnostics":
+        command_export_diagnostics(args)
+    elif args.command == "export-text":
+        command_export_text(args)
     elif args.command == "record":
         command_record(args)
     elif args.command == "play":

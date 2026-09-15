@@ -161,8 +161,12 @@ local S = {
   -- conflict | error.
   shortcut = { state = "unknown", chord = SHORTCUT_CHORD, message = "Not checked yet.", canInstall = false, canRemove = false, installed = false },
   -- The helper's durable record of every job, read back from disk: idle | ok |
-  -- error. The list is the helper's own, newest first.
-  history = { state = "idle", message = "", list = {} },
+  -- error. The list is the helper's own, newest first. storage and retention are
+  -- the helper's own accounting of that same directory.
+  history = { state = "idle", message = "", list = {}, storage = nil, retention = nil },
+  -- The user-requested diagnostics: idle | noting | ready | error. The preview is
+  -- the exact text that an export copies, not a regenerated approximation.
+  diagnostics = { state = "idle", message = "", preview = "", hash = "", jobs = 0, bytes = 0, exportedPath = "" },
 }
 
 local summaryPath = nil
@@ -197,6 +201,18 @@ local function configThreads()
   local value = noctalia.getConfig("threads")
   if type(value) ~= "number" then return 4 end
   return math.floor(value)
+end
+
+-- How many finished dictations stay on disk. The helper enforces it; the
+-- controller only carries the setting through, so the number the user sees in
+-- settings and the number the helper prunes with are the same one.
+local function configRetention()
+  local value = noctalia.getConfig("retention")
+  if type(value) ~= "number" then return 10 end
+  value = math.floor(value)
+  if value < 1 then return 1 end
+  if value > 1000 then return 1000 end
+  return value
 end
 
 local function shortHash(hash)
@@ -1149,13 +1165,25 @@ end
 -- limits are a guard rather than a policy.
 local HISTORY_LIMIT = 20
 
+-- The last deletion, clear or export this session asked for. It rides along with
+-- every history refresh, so a partial failure stays visible next to the rows it
+-- left behind instead of only in a notification that is gone.
+local maintenanceNote = ""
+
+local function setMaintenanceNote(text)
+  maintenanceNote = type(text) == "string" and text or ""
+  -- Shown immediately: a refusal never refreshes the history, and the reason has
+  -- to be visible even when no helper run follows it.
+  S.history.note = maintenanceNote
+end
+
 -- The history is the helper's own record of the durable job directories, not this
 -- session's memory, so it survives a panel close, a plugin reload and a shell
 -- restart. Reading it is read-only: no recording, no engine and no paste follow
 -- from reconciliation.
 local function refreshHistory()
   if not DATA or HELPER == "" then
-    S.history = { state = "error", message = "Could not locate the bundled recognition helper.", list = S.history.list }
+    S.history = { state = "error", message = "Could not locate the bundled recognition helper.", list = S.history.list, note = maintenanceNote }
     publish()
     return
   end
@@ -1163,7 +1191,7 @@ local function refreshHistory()
     local summary = type(result) == "table" and readLastJson(result.stdout) or nil
     if type(summary) ~= "table" or summary.outcome ~= "ok" or type(summary.jobs) ~= "table" then
       local message = type(summary) == "table" and type(summary.message) == "string" and summary.message or "Could not read the dictation history."
-      S.history = { state = "error", message = message, list = S.history.list }
+      S.history = { state = "error", message = message, list = S.history.list, note = maintenanceNote }
       publish()
       return
     end
@@ -1178,11 +1206,14 @@ local function refreshHistory()
       state = "ok",
       message = type(summary.message) == "string" and summary.message or "",
       list = list,
+      storage = type(summary.storage) == "table" and summary.storage or nil,
+      retention = type(summary.retention) == "table" and summary.retention or nil,
+      note = maintenanceNote,
     }
     publish()
   end)
   if accepted == false then
-    S.history = { state = "error", message = "Could not read the dictation history.", list = S.history.list }
+    S.history = { state = "error", message = "Could not read the dictation history.", list = S.history.list, note = maintenanceNote }
     publish()
   end
 end
@@ -1623,6 +1654,8 @@ local function startJob(wav, label, retriesOf)
     jobId,
     "--data-dir",
     DATA,
+    "--retention",
+    tostring(configRetention()),
   }
   -- Which dictation a retry read from, so the new attempt names it on disk. The
   -- controller's label is this session's; this is the durable record.
@@ -1729,6 +1762,8 @@ local function startRecording(from)
     jobId,
     "--data-dir",
     DATA,
+    "--retention",
+    tostring(configRetention()),
   }
   if not noctalia.runAsync(argv) then
     noctalia.removeFile(leasePath)
@@ -1898,6 +1933,153 @@ local function retryHistory(jobId)
     return
   end
   startJob(entry.recordingPath, "retry", jobId)
+end
+
+-- ── Retention, deletion and export ───────────────────────────────────────────
+
+-- Destructive and export actions run in the helper, which owns the data
+-- directory: the host has no directory delete and no save dialog, so path
+-- validation lives in the one process that already knows what this plugin owns.
+-- The helper reports what it did; this relays that and re-reads the durable
+-- history, so the rows on screen always match what is left on disk.
+local function runHelperMaintenance(action, extraArgv, onSummary)
+  if not DATA or HELPER == "" then
+    setMaintenanceNote("Could not locate the bundled recognition helper.")
+    publish()
+    noctalia.notifyError("Dictation", maintenanceNote)
+    return
+  end
+  local argv = { "python3", HELPER, action, "--data-dir", DATA }
+  for _, value in ipairs(extraArgv or {}) do table.insert(argv, value) end
+  local accepted = noctalia.runAsync(argv, function(result)
+    local summary = type(result) == "table" and readLastJson(result.stdout) or nil
+    local message = type(summary) == "table" and type(summary.message) == "string" and summary.message
+      or "The helper did not report a result."
+    if onSummary then onSummary(summary, message) end
+    setMaintenanceNote(message)
+    publish()
+    if type(summary) ~= "table" or summary.severity == "error" then
+      noctalia.notifyError("Dictation", message)
+    else
+      noctalia.notify("Dictation", message)
+    end
+    refreshHistory()
+  end)
+  if accepted == false then
+    setMaintenanceNote("Could not start the helper for that action.")
+    publish()
+    noctalia.notifyError("Dictation", maintenanceNote)
+  end
+end
+
+-- Deleting a recording leaves the transcript and the attempts in place; the
+-- helper refuses anything that is not this job's own recording, so an imported
+-- file and an earlier dictation's audio are never the target.
+local function deleteHistoryRecording(jobId)
+  runHelperMaintenance("delete", { "--job-id", jobId, "--what", "recording" })
+end
+
+local function deleteHistoryDictation(jobId)
+  runHelperMaintenance("delete", { "--job-id", jobId, "--what", "dictation" })
+end
+
+-- A clear deletes everything the plugin owns except live work. The helper checks
+-- liveness itself and this names the job this session is still tracking, so the
+-- two cannot race whatever the process table happens to show.
+local function clearHistory()
+  local extra = {}
+  if S.job and type(S.job.id) == "string" and S.job.id ~= "" then
+    extra = { "--keep", S.job.id }
+  end
+  runHelperMaintenance("clear", extra)
+end
+
+local function exportHistoryText(jobId)
+  local entry = historyEntry(jobId)
+  local path = type(entry) == "table" and type(entry.transcriptPath) == "string" and entry.transcriptPath or ""
+  if path == "" then
+    setMaintenanceNote("That dictation has no saved transcript to export.")
+    publish()
+    return
+  end
+  runHelperMaintenance("export-text", { "--transcript", path })
+end
+
+-- The preview is read back from the file the helper wrote and shown verbatim;
+-- the export copies those same bytes, so what the user reviews is what lands on
+-- disk. Nothing is exported until the user confirms, and nothing is ever sent
+-- anywhere: the export is a local file.
+local function previewDiagnostics()
+  S.diagnostics = { state = "preparing", message = "Preparing diagnostics for review.", preview = "", hash = "", jobs = 0, bytes = 0, exportedPath = "" }
+  publish()
+  runHelperMaintenance("diagnostics", { "--retention", tostring(configRetention()) }, function(summary)
+    if type(summary) ~= "table" or summary.severity == "error" then
+      S.diagnostics = {
+        state = "error",
+        message = type(summary) == "table" and type(summary.message) == "string" and summary.message or "Could not prepare diagnostics.",
+        preview = "",
+        hash = "",
+        jobs = 0,
+        bytes = 0,
+        exportedPath = "",
+      }
+      return
+    end
+    local path = type(summary.previewPath) == "string" and summary.previewPath or ""
+    local preview = path ~= "" and noctalia.readFile(path) or nil
+    if type(preview) ~= "string" then
+      S.diagnostics = { state = "error", message = "Could not read the prepared diagnostics.", preview = "", hash = "", jobs = 0, bytes = 0, exportedPath = "" }
+      return
+    end
+    S.diagnostics = {
+      state = "ready",
+      message = "Review the exact text below. Export copies it unchanged; it contains no audio and no transcripts.",
+      preview = preview,
+      -- The hash of those exact bytes rides with the export, so a preview written
+      -- by another session between the review and the export is refused instead
+      -- of exported in its place.
+      hash = type(summary.sha256) == "string" and summary.sha256 or "",
+      jobs = type(summary.jobs) == "number" and summary.jobs or 0,
+      bytes = type(summary.previewBytes) == "number" and summary.previewBytes or #preview,
+      exportedPath = "",
+    }
+  end)
+end
+
+local function exportDiagnostics()
+  if S.diagnostics.state ~= "ready" and S.diagnostics.state ~= "exported" then
+    setMaintenanceNote("Open the diagnostics and review them before exporting.")
+    publish()
+    return
+  end
+  local preview = S.diagnostics.preview
+  local hash = type(S.diagnostics.hash) == "string" and S.diagnostics.hash or ""
+  S.diagnostics = { state = "exporting", message = "Exporting the reviewed diagnostics.", preview = preview, hash = hash, jobs = S.diagnostics.jobs, bytes = S.diagnostics.bytes, exportedPath = "" }
+  publish()
+  local extra = hash ~= "" and { "--expect-hash", hash } or {}
+  runHelperMaintenance("export-diagnostics", extra, function(summary)
+    if type(summary) ~= "table" or summary.severity == "error" then
+      S.diagnostics = {
+        state = "error",
+        message = type(summary) == "table" and type(summary.message) == "string" and summary.message or "Could not export the diagnostics.",
+        preview = preview,
+        hash = hash,
+        jobs = S.diagnostics.jobs,
+        bytes = S.diagnostics.bytes,
+        exportedPath = "",
+      }
+      return
+    end
+    S.diagnostics = {
+      state = "exported",
+      message = "Exported the exact text you reviewed.",
+      preview = preview,
+      hash = hash,
+      jobs = S.diagnostics.jobs,
+      bytes = type(summary.bytes) == "number" and summary.bytes or S.diagnostics.bytes,
+      exportedPath = type(summary.exportPath) == "string" and summary.exportPath or "",
+    }
+  end)
 end
 
 local function verifySetup()
@@ -2237,6 +2419,18 @@ noctalia.state.watch("dictation.command", function(command)
     playHistoryRecording(command.jobId)
   elseif action == "history-retry" then
     retryHistory(command.jobId)
+  elseif action == "history-delete-recording" then
+    deleteHistoryRecording(command.jobId)
+  elseif action == "history-delete" then
+    deleteHistoryDictation(command.jobId)
+  elseif action == "history-clear" then
+    clearHistory()
+  elseif action == "history-export-text" then
+    exportHistoryText(command.jobId)
+  elseif action == "diagnostics-preview" then
+    previewDiagnostics()
+  elseif action == "diagnostics-export" then
+    exportDiagnostics()
   elseif action == "verify" then
     verifySetup()
   elseif action == "sources" then
