@@ -4,6 +4,18 @@ A Noctalia plugin that records your microphone and transcribes the recording wit
 
 The plugin owns the native interface and the settings; `dictation-helper.py` owns the recording and the recognition job. You pick an installed `transcribe-cli` executable and a GGUF model, choose a PipeWire capture source, press **Record**, press **Stop**, and read or copy the finished transcript. The engine is used exactly as installed: the plugin never rebuilds it, downloads anything, or patches its source. A WAV you recorded elsewhere can still be imported and transcribed.
 
+## Quickstart
+
+1. Install the host tools: `sudo dnf install python3 pipewire-utils hyprland`.
+2. Get an engine. If you have no `transcribe-cli` yet, [source-installer/](../source-installer/) in this repository builds one: `python3 source-installer/dictation_source_installer.py`.
+3. Get a model. Pre-built GGUFs for every model the engine supports are published at [huggingface.co/handy-computer](https://huggingface.co/handy-computer). Download one and keep it somewhere stable.
+4. Add this repository as a Git source in **Settings → Plugins → Sources** and enable **Dictation**.
+5. In **Settings → Plugins → Dictation**, set **Recognition executable** and **Model GGUF** to those two files.
+6. Open the panel, press **Verify and record**, then choose your **Microphone**.
+7. Press **Record**, speak, press **Stop**. The transcript is copied and pasted into the window you started from.
+
+Everything below is the reference for those seven steps.
+
 ## Plugin
 
 | Field | Value |
@@ -22,7 +34,7 @@ The service is the only owner of a job, so closing the panel or the bar widget n
 | Compositor | Hyprland with `hyprctl` and the `sendshortcut` dispatcher; automatic paste and the recording shortcut are Hyprland-only |
 | Audio | PipeWire, with `pw-dump`, `pw-record` and `pw-play` |
 | Engine | an installed `transcribe-cli` from transcribe.cpp that accepts `--batch` and `--batch-jsonl` |
-| Model | a GGUF the engine can load |
+| Model | a GGUF the engine can load, such as a pre-built one from [huggingface.co/handy-computer](https://huggingface.co/handy-computer) |
 | Distribution | Fedora with PipeWire and Hyprland is the target this release is built for; another distribution works when the tools above are present, but nothing else is developed against |
 
 Automatic paste is aimed at the editor and the browser you work in, reached as ordinary clipboard-paste targets and identified by the compositor window class the plugin reads. The plugin ships no per-application list: the first recording into a window class you have not confirmed is held for **Paste now**, and terminals, password managers, an unreadable class and any window other than the one the recording was started from are always held. Nothing is typed as keystrokes, so the application receives its own normal paste of the clipboard the plugin set.
@@ -36,8 +48,8 @@ The release-candidate host measurements — the versions of Noctalia, Hyprland, 
 - `hyprctl` for automatic paste, for the destination check and for the recording shortcut: the chord is dispatched by the compositor itself (`hyprctl dispatch sendshortcut CTRL,V,`), so no daemon and no input-device access is needed, and `hyprctl` is the same tool this plugin already uses to read the focused window. It is required only for automatic paste and the shortcut setup, and it is listed in the catalog's dependency metadata for that reason — without it, and in manual copy mode, the transcript is still copied when you ask for it, and the shortcut row stays actionable instead of pretending.
 - `ps` to read the compositor's command line when the recording shortcut has to find which configuration file Hyprland loaded. The shortcut row stays actionable without it; recording and paste do not use it.
 - A capture source (microphone) PipeWire reports as an `Audio/Source`.
-- An installed recognition engine from [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), such as `transcribe-cli`.
-- A GGUF model the engine can load.
+- An installed recognition engine from [transcribe.cpp](https://github.com/handy-computer/transcribe.cpp), such as `transcribe-cli`. If you have none, [source-installer/](../source-installer/) in this repository builds one from a pinned source revision.
+- A GGUF model the engine can load. Pre-built GGUFs for every model transcribe.cpp supports are published at [huggingface.co/handy-computer](https://huggingface.co/handy-computer); download one yourself, because the plugin never fetches a model.
 
 On Fedora the packages for everything above are:
 
@@ -45,7 +57,7 @@ On Fedora the packages for everything above are:
 sudo dnf install python3 pipewire-utils hyprland
 ```
 
-`pipewire-utils` provides `pw-dump`, `pw-record` and `pw-play`, and `hyprctl` ships with `hyprland`; on Debian and Ubuntu the PipeWire tools come from `pipewire-bin`. The dependency list is metadata: it names the tools the plugin runs, Noctalia does not install packages from it, and the engine and the model are yours to install. A user who has no engine yet cannot finish setup from this plugin alone.
+`pipewire-utils` provides `pw-dump`, `pw-record` and `pw-play`, and `hyprctl` ships with `hyprland`; on Debian and Ubuntu the PipeWire tools come from `pipewire-bin`. The dependency list is metadata: it names the tools the plugin runs, Noctalia does not install packages from it, and the engine and the model are yours to install. A user who has no engine yet cannot finish setup from this plugin alone, which is what [source-installer/](../source-installer/) is for.
 
 ## Installation
 
@@ -324,7 +336,7 @@ What removal cannot undo is the one block the shortcut setup wrote into your Hyp
 
 ## Release scope
 
-- **Requires an installed engine.** Dictation is an existing-engine plugin: a `transcribe-cli` build and a GGUF model must already be installed. The plugin never downloads, bundles, rebuilds, patches or installs an engine, a model or a package, and the catalog's dependency list is metadata rather than an installation step. A user who has no engine yet cannot complete setup from this plugin alone; that graphical source-install route is a separate ticket and is not shipped here.
+- **Requires an installed engine.** Dictation is an existing-engine plugin: a `transcribe-cli` build and a GGUF model must already be installed. The plugin never downloads, bundles, rebuilds, patches or installs an engine, a model or a package, and the catalog's dependency list is metadata rather than an installation step. A user who has no engine yet cannot complete setup from this plugin alone; [source-installer/](../source-installer/) is that graphical source-install route, shipped in this repository as a separate tool that Noctalia never loads or runs.
 - **What this release covers.** Installing from the Git source, setup verification, microphone selection, shortcut-driven recording, automatic paste into the editor and browser you dictate into, history with Retry, cancellation and error recovery, retention and deletion, diagnostics export, and update, reload and removal safety.
 - **What publishing does not authorize.** Publishing this code does not authorize an automatic merge, an installation on anyone's host, or a submission to a community store. Those remain separate human decisions.
 - **No privileged behaviour.** The plugin does not install a package, a permission, a udev rule or a background daemon, does not use `ydotool` or `/dev/uinput`, does not request input-device access, and does not change boost or any global policy. Inference is CPU-only by design.
