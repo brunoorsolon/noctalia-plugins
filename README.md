@@ -27,6 +27,6 @@ noctalia msg plugins enable magus/pi-scratchpad
 | [Dictation](dictation/) | Records the microphone you choose and transcribes it with an installed recognition engine and GGUF model. |
 | [Pi Scratchpad](pi-scratchpad/) | Parks one long-lived Pi TUI in a Hyprland special workspace and shows whether it is working, waiting or idle. |
 
-Each plugin documents its own requirements, setup, and usage in its directory.
+Each plugin documents its own requirements, setup, and usage in its directory. [docs/howto.md](docs/howto.md) walks the two newest ones, Dictation and Pi Scratchpad, from a clean machine to a working one in the order the steps have to happen.
 
 The [Dictation](dictation/) plugin consumes an already-installed recognition engine. [source-installer/](source-installer/) is a separate graphical tool that builds that engine from one pinned source revision for users who have none; it is not part of the plugin and Noctalia does not load or run it.
