@@ -16,7 +16,7 @@ The plugin never renders the conversation. Pi's own TUI is the UI, so nothing is
 ## Requirements
 
 - **Hyprland.** Niri has no native special workspace, so this plugin is Hyprland only.
-- **The companion Pi extension, [pi-hypr-agent-monitor](https://github.com/brunoorsolon/pi-hypr-agent-monitor).** It is what publishes the status file the widget reads. Without it the widget sits on "Pi is not running". Install the extension in Pi and leave `PI_HYPR_MONITOR` alone; the plugin sets `PI_HYPR_MONITOR=1` for the Pi it spawns, so a Pi you start by hand in another terminal can never overwrite the scratchpad's status.
+- **The companion Pi extension, [pi-hypr-agent-monitor](https://github.com/brunoorsolon/pi-hypr-agent-monitor).** It is what publishes the status file the widget reads. Without it the widget sits on "Pi is not running". Install it with `git clone https://github.com/brunoorsolon/pi-hypr-agent-monitor ~/.pi/agent/extensions/pi-hypr-agent-monitor`, then leave `PI_HYPR_MONITOR` alone; the plugin sets `PI_HYPR_MONITOR=1` for the Pi it spawns, so a Pi you start by hand in another terminal can never overwrite the scratchpad's status.
 - **`hyprctl`** on `PATH`.
 - **A terminal emulator** such as `foot` or `kitty`. The setting is a shell fragment, so a terminal that needs a flag works too: `alacritty -e`, `wezterm start --`.
 - **`pi`** on `PATH`.

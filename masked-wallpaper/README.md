@@ -10,10 +10,17 @@ The plugin owns the settings and the trigger; `generate-masked-wallpaper.sh` doe
 | --- | --- |
 | ID | `magus/masked-wallpaper` |
 | Entries | Service: `sync` |
+| Minimum plugin API | 25 |
 
 ## Requirements
 
-Install `imagemagick`. The plugin accepts either its `magick` or `convert` command.
+Install ImageMagick. The plugin accepts either its `magick` or its `convert` command.
+
+```sh
+sudo dnf install ImageMagick
+```
+
+On Debian and Ubuntu the package is `imagemagick`. That is the only external dependency: nothing else is downloaded, and the plugin fetches nothing at runtime.
 
 ## Installation
 
@@ -68,7 +75,7 @@ Without any hook the plugin still works, but only picks up changes on its hourly
 
 ## Add the sticker, once
 
-The plugin cannot write Noctalia's config, so point a lockscreen sticker at the output path yourself. Do it in the lockscreen widget editor, or add this to `~/.local/state/noctalia/settings.toml` with Noctalia's editor closed:
+The plugin cannot write Noctalia's config, so point a lockscreen sticker at the output path yourself. Let it generate once first: every generated file gets a `.toml` sibling in the output folder holding exactly the snippet below with your own connector name, paths and resolution already filled in, so copy that instead of editing the example by hand. `DP-3` here is a monitor connector name — `hyprctl monitors` lists yours on Hyprland, `wlr-randr` elsewhere, and the generated filenames carry the same names. Do it in the lockscreen widget editor, or add this to `~/.local/state/noctalia/settings.toml` with Noctalia's editor closed:
 
     [lockscreen_widgets.widget.masked-wallpaper-DP-3]
     type = "sticker"
@@ -86,8 +93,6 @@ The plugin cannot write Noctalia's config, so point a lockscreen sticker at the 
     opacity = 1.0
 
 Add its id first in `lockscreen_widgets.widget_order` so it sits behind the rest, keep `opacity = 1.0` and `rotation = 0.0` — the shape is tilted inside the image, not by the widget — and repeat per monitor. The path never changes again: the plugin replaces the file in place and the sticker reloads it.
-
-Every generated file also gets a `.toml` sibling in the cache folder holding this snippet, filled in with real values.
 
 ## When something looks wrong
 
