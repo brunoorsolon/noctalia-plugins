@@ -26,9 +26,11 @@ trap 'rm -rf "$work"' EXIT
 # table, the way a plugin runtime loads its entries.
 {
   printf 'SOURCES = {\n'
-  printf 'scratchpad = [==[\n'
-  cat scratchpad.luau
-  printf '\n]==],\n'
+  for entry in scratchpad icon; do
+    printf '%s = [==[\n' "$entry"
+    cat "$entry.luau"
+    printf '\n]==],\n'
+  done
   printf '}\n'
   cat scratchpad-harness.luau
 } >"$work/run.luau"
