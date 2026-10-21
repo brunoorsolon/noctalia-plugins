@@ -417,6 +417,23 @@ local namedNonce = request().nonce
 onClick()
 check("a named selection is still toggleable", namedNonce + 1, request().nonce)
 
+-- The name survives the states that decide the click too: an operation in flight
+-- and a reported failure both still say which pad they concern.
+snapshot({ pads = {}, busy = true })
+check("a busy bar still names the pad the controller selected", "terminal", tooltipValue("Pad"))
+check("a busy bar does not advertise the left click it ignores", false, describesLeftClick())
+
+snapshot({ pads = {}, error = "launch failed" })
+check("a failed bar still names the pad the controller selected", "terminal", tooltipValue("Pad"))
+check("a failed bar reports the failure", "launch failed", tooltipValue("Error"))
+checkTrue("a failed bar still describes the left click it accepts", describesLeftClick())
+
+-- An absent selection stays absent whatever else the snapshot reports.
+snapshot({ selectedPadId = false, pads = {}, busy = true })
+check("busy without a selection still reports none", "None selected", tooltipValue("Pad"))
+snapshot({ selectedPadId = false, pads = {}, error = "launch failed" })
+check("an error without a selection still reports none", "None selected", tooltipValue("Pad"))
+
 -- Left click publishes one toggle request through the shared helper. Two
 -- identical consecutive clicks are two publications, each with its own nonce.
 snapshot()

@@ -47,18 +47,23 @@ end
 local function view(snapshot)
   local pad = shared.selectedPad(snapshot)
   local errorText = type(snapshot.error) == "string" and snapshot.error or nil
+  -- The selection is authoritative before its record arrives, in every state: a
+  -- snapshot caught mid-refresh still names the pad the controller is acting on.
+  if pad == nil then
+    local id = selectedId(snapshot)
+    if id ~= nil then
+      pad = { id = id }
+    end
+  end
   if snapshot.busy then
     return { pad = pad, state = "busy", error = errorText, glyph = "loader", color = "primary" }
   end
   if errorText then
     return { pad = pad, state = "error", error = errorText, glyph = "alert-triangle", color = "error" }
   end
-  if selectedId(snapshot) == nil then
+  if pad == nil then
     return { pad = nil, state = "unavailable", glyph = DEFAULT_GLYPH, color = "on_surface_variant" }
   end
-  -- The selection is authoritative before its record arrives: with no runtime
-  -- detail published yet, a named pad is simply not running and not shown.
-  pad = pad or { id = selectedId(snapshot) }
   local glyph = type(pad.icon) == "string" and pad.icon ~= "" and pad.icon or DEFAULT_GLYPH
   if pad.visible then
     return { pad = pad, state = "visible", glyph = glyph, color = "primary" }
