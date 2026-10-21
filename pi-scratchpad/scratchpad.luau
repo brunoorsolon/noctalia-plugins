@@ -30,15 +30,28 @@ local SPAWN_GRACE_MS = 20000
 local SPAWNED_UNTIL = "spawned_until"
 local LAST_STATE = "last_state"
 
--- Every state the widget can report, and how it looks. Glyph names are Tabler
--- names and every state gets a different one, so a screenshot alone tells the
--- states apart.
+-- The launcher identity is the Pi glyph in every state, so the widget reads as
+-- "bring Pi here" and never as a power button. The badge is what changes, so a
+-- screenshot alone tells the states apart without relying on color, and a "+"
+-- badge on a stopped Pi also says the click starts it.
+--
+-- Both glyphs take on_surface, the palette's role for text and icons on a bar:
+-- it is the only role a palette guarantees to contrast with the bar. "outline"
+-- is the border role and the accent roles are tuned for fills, so on some
+-- built-in palettes they fall to 1.3:1 and 2.2:1 against the bar, which is the
+-- invisible icon this widget had. A role token is also what makes the icon
+-- follow the theme: the host resolves it against the active palette and
+-- repaints when that palette changes, where a hex value would freeze it.
+local IDENTITY = { glyph = "math-pi", color = "on_surface" }
+
+-- Every state the widget can report, and the badge that tells it apart. Glyph
+-- names are Tabler names.
 local LOOK = {
-  working = { glyph = "loader", color = "primary", label = "Pi is working" },
-  waiting = { glyph = "bell", color = "tertiary", label = "Pi is waiting for you" },
-  idle = { glyph = "robot", color = "on_surface_variant", label = "Pi is idle" },
-  unknown = { glyph = "alert-triangle", color = "error", label = "Pi status is unreadable" },
-  not_running = { glyph = "power", color = "outline", label = "Pi is not running" },
+  working = { badge = "loader", label = "Pi is working - click to show or hide it" },
+  waiting = { badge = "bell", label = "Pi is waiting for you - click to show or hide it" },
+  idle = { label = "Pi is idle - click to show or hide it" },
+  unknown = { badge = "alert-triangle", label = "Pi status is unreadable - click to show or hide it" },
+  not_running = { badge = "plus", label = "Pi is not running - click to start it" },
 }
 
 local KNOWN_STATES = { working = true, waiting = true, idle = true }
@@ -182,7 +195,11 @@ end
 
 local function paint(state)
   local look = LOOK[state]
-  barWidget.render(ui.glyph({ name = look.glyph, size = 14, color = look.color }))
+  local glyphs = { ui.glyph({ name = IDENTITY.glyph, size = 14, color = IDENTITY.color }) }
+  if look.badge then glyphs[#glyphs + 1] = ui.glyph({ name = look.badge, size = 12, color = IDENTITY.color }) end
+  -- The capsule clips to bar thickness, so the pair stacks on a side bar.
+  local container = barWidget.isVertical() and ui.column or ui.row
+  barWidget.render(container({ gap = 2, align = "center" }, glyphs))
   barWidget.setTooltip(look.label)
 end
 

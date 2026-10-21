@@ -45,7 +45,8 @@ local decoded = {}       -- raw JSON -> the table the runtime would decode it to
 local dispatches = {}    -- every hyprctl dispatch argv, in order
 local notifications = {} -- every noctalia.notify call
 local updates = 0
-local lastGlyph, lastTooltip = nil, nil
+local lastTree, lastTooltip = nil, nil
+local verticalBar = false
 local visible = false
 
 -- What the compositor would answer for `hyprctl -j monitors`: one monitor whose
@@ -117,13 +118,13 @@ end
 
 ui = {
   glyph = function(props) return { kind = "glyph", props = props or {} } end,
+  row = function(props, children) return { kind = "row", props = props or {}, children = children } end,
+  column = function(props, children) return { kind = "column", props = props or {}, children = children } end,
 }
 
 barWidget = {
-  render = function(tree)
-    lastGlyph = tree.kind == "glyph" and tree.props.name or nil
-    lastTooltip = nil
-  end,
+  isVertical = function() return verticalBar end,
+  render = function(tree) lastTree, lastTooltip = tree, nil end,
   setTooltip = function(text) lastTooltip = text end,
 }
 
@@ -161,11 +162,34 @@ processes[LIVE_PID] = true
 
 local function show(raw) files[STATUS_PATH] = raw end
 
-local function glyphFor(raw)
+-- The presence and color of every glyph the widget rendered, in order. The
+-- checks below read the whole presentation, not one decorative glyph, so a state
+-- stays free to choose its own icons.
+local function glyphProp(tree, prop)
+  local values = {}
+  local function walk(node)
+    if type(node) ~= "table" then return end
+    if node.kind == "glyph" then
+      table.insert(values, tostring(node.props[prop]))
+      return
+    end
+    for _, child in ipairs(node.children or {}) do walk(child) end
+  end
+  walk(tree)
+  return values
+end
+
+-- The glyph names with their colors dropped: what a monochrome screenshot, or a
+-- reader who cannot tell the palette's colors apart, would still see.
+local function shape(tree)
+  return table.concat(glyphProp(tree, "name"), ",")
+end
+
+local function treeFor(raw)
   show(raw)
   updates = updates + 1
   update()
-  return lastGlyph
+  return lastTree
 end
 
 local function tooltipFor(raw)
@@ -179,17 +203,56 @@ end
 show(nil)
 update()
 
-local working = glyphFor(WORKING)
-local waiting = glyphFor(WAITING)
-local idle = glyphFor(IDLE)
-local malformed = glyphFor(MALFORMED)
-local unrecognised = glyphFor(UNRECOGNISED)
-local pidless = glyphFor(PIDLESS)
-local deadPid = glyphFor(DEAD_PID_DOCUMENT)
-local missing = glyphFor(nil)
+local working = shape(treeFor(WORKING))
+local waiting = shape(treeFor(WAITING))
+local idle = shape(treeFor(IDLE))
+local malformed = shape(treeFor(MALFORMED))
+local unrecognised = shape(treeFor(UNRECOGNISED))
+local pidless = shape(treeFor(PIDLESS))
+local deadPid = shape(treeFor(DEAD_PID_DOCUMENT))
+local missing = shape(treeFor(nil))
 
-checkTrue("working, waiting and idle render three different glyphs",
-  working ~= waiting and waiting ~= idle and working ~= idle)
+-- One fixture per state the widget can report, so a state cannot slip out of the
+-- checks below: idle, working, waiting, unknown and not running.
+local STATE_FIXTURES = { WORKING, WAITING, IDLE, UNRECOGNISED, DEAD_PID_DOCUMENT }
+
+-- The launcher identity is the Pi glyph, whatever state the widget is in, and it
+-- is never the power symbol that read as shutting the computer down.
+for _, fixture in ipairs(STATE_FIXTURES) do
+  local names = glyphProp(treeFor(fixture), "name")
+  check("every state leads with the Pi identity glyph", "math-pi", names[1])
+  checkTrue("no state falls back to the power glyph", table.concat(names, ","):find("power", 1, true) == nil)
+end
+
+-- Colors have to be palette role tokens. A hex value would freeze the icon at
+-- the theme it was written under instead of following the user's palette.
+for _, fixture in ipairs(STATE_FIXTURES) do
+  for _, color in ipairs(glyphProp(treeFor(fixture), "color")) do
+    checkTrue("color '" .. color .. "' is a palette role token, not a fixed color", color:match("^[a-z_]+$") ~= nil)
+    -- "outline" is the border and separator role, and it is what left the old
+    -- not-running glyph at border contrast instead of icon contrast.
+    checkTrue("color '" .. color .. "' is not the outline border role", color ~= "outline")
+  end
+end
+
+-- Color is a second cue, never the only one: the five states have to stay
+-- distinguishable in a monochrome rendering too.
+local shapes = {}
+for _, fixture in ipairs(STATE_FIXTURES) do
+  local presentation = shape(treeFor(fixture))
+  checkTrue("state presentation " .. presentation .. " is not shared with another state", shapes[presentation] == nil)
+  shapes[presentation] = true
+end
+
+-- A side bar clips at its thickness, so the documented pattern stacks the glyph
+-- pair there instead of laying it out across the bar.
+verticalBar = true
+treeFor(WAITING)
+check("a side bar stacks the glyph pair", "column", lastTree.kind)
+verticalBar = false
+treeFor(WAITING)
+check("a horizontal bar keeps the glyph pair on one line", "row", lastTree.kind)
+
 check("a document that cannot be parsed reads the same as an unrecognised state", unrecognised, malformed)
 check("a document with no usable pid reads as unknown, not as gone", pidless, malformed)
 check("a recorded pid with no live process reads the same as a missing file", missing, deadPid)
@@ -204,20 +267,24 @@ end
 checkTrue("the working state says working", names(WORKING, "working"))
 checkTrue("the waiting state says waiting", names(WAITING, "waiting"))
 checkTrue("the idle state says idle", names(IDLE, "idle"))
+-- The tooltip is also the action feedback: a stopped Pi says the click starts it,
+-- a live one says the click shows or hides the scratchpad.
+checkTrue("the not-running tooltip names the action", names(nil, "start"))
+checkTrue("a live session tooltip names the action", names(IDLE, "show"))
 
 -- When the runtime directory is unset the extension writes under XDG_STATE_HOME,
 -- so the widget has to look there too.
 ENV.XDG_RUNTIME_DIR = nil
 ENV.XDG_STATE_HOME = STATE_DIR
 files[STATE_STATUS_PATH] = WORKING
-check("the XDG_STATE_HOME fallback finds the status file", working, glyphFor(nil))
+check("the XDG_STATE_HOME fallback finds the status file", working, shape(treeFor(nil)))
 files[STATE_STATUS_PATH] = nil
 
 -- And XDG_STATE_HOME itself defaults to ~/.local/state, so a session with neither
 -- variable set is still findable.
 ENV.XDG_STATE_HOME = nil
 files[HOME_STATUS_PATH] = WORKING
-check("the ~/.local/state default finds the status file", working, glyphFor(nil))
+check("the ~/.local/state default finds the status file", working, shape(treeFor(nil)))
 files[HOME_STATUS_PATH] = nil
 ENV.XDG_RUNTIME_DIR = RUNTIME_DIR
 
