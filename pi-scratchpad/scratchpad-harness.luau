@@ -1,7 +1,10 @@
 -- Drives the plugin's widget entry against a stubbed Noctalia runtime and a
 -- stubbed hyprctl, so the status file to widget state mapping is checked here
--- rather than only on a host with Noctalia, Hyprland and Pi. ./selftest.sh
--- injects the entry source as the global SOURCES table and runs this file.
+-- rather than only on a host with Noctalia, Hyprland and Pi. The hyprctl stub
+-- evaluates dispatch arguments the way a Lua-configured Hyprland does, so the
+-- compositor boundary is a parsed dispatcher table, not a command string.
+-- ./selftest.sh injects the entry source as the global SOURCES table and runs
+-- this file.
 --
 -- It is a check, not a plugin entry: plugin.toml never loads it.
 
@@ -42,7 +45,9 @@ local CONFIG = {
 local files = {}         -- absolute path -> contents
 local processes = {}     -- pid -> true for the ones the stub reports alive
 local decoded = {}       -- raw JSON -> the table the runtime would decode it to
-local dispatches = {}    -- every hyprctl dispatch argv, in order
+local calls = {}         -- the dispatcher table each dispatch expression built
+local dispatchReplies = {} -- queued { exitCode, stdout } dispatch replies, in order
+local declineNextDispatch = false -- the next dispatch request is refused before it starts
 local notifications = {} -- every noctalia.notify call
 local updates = 0
 local lastTree, lastTooltip = nil, nil
@@ -105,12 +110,46 @@ noctalia.json = {
 
 function noctalia.notify(title, body) table.insert(notifications, { title = title, body = body }) end
 
+-- What a Lua-configured Hyprland does with a dispatch: hyprctl evaluates
+-- `return hl.dispatch(<argument>)`, so the stub evaluates the same expression
+-- against the dispatcher API and records the table it built. A queued failure
+-- answers the way a real rejection does instead.
+hl = {
+  dispatch = function(dispatcher)
+    assert(type(dispatcher) == "table", "hl.dispatch needs a dispatcher table")
+    table.insert(calls, dispatcher)
+  end,
+  dsp = {
+    exec_cmd = function(command, rules)
+      return { kind = "exec_cmd", command = command, rules = rules or {} }
+    end,
+    workspace = {
+      toggle_special = function(name)
+        return { kind = "toggle_special", name = name }
+      end,
+    },
+  },
+}
+
 function noctalia.runAsync(argv, onResult)
   local result = { exitCode = 0, stdout = "", stderr = "", timedOut = false, stdoutTruncated = false, stderrTruncated = false }
   if argv[1] == "hyprctl" and argv[2] == "-j" then
     result.stdout = monitorsJson()
   elseif argv[1] == "hyprctl" and argv[2] == "dispatch" then
-    table.insert(dispatches, argv)
+    if declineNextDispatch then
+      declineNextDispatch = false
+      return false
+    end
+    local reply = table.remove(dispatchReplies, 1)
+    if reply then
+      result.exitCode = reply.exitCode
+      result.stdout = reply.stdout
+    else
+      local chunk, err = loadstring("return hl.dispatch(" .. argv[3] .. ")")
+      assert(chunk, "the dispatch argument is not a valid Lua expression: " .. tostring(err))
+      chunk()
+      result.stdout = "ok\n"
+    end
   end
   if type(onResult) == "function" then onResult(result) end
   return true
@@ -290,96 +329,194 @@ ENV.XDG_RUNTIME_DIR = RUNTIME_DIR
 
 -- ── Click routing ────────────────────────────────────────────────────────────
 
-local function hasDispatch(kind)
-  for _, argv in ipairs(dispatches) do
-    for _, argument in ipairs(argv) do
-      if argument == kind then return true end
-    end
+local function callsOf(kind)
+  local found = {}
+  for _, call in ipairs(calls) do
+    if call.kind == kind then table.insert(found, call) end
   end
-  return false
+  return found
 end
 
-local function execCount()
-  local count = 0
-  for _, argv in ipairs(dispatches) do
-    if argv[2] == "dispatch" and argv[3] == "exec" then count = count + 1 end
-  end
-  return count
+local function spawnCount()
+  return #callsOf("exec_cmd")
 end
 
-local function commandText()
-  for _, argv in ipairs(dispatches) do
-    if argv[2] == "dispatch" and argv[3] == "exec" then return argv[4] end
-  end
-  return ""
+local function lastCall()
+  return calls[#calls]
 end
 
--- Nothing running: the click has to spawn, floating at the configured size in
--- the configured special workspace, with the monitor variable set.
+-- Nothing running: the click has to spawn, in the configured special workspace,
+-- with the monitor variable set, through a Lua dispatcher expression rather
+-- than the legacy command pair.
 show(nil)
 advance(60000) -- no spawn is in flight from an earlier case
-dispatches = {}
+calls = {}
 onClick()
-local spawn = commandText()
-checkTrue("a missing session spawns Pi", hasDispatch("exec"))
-checkTrue("the spawn sets PI_HYPR_MONITOR", spawn:find("PI_HYPR_MONITOR=1", 1, true) ~= nil)
-checkTrue("the spawn floats at the configured size", spawn:find("size 900 600", 1, true) ~= nil)
-checkTrue("the spawn targets the special workspace", spawn:find("workspace special:pi]", 1, true) ~= nil)
-checkTrue("the spawn reveals the workspace it spawns into", hasDispatch("togglespecialworkspace"))
+local spawn = callsOf("exec_cmd")[1]
+check("a missing session spawns Pi", spawn and spawn.kind, "exec_cmd")
+checkTrue("the spawn sets PI_HYPR_MONITOR", spawn.command:find("PI_HYPR_MONITOR=1", 1, true) ~= nil)
+check("the spawn carries the configured size",
+  spawn.rules.size and (spawn.rules.size[1] .. "x" .. spawn.rules.size[2]), "900x600")
+checkTrue("the spawn floats and centres", spawn.rules.float == true and spawn.rules.center == true)
+check("the spawn targets the configured special workspace", spawn.rules.workspace, "special:pi")
+check("the spawn reveals the workspace it spawns into", lastCall() and lastCall().kind, "toggle_special")
+check("the reveal names the workspace once", lastCall() and lastCall().name, "pi")
 -- A quoted "~" never expands under the /bin/sh Hyprland runs, so the working
 -- directory has to be absolute by the time it is quoted.
-checkTrue("the default working directory resolves before it is quoted", spawn:find("cd '/home/user'", 1, true) ~= nil)
+checkTrue("the default working directory resolves before it is quoted", spawn.command:find("cd '/home/user'", 1, true) ~= nil)
 
 -- Pi is still booting and the click is repeated. It reads as "nothing is running"
 -- for as long as the boot takes, and a second Pi would share the session
 -- directory, so the in-flight spawn has to block it.
 onClick()
-check("a second click while Pi is starting does not spawn again", 1, execCount())
+check("a second click while Pi is starting does not spawn again", 1, spawnCount())
 
 -- The latch also lifts as soon as the session shows up in the status file,
 -- without waiting the grace out.
 show(WORKING)
 update()
 show(nil)
-dispatches = {}
+calls = {}
 CONFIG.working_dir = "~/project"
 onClick()
-checkTrue("a ~/ working directory resolves too", commandText():find("cd '/home/user/project'", 1, true) ~= nil)
+checkTrue("a ~/ working directory resolves too", callsOf("exec_cmd")[1].command:find("cd '/home/user/project'", 1, true) ~= nil)
 CONFIG.working_dir = "~"
 
 -- And a spawn that never publishes a session at all must not wedge the widget:
 -- once the grace lapses the next click is obeyed again.
 show(nil)
 advance(60000)
-dispatches = {}
+calls = {}
 onClick()
-check("the spawn grace lapses", 1, execCount())
+check("the spawn grace lapses", 1, spawnCount())
 
 -- A live session: the click has to toggle, not spawn a second Pi.
 show(WORKING)
 update()
-dispatches = {}
+calls = {}
 onClick()
-checkTrue("a live session toggles the workspace", hasDispatch("togglespecialworkspace"))
-checkTrue("a live session never spawns", not hasDispatch("exec"))
+check("a live session toggles the workspace", lastCall() and lastCall().kind, "toggle_special")
+check("a live session never spawns", 0, spawnCount())
 
 -- A status that cannot be read still means a session was there, so it toggles
 -- instead of risking a duplicate.
-dispatches = {}
+calls = {}
 show(MALFORMED)
 onClick()
-checkTrue("an unreadable status toggles instead of spawning", not hasDispatch("exec"))
+check("an unreadable status toggles instead of spawning", 0, spawnCount())
 
 -- "special:pi" and "pi" name the same workspace; the plugin must not build
 -- "special:special:pi".
 CONFIG.workspace = "special:hi"
-dispatches = {}
+calls = {}
 show(nil)
+advance(60000)
 onClick()
-checkTrue("a special: prefix in the setting is not doubled",
-  commandText():find("workspace special:hi]", 1, true) ~= nil and
-  commandText():find("special:special:", 1, true) == nil)
+check("a special: prefix in the setting is not doubled", callsOf("exec_cmd")[1].rules.workspace, "special:hi")
+check("the reveal is not doubled either", lastCall().name, "hi")
 CONFIG.workspace = "pi"
+
+-- Configured values reach the compositor unchanged, however they are spelled: a
+-- quote or a backslash in a spawn command or a workspace name must not close the
+-- Lua expression and must not be mangled on the way through it.
+CONFIG.workspace = 'p"i\\x'
+CONFIG.spawn = 'pi "quoted" \\ backslash'
+calls = {}
+show(nil)
+advance(60000)
+onClick()
+check("a spawn command with a quote and a backslash arrives unchanged", callsOf("exec_cmd")[1].command,
+  "cd '/home/user' && PI_HYPR_MONITOR=1 foot pi \"quoted\" \\ backslash")
+check("a workspace name with a quote and a backslash arrives unchanged", lastCall().name, 'p"i\\x')
+check("and is still targeted as a special workspace", callsOf("exec_cmd")[1].rules.workspace, 'special:p"i\\x')
+CONFIG.workspace = "pi"
+CONFIG.spawn = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
+
+-- ── A rejected dispatch ──────────────────────────────────────────────────────
+
+-- A compositor that refuses the expression has to say why, and a refused launch
+-- has to stay retryable instead of holding the spawn latch down.
+show(nil)
+advance(60000)
+calls, notifications = {}, {}
+dispatchReplies = { { exitCode = 7, stdout = "error: hl.dsp.exec_cmd: unknown effect 'float'\n" } }
+onClick()
+check("a rejected spawn is announced", 1, #notifications)
+checkTrue("the diagnostic carries the compositor's error",
+  notifications[1] and notifications[1].body:find("unknown effect 'float'", 1, true) ~= nil)
+check("a rejected spawn does not reveal the workspace", 0, #callsOf("toggle_special"))
+calls = {}
+onClick()
+check("a failed launch is retried on the next click", 1, spawnCount())
+
+-- A launch Hyprland accepted but could not reveal is not a launch to retry: Pi is
+-- already booting, so the latch stays down and the next click must not start a
+-- second Pi. The queued "ok" is the accepted exec; the reveal then fails.
+show(nil)
+advance(60000)
+calls, notifications = {}, {}
+dispatchReplies = {
+  { exitCode = 0, stdout = "ok\n" },
+  { exitCode = 7, stdout = "error: Could not resolve special workspace\n" },
+}
+onClick()
+check("a reveal Hyprland refused is announced", 1, #notifications)
+calls = {}
+onClick()
+check("a launched Pi is not spawned twice when the reveal failed", 0, spawnCount())
+advance(60000)
+calls = {}
+onClick()
+check("the latch still lapses after a failed reveal", 1, spawnCount())
+
+-- A rejected toggle is announced too, and does not stop the next click.
+show(WORKING)
+update()
+calls, notifications = {}, {}
+dispatchReplies = { { exitCode = 7, stdout = "error: Invalid special workspace\n" } }
+onClick()
+check("a rejected toggle is announced", 1, #notifications)
+calls, notifications = {}, {}
+onClick()
+check("a rejected toggle is retried on the next click", 1, #callsOf("toggle_special"))
+
+-- A hyprlang `.conf` compositor answers a Lua expression with "Invalid
+-- dispatcher" and a zero exit status, so success has to be the "ok" reply and
+-- not merely a zero status.
+show(WORKING)
+update()
+calls, notifications = {}, {}
+dispatchReplies = { { exitCode = 0, stdout = "Invalid dispatcher\n" } }
+onClick()
+check("a reply that is not ok is a failed dispatch", 1, #notifications)
+checkTrue("the diagnostic carries the legacy reply", notifications[1].body:find("Invalid dispatcher", 1, true) ~= nil)
+check("the refused reply is not recorded as a dispatch", 0, #callsOf("toggle_special"))
+dispatchReplies = {}
+
+-- The runtime can refuse to start the process at all, so no result ever arrives:
+-- that local refusal has to be announced too, and it must not leave the spawn
+-- latch holding down with nothing running.
+show(nil)
+advance(60000)
+calls, notifications = {}, {}
+declineNextDispatch = true
+onClick()
+check("a launch the runtime declined is announced", 1, #notifications)
+calls = {}
+onClick()
+check("a launch the runtime declined is retried on the next click", 1, spawnCount())
+check("and the retry still reveals the workspace", lastCall().kind, "toggle_special")
+
+-- The same for a toggle.
+show(WORKING)
+update()
+calls, notifications = {}, {}
+declineNextDispatch = true
+onClick()
+check("a toggle the runtime declined is announced", 1, #notifications)
+calls, notifications = {}, {}
+onClick()
+check("a toggle the runtime declined is retried on the next click", 1, #callsOf("toggle_special"))
 
 -- ── The waiting notification ─────────────────────────────────────────────────
 
@@ -436,10 +573,10 @@ check("the second placement does not announce it again", 0, notifyCount())
 
 show(nil)
 advance(60000)
-dispatches = {}
+calls = {}
 firstOnClick()
 secondOnClick()
-check("two placements do not start two Pis", 1, execCount())
+check("two placements do not start two Pis", 1, spawnCount())
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then
