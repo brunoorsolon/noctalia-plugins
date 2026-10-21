@@ -46,7 +46,7 @@ Hiding a special workspace does not touch the process. Pi keeps running and keep
 
 The workspace is one Pi, not one per project. It starts in the configured directory and Pi's own tools take paths from there. Anyone who needs a session rooted somewhere specific launches Pi as an ordinary window.
 
-A click never fails silently. If Hyprland refuses the dispatch — a legacy `hyprland.conf` configuration, an unknown special workspace, a compositor that is not reachable — the widget sends a notification carrying Hyprland's own error, and the click stays retryable instead of latching the spawn.
+A click never fails silently. If Hyprland refuses the dispatch — a legacy `hyprland.conf` configuration, an unknown special workspace, a compositor that is not reachable — the widget sends a notification carrying Hyprland's own error; if Noctalia cannot start `hyprctl` at all, it says so. Either way the click stays retryable instead of latching the spawn.
 
 ### Settings
 

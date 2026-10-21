@@ -173,13 +173,21 @@ end
 
 local function dispatch(expression, onDone)
   local done = onDone or function() end
-  return noctalia.runAsync({ "hyprctl", "dispatch", expression }, function(result)
+  local accepted = noctalia.runAsync({ "hyprctl", "dispatch", expression }, function(result)
     if dispatchSucceeded(result) then return done(true) end
     -- The click has to say what Hyprland said, or a misconfigured compositor
     -- looks exactly like a widget that does nothing.
-    noctalia.notify("Hyprland refused the Pi scratchpad dispatch", dispatchError(result))
+    noctalia.notify("Pi scratchpad dispatch failed", dispatchError(result))
     done(false)
   end)
+  -- The runtime can decline to start the process at all, and then no result ever
+  -- arrives. A click reported as obeyed would hold the spawn latch down with
+  -- nothing running, so the local refusal is reported and cleared here.
+  if accepted == false then
+    noctalia.notify("Pi scratchpad dispatch failed", "hyprctl could not be started, so nothing was sent to Hyprland.")
+    done(false)
+  end
+  return accepted
 end
 
 local function compositor(op, onDone)

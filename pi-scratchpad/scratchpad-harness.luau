@@ -47,6 +47,7 @@ local processes = {}     -- pid -> true for the ones the stub reports alive
 local decoded = {}       -- raw JSON -> the table the runtime would decode it to
 local calls = {}         -- the dispatcher table each dispatch expression built
 local dispatchReplies = {} -- queued { exitCode, stdout } dispatch replies, in order
+local declineNextDispatch = false -- the next dispatch request is refused before it starts
 local notifications = {} -- every noctalia.notify call
 local updates = 0
 local lastGlyph, lastTooltip = nil, nil
@@ -134,6 +135,10 @@ function noctalia.runAsync(argv, onResult)
   if argv[1] == "hyprctl" and argv[2] == "-j" then
     result.stdout = monitorsJson()
   elseif argv[1] == "hyprctl" and argv[2] == "dispatch" then
+    if declineNextDispatch then
+      declineNextDispatch = false
+      return false
+    end
     local reply = table.remove(dispatchReplies, 1)
     if reply then
       result.exitCode = reply.exitCode
@@ -420,6 +425,31 @@ check("a reply that is not ok is a failed dispatch", 1, #notifications)
 checkTrue("the diagnostic carries the legacy reply", notifications[1].body:find("Invalid dispatcher", 1, true) ~= nil)
 check("the refused reply is not recorded as a dispatch", 0, #callsOf("toggle_special"))
 dispatchReplies = {}
+
+-- The runtime can refuse to start the process at all, so no result ever arrives:
+-- that local refusal has to be announced too, and it must not leave the spawn
+-- latch holding down with nothing running.
+show(nil)
+advance(60000)
+calls, notifications = {}, {}
+declineNextDispatch = true
+onClick()
+check("a launch the runtime declined is announced", 1, #notifications)
+calls = {}
+onClick()
+check("a launch the runtime declined is retried on the next click", 1, spawnCount())
+check("and the retry still reveals the workspace", lastCall().kind, "toggle_special")
+
+-- The same for a toggle.
+show(WORKING)
+update()
+calls, notifications = {}, {}
+declineNextDispatch = true
+onClick()
+check("a toggle the runtime declined is announced", 1, #notifications)
+calls, notifications = {}, {}
+onClick()
+check("a toggle the runtime declined is retried on the next click", 1, #callsOf("toggle_special"))
 
 -- ── The waiting notification ─────────────────────────────────────────────────
 
