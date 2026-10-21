@@ -50,6 +50,10 @@ local function dispatch(action, padId)
 end
 
 noctalia.state.watch(shared.REQUEST_KEY, function(request)
+  -- Every notification carries its own value, so two requests published at the
+  -- same moment are both delivered. The nonce is a change token, not an order:
+  -- a lower one is never treated as stale, and the revision below is the order
+  -- this controller acts on.
   if type(request) ~= "table" or type(request.action) ~= "string" or type(request.nonce) ~= "number" then
     refuse("malformed request")
     return

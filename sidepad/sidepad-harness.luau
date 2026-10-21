@@ -33,9 +33,14 @@ end
 -- own snapshot. Watchers fire on every set, as the host's do.
 local stateStore = {}
 local watchers = {}
+-- Wall-clock milliseconds, moved by the harness so a later request is visibly
+-- later. The host exposes this clock and no monotonic one.
+local clock = 1730000000000
+local function advance(ms) clock = clock + ms end
 
 noctalia = {}
 noctalia.string = { trim = function(value) return (value:gsub("^%s+", ""):gsub("%s+$", "")) end }
+function noctalia.nowMs() return clock end
 noctalia.state = {
   set = function(key, value)
     stateStore[key] = copy(value)
@@ -161,24 +166,51 @@ check("a caller cannot add a pad to the snapshot", 0, #reread.pads)
 
 local before = status().revision
 onClick()
-check("a widget click publishes a request", 1, request().nonce)
+check("a widget click publishes a request", clock, request().nonce)
 check("the widget's request names its action", "toggle", request().action)
 check("the controller answers the widget's request", before + 1, status().revision)
 check("a declared but unimplemented action is refused", "toggle is not available yet", status().error)
 
--- The panel runs in its own VM with its own module instance. The identical
--- request must still change what the controller sees.
+-- The panel runs in its own VM with its own module instance. A later request
+-- carries a larger nonce even though the two VMs share no memory.
+advance(5)
 before = status().revision
 onToggle()
-check("an identical request from the panel is still published", 2, request().nonce)
+check("a later request from another entry VM carries a larger nonce", true, request().nonce > clock - 5)
 check("the controller answers the panel's request too", before + 1, status().revision)
 
--- The helper refuses a command that is not in the contract, without moving the
--- nonce, so the controller never receives an invented action.
+-- Overlapping publications must never step the nonce back. With the clock
+-- standing still two entries publishing at once share one nonce, and neither is
+-- lower than what was published before; both are still delivered.
+local frozen = request().nonce
+before = status().revision
+onClick()
+onToggle()
+check("overlapping publications never carry a smaller nonce", true, request().nonce >= frozen)
+check("every overlapping publication is still delivered", before + 2, status().revision)
+
+-- The nonce is a change token, not an order: a lower one is a real request and
+-- must be dispatched, not discarded as stale.
+before = status().revision
+noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 1, action = "refresh" })
+check("a lower nonce is not treated as stale", before + 1, status().revision)
+check("and its action is dispatched", "refresh is not available yet", status().error)
+
+-- The host notifies watchers on every set, so two identical requests published
+-- in the same millisecond are both delivered even though their nonces match.
+local identical = { nonce = clock, action = "toggle" }
+before = status().revision
+noctalia.state.set(serviceShared.REQUEST_KEY, identical)
+noctalia.state.set(serviceShared.REQUEST_KEY, identical)
+check("identical consecutive requests are both delivered", before + 2, status().revision)
+
+-- The helper refuses a command that is not in the contract, without publishing
+-- anything, so the controller never receives an invented action.
+local publishedNonce = request().nonce
 local refused, reason = widgetShared.request("explode")
 check("an undeclared command is refused by the helper", nil, refused)
 check("the refusal names the command", "unsupported action: explode", reason)
-check("a refused command does not move the nonce", 2, request().nonce)
+check("a refused command does not publish a request", publishedNonce, request().nonce)
 
 -- IPC lands on the same dispatch, so its answer cannot differ from the UI's.
 before = status().revision

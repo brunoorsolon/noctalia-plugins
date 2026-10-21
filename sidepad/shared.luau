@@ -1,8 +1,8 @@
 -- The contract the controller, the bar widget and the selector panel share: the
 -- two state keys, the command names, and the request helper. Every entry runs in
--- its own VM with its own module instance, so the nonce is read back from shared
--- state instead of being counted here: two identical requests from two entries
--- still change the request the controller sees.
+-- its own VM with its own module instance, so the helper works without shared
+-- memory: each call publishes one request value, and the controller acts on the
+-- requests in the order it receives them.
 
 local M = {}
 
@@ -33,13 +33,19 @@ end
 -- Publishes one request and returns it. `padId` is optional because only the
 -- actions that name a pad carry one. An undeclared action is refused before it
 -- reaches the controller, so a caller cannot publish a malformed command.
+--
+-- The nonce is taken from the host clock at publication time, without reading
+-- shared state. The plugin API has no atomic increment, so a counter read before
+-- the write can step backwards when two entry VMs publish at once, and no
+-- monotonic clock is exposed. A later publication therefore never carries a
+-- smaller nonce. Two requests inside the same millisecond share one, and they
+-- stay observable because the host notifies every watcher on every set; the
+-- controller's own revision is the strict order it acts on.
 function M.request(action, padId)
   if not M.isAction(action) then
     return nil, "unsupported action: " .. tostring(action)
   end
-  local previous = noctalia.state.get(M.REQUEST_KEY)
-  local nonce = type(previous) == "table" and tonumber(previous.nonce) or 0
-  local request = { nonce = nonce + 1, action = action }
+  local request = { nonce = noctalia.nowMs(), action = action }
   if padId ~= nil then
     request.padId = padId
   end
