@@ -1,0 +1,71 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+# Supersede only the same PR; pushes keep independent runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: ${{ github.event_name == 'pull_request' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect test applicability
+        id: changes
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            pull_request) base="$PR_BASE_SHA" ;;
+            push) base="$PUSH_BEFORE_SHA" ;;
+            *) base="" ;;
+          esac
+
+          only_exempt_paths() (
+            [[ "$base" =~ ^[0-9a-f]{40}$ ]] || exit 1
+            git cat-file -e "$base^{commit}" 2>/dev/null || exit 1
+            changes="$(mktemp)" || exit 1
+            trap 'rm -f "$changes"' EXIT
+            # Keep source deletions visible when files move into an exempt folder.
+            git diff --name-only -z --no-renames "$base" HEAD -- > "$changes" || exit 1
+            [[ -s "$changes" ]] || exit 1
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                # Extend only with folders that have no runtime, test, or build inputs.
+                docs/*) ;;
+                *) exit 1 ;;
+              esac
+            done < "$changes"
+          )
+
+          skip_tests=false
+          if only_exempt_paths; then
+            skip_tests=true
+          fi
+          echo "skip_tests=$skip_tests" >> "$GITHUB_OUTPUT"
+
+      # Give every test-only setup/check step this condition, not the whole job.
+      - name: Placeholder validation
+        if: steps.changes.outputs.skip_tests != 'true'
+        run: echo 'Placeholder only. Replace this step with project checks before requiring validation for merge.'
+
+      - name: Report tests not applicable
+        if: steps.changes.outputs.skip_tests == 'true'
+        run: echo 'Tests not applicable — every changed path is in the exempt-folder allowlist. Tests did not run; project checks are still placeholders until configured.'
