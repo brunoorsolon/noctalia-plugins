@@ -87,8 +87,8 @@ The widget is a 20 × 20 pixel-display robot/TV head. Its outline stays the same
 | --- | --- | --- |
 | Working | Pi is running a turn | Heartbeat scrolling horizontally to the left |
 | Waiting | Pi wants an answer or an approval | Bell swaying twice, then resting briefly |
-| Idle / stopped | Pi is idle, or there is no live monitored session | Bold π; no plus badge or separate stopped appearance |
-| Waiting, acknowledged | You viewed the waiting scratchpad and hid it | Bold π; tooltip still says Pi is waiting |
+| Idle / stopped | Pi is idle, or there is no live monitored session | Thin π; no plus badge or separate stopped appearance |
+| Waiting, acknowledged | You viewed the waiting scratchpad and hid it | Thin π; tooltip still says Pi is waiting |
 | Unknown | The file exists and Pi is alive, but the document cannot be read or its state is unrecognised | Exclamation mark |
 
 The artwork inherits **Icon Color → widget Color → theme default** through Noctalia's native glyph rendering. It no longer forces `on_surface` (which bypassed the presentation overrides and left the icon white). Pick a color with enough contrast against your bar. Shapes and tooltips, rather than color alone, carry meaning.

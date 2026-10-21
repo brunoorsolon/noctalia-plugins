@@ -58,7 +58,7 @@ label { display: flex; align-items: center; gap: 8px; } input { cursor: pointer;
 footer { margin-top: 24px; font-size: 14px; } svg { display: block; flex-shrink: 0; }
 </style>
 <h1>Pi Scratchpad · final artwork</h1>
-<p>One pixel-display robot. Bold π at rest, a scrolling heartbeat while working, and a swaying bell when Pi needs you. Stopped uses exactly the idle artwork.</p>
+<p>One pixel-display robot. Thin π at rest, a thin scrolling heartbeat while working, and an outline bell swaying when Pi needs you. The robot outline stays thick. Stopped uses exactly the idle artwork.</p>
 <div class="controls">
 <label>Icon color <input id="color" type="color" value="#b08bf5"></label>
 <label>Bar <select id="theme"><option value="#201c29">Dark</option><option value="#f5f0fa">Light</option><option value="#000000">Black</option></select></label>

@@ -26,13 +26,23 @@ local head = {
 }
 local pi = {
   " ########## ",
-  " ########## ",
-  "   ##  ##   ",
-  "   ##  ##   ",
-  "   ##  ##   ",
-  "   ##  ##   ",
-  "  ###  ###  ",
-  "  ##    ##  ",
+  "   #   #    ",
+  "   #   #    ",
+  "   #   #    ",
+  "   #   #    ",
+  "   #   #    ",
+  "   #   #    ",
+  "  #     ##  ",
+}
+local heartbeat = {
+  "     #      ",
+  "     ##     ",
+  "   # # #    ",
+  "### #  # ###",
+  "       # #  ",
+  "       # #  ",
+  "        #   ",
+  "            ",
 }
 local bell = {
   "     ##     ",
@@ -65,11 +75,8 @@ function icon.frame(state, time)
       local lit
       if state == "working" then
         -- One heartbeat travels left through the display, wrapping at its edge.
-        local heights = { 4, 4, 4, 3, 5, 1, 7, 4, 4, 4, 4, 4 }
-        local index = (x + phase - 1) % 12 + 1
-        local nextIndex = index % 12 + 1
-        lit = y >= math.min(heights[index], heights[nextIndex]) and
-          y <= math.max(heights[index], heights[nextIndex])
+        local column = (x + phase - 1) % 12 + 1
+        lit = heartbeat[y]:sub(column, column) == "#"
       elseif state == "waiting" then
         -- Sway the bell's body around its top; pause between pairs of rings.
         local sway = ({ 0, -1, 0, 1, 0, -1, 0, 1, 0, 0, 0, 0 })[phase % 12 + 1]
