@@ -1,6 +1,6 @@
 -- A small pixel-display robot. Every lit pixel is an uncolored native glyph,
 -- so Noctalia applies Icon Color, then widget Color, then the theme default.
-local icon = { interval = 125, size = 20 }
+local icon = { interval = 125, size = 20, pixelSize = 2 }
 
 local head = {
   "                    ",
@@ -98,10 +98,10 @@ function icon.render(state, time)
   for y, line in ipairs(icon.frame(state, time)) do
     local pixels = {}
     for x = 1, icon.size do
-      -- Glyph measurements round to whole pixels; fixed flex cells preserve
-      -- the grid spacing when the widget uses a fractional scale such as 1.25.
+      -- Overscan each cell: the font's rounded corners, alpha fringe and snapped
+      -- positions otherwise leave dotted seams, especially at fractional scales.
       pixels[x] = ui.row({ key = tostring(x), width = 1, height = 1, justify = "center", align = "center" }, {
-        ui.glyph({ name = "square-filled", size = 4 / 3, opacity = line:sub(x, x) == "#" and 1 or 0 }),
+        ui.glyph({ name = "square-filled", size = icon.pixelSize, opacity = line:sub(x, x) == "#" and 1 or 0 }),
       })
     end
     rows[y] = ui.row({ key = tostring(y), gap = 0, width = icon.size, height = 1 }, pixels)
