@@ -1,0 +1,14 @@
+{
+  "settings.narrow_width.label": "Narrow width",
+  "settings.narrow_width.description": "Width of a pad in narrow mode, in logical pixels.",
+  "settings.wide_width.label": "Wide width",
+  "settings.wide_width.description": "Width of a pad in wide mode, in logical pixels.",
+  "settings.edge_gap.label": "Edge gap",
+  "settings.edge_gap.description": "Gap between the pad and the screen edge it is attached to, in logical pixels.",
+  "settings.top_gap.label": "Top gap",
+  "settings.top_gap.description": "Gap between the pad and the top of the screen, in logical pixels.",
+  "settings.bottom_gap.label": "Bottom gap",
+  "settings.bottom_gap.description": "Gap between the pad and the bottom of the screen, in logical pixels.",
+  "settings.launch_timeout_ms.label": "Launch timeout",
+  "settings.launch_timeout_ms.description": "How long to wait for a launched pad's window before reporting a failure, in milliseconds."
+}
