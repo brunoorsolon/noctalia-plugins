@@ -59,6 +59,35 @@ local function nonEmpty(value)
   return type(value) == "string" and noctalia.string.trim(value) ~= ""
 end
 
+-- The host decoder preallocates the JSON array and writes every original index,
+-- so a JSON null leaves a hole while the later indices stay in place. ipairs
+-- stops at the first hole and the length operator is not defined for a sparse
+-- table, so a list is proved dense before anything iterates it: a hidden pad or
+-- a hidden command argument would otherwise be accepted without an error.
+local function denseLength(list)
+  if type(list) ~= "table" then
+    return nil, "must be an array"
+  end
+  local count, highest = 0, 0
+  for key in pairs(list) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      return nil, "must be an array"
+    end
+    count = count + 1
+    if key > highest then
+      highest = key
+    end
+  end
+  if count ~= highest then
+    for position = 1, highest do
+      if list[position] == nil then
+        return nil, ("has no value at position %d; a JSON null is not allowed here"):format(position)
+      end
+    end
+  end
+  return highest
+end
+
 local function padLabel(entry, index)
   if type(entry) == "table" and nonEmpty(entry.id) then
     return "pad '" .. entry.id .. "'"
@@ -87,10 +116,11 @@ local function readPad(entry, index)
     return nil, label .. ": icon must be a non-empty string when it is set"
   end
   local command = entry.command
-  -- shortcut: a JSON null inside an array is dropped by the host decoder before
-  -- this check runs, so a null argument leaves the remaining argv intact but
-  -- undetectable; revisit if the host ever preserves nulls.
-  if type(command) ~= "table" or #command == 0 then
+  local argumentCount, commandProblem = denseLength(command)
+  if not argumentCount then
+    return nil, label .. ": command " .. commandProblem
+  end
+  if argumentCount == 0 then
     return nil, label .. ": command must be a non-empty array"
   end
   for position, argument in ipairs(command) do
@@ -147,16 +177,16 @@ local function loadPads()
   if document.version ~= EXPECTED_VERSION then
     return nil, ("%s: version must be %d, got %s"):format(path, EXPECTED_VERSION, tostring(document.version))
   end
-  local entries = document.pads
-  -- A JSON object decodes to a table too, so an object keyed by pad id is caught
+  -- A JSON object decodes to a table too, so an object keyed by pad id is refused
   -- here instead of silently contributing no pads. An empty object decodes to the
   -- same table as an empty array, so `{}` reads as "no pads configured" and there
   -- is nothing further to distinguish.
-  if type(entries) ~= "table" or (next(entries) ~= nil and #entries == 0) then
-    return nil, path .. ": pads must be an array"
+  local entries, entriesProblem = denseLength(document.pads)
+  if not entries then
+    return nil, path .. ": pads " .. entriesProblem
   end
   local pads, ids, classes = {}, {}, {}
-  for index, entry in ipairs(entries) do
+  for index, entry in ipairs(document.pads) do
     local id = type(entry) == "table" and entry.id or nil
     local class = type(entry) == "table" and entry.class or nil
     -- Duplicates are reported first so the message names the clash the user has

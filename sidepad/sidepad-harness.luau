@@ -108,16 +108,19 @@ local function decodeJson(text)
   local function parseArray()
     take("[")
     local out = {}
+    local position = 1
     skip()
     if peek() == "]" then
       cursor = cursor + 1
       return out
     end
     while true do
-      -- shortcut: these fixtures carry no JSON null, so an array null would be
-      -- inserted as nothing rather than as a hole; add a placeholder if one is
-      -- ever needed.
-      table.insert(out, parseValue())
+      -- The host writes every original index, so a JSON null stays a hole with
+      -- the later indices in place; keeping that shape is what lets a fixture
+      -- prove the controller refuses a hidden pad or command argument.
+      local value = parseValue()
+      if value ~= nil then out[position] = value end
+      position = position + 1
       skip()
       if peek() == "]" then
         cursor = cursor + 1
@@ -611,7 +614,23 @@ refusedAtStartup(
 refusedAtStartup(
   "a command given as a string",
   '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": "kitty --class pad-terminal" }] }',
-  "command must be a non-empty array"
+  "command must be an array"
+)
+
+-- The host leaves a JSON null as a hole that ipairs stops at, so a null would
+-- hide the value behind it. Both lists are refused rather than half-validated.
+refusedAtStartup(
+  "a null in a command",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": ["kitty", null, 42] }] }',
+  "command has no value at position 2"
+)
+refusedAtStartup(
+  "a null in the pad list",
+  '{ "version": 1, "pads": ['
+    .. '{ "id": "one", "name": "One", "class": "class-one", "command": ["kitty"] },'
+    .. 'null,'
+    .. '{ "id": "two", "name": "Two", "class": "class-two", "command": ["kitty"] }] }',
+  "pads has no value at position 2"
 )
 
 -- The executable check goes through the host, not through a guess about PATH.
