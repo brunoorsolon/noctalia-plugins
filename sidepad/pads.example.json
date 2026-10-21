@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "pads": [
+    {
+      "id": "terminal",
+      "name": "Terminal",
+      "icon": "terminal-symbolic",
+      "class": "noctalia-sidepad-terminal",
+      "command": ["kitty", "--class", "noctalia-sidepad-terminal"]
+    },
+    {
+      "id": "browser",
+      "name": "Browser",
+      "class": "noctalia-sidepad-browser",
+      "command": ["firefox", "--class", "noctalia-sidepad-browser"]
+    }
+  ]
+}

@@ -93,6 +93,11 @@ trap 'rm -rf "$work"' EXIT
     printf '\n]==],\n'
   done
   printf '}\n'
+  # The shipped example is loaded by the harness as a real startup fixture, so a
+  # corrupt example fails here instead of only in review.
+  printf 'EXAMPLE_PADS = [==[\n'
+  cat pads.example.json
+  printf '\n]==]\n'
   cat sidepad-harness.luau
 } >"$work/run.luau"
 
