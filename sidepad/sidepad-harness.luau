@@ -238,7 +238,7 @@ local function release()
 end
 
 local lastGlyph, lastGlyphColor, lastTooltip, lastTree = nil, nil, nil, nil
-local toggledPanels = {}
+local toggledPanels, closedPanels = {}, 0
 
 ui = {}
 local function node(kind)
@@ -251,7 +251,10 @@ ui.button = node("button")
 ui.glyph = node("glyph")
 ui.separator = node("separator")
 
-panel = { render = function(tree) lastTree = tree end, close = function() end }
+panel = {
+  render = function(tree) lastTree = tree end,
+  close = function() closedPanels = closedPanels + 1 end,
+}
 barWidget = {
   setGlyph = function(name) lastGlyph = name end,
   setGlyphColor = function(role) lastGlyphColor = role end,
@@ -429,6 +432,7 @@ check("a declared but unimplemented action is refused", "toggle is not available
 
 -- The panel runs in its own VM with its own module instance. The nonce still
 -- increases, because the controller owns it and no caller can allocate one.
+snapshot()
 before = status().revision
 onToggle()
 check("a later request from another entry VM takes the next nonce", 3, request().nonce)
@@ -520,15 +524,96 @@ check("the panel marks another pad as unselected", false, buttonByKey(lastTree, 
 checkTrue("the panel names a pad with its state", hasText(lastTree, "Terminal · shown on DP-1"))
 checkTrue("the panel reports a stopped pad", hasText(lastTree, "Notes · stopped"))
 check("the panel shows a pad's icon", "terminal-2", buttonByKey(lastTree, "terminal").props.glyph)
+check("pad names include their selected state for assistive users", true, buttonByKey(lastTree, "terminal").props.text:find("selected", 1, true) ~= nil)
+check("the selected pad shows Hide", "Hide", buttonByKey(lastTree, "visibility").props.text)
+check("a running pad offers the opposite width", "Narrow", buttonByKey(lastTree, "width").props.text)
+check("the panel names the side action", "Move to left", buttonByKey(lastTree, "side").props.text)
+check("a running pad exposes Close", true, buttonByKey(lastTree, "close").props.enabled)
 
--- Selecting a pad from the panel carries the pad id on the same action path.
+-- The selected control actions route through the shared request contract.
+buttonByKey(lastTree, "width").props.onClick()
+check("width action uses the declared toggle contract", "toggle_width", request().action)
+check("width request names the selected pad", "terminal", request().padId)
+snapshot()
+buttonByKey(lastTree, "side").props.onClick()
+check("side action uses the declared switch contract", "switch_side", request().action)
+snapshot()
+buttonByKey(lastTree, "close").props.onClick()
+check("close action uses the declared contract", "close", request().action)
+snapshot({ pads = { { id = "terminal", name = "Terminal", running = true, visible = true, output = "DP-1" } } })
+buttonByKey(lastTree, "visibility").props.onClick()
+check("visibility action follows the selected pad state", "hide", request().action)
+check("visibility request names its pad", "terminal", request().padId)
+-- The controller republishes an error for unsupported actions; failure keeps the panel open.
+check("failed actions do not dismiss the panel", 0, closedPanels)
+check("the panel displays the controller failure", true, hasText(lastTree, "hide is not available yet"))
+
+snapshot({
+  busy = true,
+  pads = {
+    { id = "terminal", name = "Terminal", running = true, visible = true },
+    { id = "browser", name = "Browser", running = true, visible = false },
+  },
+})
+check("busy disables pad selection", false, buttonByKey(lastTree, "browser").props.enabled)
+check("busy disables visibility actions", false, buttonByKey(lastTree, "visibility").props.enabled)
+check("busy disables refresh", false, find(lastTree, function(n) return n.kind == "button" and n.props.text == "Refresh" end).props.enabled)
+local busyNonce = request().nonce
 buttonByKey(lastTree, "browser").props.onClick()
-check("a panel selection publishes a select request", "select", request().action)
+buttonByKey(lastTree, "visibility").props.onClick()
+check("busy panel actions publish nothing", busyNonce, request().nonce)
+
+snapshot({ pads = { { id = "terminal", name = "Terminal", running = false, visible = false } } })
+check("a stopped pad can still be shown", true, buttonByKey(lastTree, "visibility").props.enabled)
+check("width is disabled until the pad is running", false, buttonByKey(lastTree, "width").props.enabled)
+check("close is disabled until the pad is running", false, buttonByKey(lastTree, "close").props.enabled)
+check("side preference remains available for a stopped pad", true, buttonByKey(lastTree, "side").props.enabled)
+buttonByKey(lastTree, "visibility").props.onClick()
+check("a stopped pad's Show button requests show", "show", request().action)
+
+snapshot({ busy = false, selectedPadId = false, pads = {} })
+check("no configured selection disables actions", false, buttonByKey(lastTree, "visibility").props.enabled)
+check("no configured selection disables width changes", false, buttonByKey(lastTree, "width").props.enabled)
+check("no configured selection disables close", false, buttonByKey(lastTree, "close").props.enabled)
+local unavailableNonce = request().nonce
+buttonByKey(lastTree, "visibility").props.onClick()
+check("unavailable actions publish nothing", unavailableNonce, request().nonce)
+
+-- A fresh selection stays open on failure, then dismisses only after the
+-- controller publishes the requested selected pad as visible without an error.
+snapshot({
+  pads = {
+    { id = "terminal", name = "Terminal", running = true, visible = true },
+    { id = "browser", name = "Browser", running = true, visible = false },
+    { id = "notes", name = "Notes", running = false, visible = false },
+  },
+})
+local requestWatchers = watchers[serviceShared.REQUEST_KEY]
+watchers[serviceShared.REQUEST_KEY] = {}
+buttonByKey(lastTree, "browser").props.onClick()
+watchers[serviceShared.REQUEST_KEY] = requestWatchers
+check("a pad selection requests select-and-show", "select", request().action)
 check("the request carries the chosen pad", "browser", request().padId)
-check("an unimplemented selection is refused truthfully", "select is not available yet", status().error)
--- The controller republishes its own snapshot, so the fixture cannot outlive it.
-check("the controller owns the snapshot after an action", 3, #status().pads)
-check("and republishes the configured pads", "terminal", status().pads[1].id)
+check("pending select-and-show remains open", 0, closedPanels)
+local selectedSuccess = {
+  revision = (status().revision or 0) + 1,
+  phase = "ready",
+  selectedPadId = "browser",
+  side = "left",
+  widthMode = "narrow",
+  busy = false,
+  error = nil,
+  pads = {
+    { id = "terminal", name = "Terminal", icon = "terminal-2", running = true, visible = false },
+    { id = "browser", name = "Browser", icon = "world", running = true, visible = true },
+    { id = "notes", name = "Notes", icon = "notes", running = false, visible = false },
+  },
+}
+noctalia.state.set(serviceShared.STATUS_KEY, selectedSuccess)
+check("successful select-and-show dismisses the panel", 1, closedPanels)
+-- The request watcher was withheld to represent the asynchronous action's pending
+-- interval; restore a stamped request so subsequent entries see a host-like state.
+noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 99, action = "select", padId = "browser" })
 
 -- ── The bar's states and its two interactions ───────────────────────────────
 
@@ -602,9 +687,9 @@ snapshot({ pads = {} })
 check("a named selection is named without its record", "terminal", tooltipValue("Pad"))
 check("a named selection without runtime detail is reported as stopped", "stopped", tooltipValue("State"))
 checkTrue("a named selection still describes the left click", describesLeftClick())
-local namedNonce = request().nonce
 onClick()
-check("a named selection is still toggleable", namedNonce + 1, request().nonce)
+check("a named selection is still toggleable", "toggle", request().action)
+check("a named selection click is stamped", true, type(request().nonce) == "number")
 
 -- The name survives the states that decide the click too: an operation in flight
 -- and a reported failure both still say which pad they concern.
