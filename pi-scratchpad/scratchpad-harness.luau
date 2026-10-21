@@ -53,6 +53,10 @@ local updates = 0
 local lastTree, lastTooltip = nil, nil
 local verticalBar = false
 local visible = false
+local monitorReply = nil
+local declineNextMonitor = false
+local deferredMonitor = nil
+local deferMonitor = false
 
 -- What the compositor would answer for `hyprctl -j monitors`: one monitor whose
 -- specialWorkspace carries the workspace name while it is showing.
@@ -86,7 +90,8 @@ function noctalia.nowMs() return clock end
 local function advance(ms) clock = clock + ms end
 
 function noctalia.getConfig(key) return CONFIG[key] end
-function noctalia.setUpdateInterval() end
+local updateInterval
+function noctalia.setUpdateInterval(ms) updateInterval = ms end
 
 function noctalia.fileExists(path)
   if files[path] ~= nil then return true end
@@ -134,7 +139,16 @@ hl = {
 function noctalia.runAsync(argv, onResult)
   local result = { exitCode = 0, stdout = "", stderr = "", timedOut = false, stdoutTruncated = false, stderrTruncated = false }
   if argv[1] == "hyprctl" and argv[2] == "-j" then
+    if declineNextMonitor then
+      declineNextMonitor = false
+      return false
+    end
     result.stdout = monitorsJson()
+    if monitorReply then result = monitorReply end
+    if deferMonitor then
+      deferredMonitor = function() onResult(result) end
+      return true
+    end
   elseif argv[1] == "hyprctl" and argv[2] == "dispatch" then
     if declineNextDispatch then
       declineNextDispatch = false
@@ -169,8 +183,14 @@ barWidget = {
 
 -- ── The entry ────────────────────────────────────────────────────────────────
 
+local icon = assert(loadstring(SOURCES.icon, "icon.luau"))()
+require = function(path)
+  assert(path == "./icon.luau")
+  return icon
+end
+
 assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
-local firstUpdate, firstOnClick = update, onClick
+local firstUpdate, firstOnClick, firstOnIpc = update, onClick, onIpc
 assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
 local secondUpdate, secondOnClick = update, onClick
 
@@ -221,7 +241,7 @@ end
 -- The glyph names with their colors dropped: what a monochrome screenshot, or a
 -- reader who cannot tell the palette's colors apart, would still see.
 local function shape(tree)
-  return table.concat(glyphProp(tree, "name"), ",")
+  return table.concat(glyphProp(tree, "opacity"), ",")
 end
 
 local function treeFor(raw)
@@ -255,42 +275,34 @@ local missing = shape(treeFor(nil))
 -- checks below: idle, working, waiting, unknown and not running.
 local STATE_FIXTURES = { WORKING, WAITING, IDLE, UNRECOGNISED, DEAD_PID_DOCUMENT }
 
--- The launcher identity is the Pi glyph, whatever state the widget is in, and it
--- is never the power symbol that read as shutting the computer down.
-for _, fixture in ipairs(STATE_FIXTURES) do
-  local names = glyphProp(treeFor(fixture), "name")
-  check("every state leads with the Pi identity glyph", "math-pi", names[1])
-  checkTrue("no state falls back to the power glyph", table.concat(names, ","):find("power", 1, true) == nil)
-end
-
--- Colors have to be palette role tokens. A hex value would freeze the icon at
--- the theme it was written under instead of following the user's palette.
+-- An omitted glyph color is the host's native Icon Color inheritance path.
 for _, fixture in ipairs(STATE_FIXTURES) do
   for _, color in ipairs(glyphProp(treeFor(fixture), "color")) do
-    checkTrue("color '" .. color .. "' is a palette role token, not a fixed color", color:match("^[a-z_]+$") ~= nil)
-    -- "outline" is the border and separator role, and it is what left the old
-    -- not-running glyph at border contrast instead of icon contrast.
-    checkTrue("color '" .. color .. "' is not the outline border role", color ~= "outline")
+    check("all artwork inherits the user's icon color", "nil", color)
   end
 end
+check("stopped and idle have identical artwork", idle, missing)
+checkTrue("working, waiting and idle are distinguishable without color",
+  working ~= waiting and waiting ~= idle and working ~= idle)
 
--- Color is a second cue, never the only one: the five states have to stay
--- distinguishable in a monochrome rendering too.
-local shapes = {}
-for _, fixture in ipairs(STATE_FIXTURES) do
-  local presentation = shape(treeFor(fixture))
-  checkTrue("state presentation " .. presentation .. " is not shared with another state", shapes[presentation] == nil)
-  shapes[presentation] = true
-end
-
--- A side bar clips at its thickness, so the documented pattern stacks the glyph
--- pair there instead of laying it out across the bar.
 verticalBar = true
-treeFor(WAITING)
-check("a side bar stacks the glyph pair", "column", lastTree.kind)
+local side = shape(treeFor(WAITING))
 verticalBar = false
-treeFor(WAITING)
-check("a horizontal bar keeps the glyph pair on one line", "row", lastTree.kind)
+check("both bar orientations show the same square robot", side, shape(treeFor(WAITING)))
+
+for _, fixture in ipairs({ WORKING, WAITING }) do
+  local frames = {}
+  for _ = 1, 12 do
+    advance(125)
+    frames[shape(treeFor(fixture))] = true
+    check("active artwork requests an animation tick", 125, updateInterval)
+  end
+  local count = 0
+  for _ in pairs(frames) do count += 1 end
+  checkTrue("working and waiting actually move across a full cycle", count > 1)
+end
+treeFor(IDLE)
+check("idle does not request animation ticks", 1000, updateInterval)
 
 check("a document that cannot be parsed reads the same as an unrecognised state", unrecognised, malformed)
 check("a document with no usable pid reads as unknown, not as gone", pidless, malformed)
@@ -577,6 +589,95 @@ calls = {}
 firstOnClick()
 secondOnClick()
 check("two placements do not start two Pis", 1, spawnCount())
+
+-- ── IPC and attention acknowledgment ─────────────────────────────────────────
+show(IDLE)
+update()
+calls = {}
+onIpc("unrecognised")
+check("unknown IPC events do nothing", 0, #calls)
+onIpc("toggle")
+check("IPC toggles a live session", 1, #callsOf("toggle_special"))
+show(nil)
+advance(60000)
+calls = {}
+firstOnIpc("toggle")
+onIpc("toggle")
+check("IPC shares launch deduplication across placements", 1, spawnCount())
+check("IPC launches and reveals a stopped session", 1, #callsOf("toggle_special"))
+
+show(IDLE)
+update()
+show(WAITING)
+visible = true
+advance(1000)
+update()
+visible = false
+advance(1000)
+update()
+check("hiding a wait observed on screen restores idle artwork", idle, shape(lastTree))
+checkTrue("acknowledgment does not pretend Pi is no longer waiting", lastTooltip:find("waiting", 1, true) ~= nil)
+secondUpdate()
+check("acknowledgment is shared across placements", idle, shape(lastTree))
+
+show(WORKING)
+update()
+checkTrue("acknowledgment never masks processing", idle ~= shape(lastTree))
+show(WAITING)
+update()
+checkTrue("a new waiting episode rearms the bell", idle ~= shape(lastTree))
+
+visible = true
+-- A rapid show/hide through the command must not depend on the next poll.
+onIpc("toggle")
+check("IPC hide acknowledges the current waiting episode", idle, shape(lastTree))
+
+-- A new status publication can arrive even when its short working turn was missed.
+local NEW_WAIT = WAITING .. " "
+decoded[NEW_WAIT] = table.clone(decoded[WAITING])
+decoded[NEW_WAIT].updated_at += 2
+show(NEW_WAIT)
+visible = false
+update()
+checkTrue("a fresh wait publication cannot reuse an old acknowledgment", idle ~= shape(lastTree))
+
+visible = true
+dispatchReplies = { { exitCode = 1, stdout = "refused" } }
+onIpc("toggle")
+update()
+checkTrue("a failed hide does not acknowledge attention", idle ~= shape(lastTree))
+
+-- Failed visibility reads must not be mistaken for hiding a viewed wait.
+advance(1000)
+update()
+monitorReply = { exitCode = 1, stdout = "" }
+visible = false
+advance(1000)
+update()
+checkTrue("a failed monitor query cannot clear attention", idle ~= shape(lastTree))
+decoded["bad-monitors"] = { { specialWorkspace = false } }
+monitorReply = { exitCode = 0, stdout = "bad-monitors" }
+advance(1000)
+update()
+checkTrue("a malformed monitor record cannot clear attention", idle ~= shape(lastTree))
+monitorReply = nil
+calls = {}
+declineNextMonitor = true
+onIpc("toggle")
+check("a declined visibility query does not swallow the toggle", 1, #callsOf("toggle_special"))
+
+-- An asynchronous observation of the old wait must not acknowledge a new one.
+advance(1000)
+deferMonitor = true
+update()
+deferMonitor = false
+show(WORKING)
+update()
+show(WAITING)
+update()
+deferredMonitor()
+checkTrue("stale visibility results cannot acknowledge a different wait", idle ~= shape(lastTree))
+
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then

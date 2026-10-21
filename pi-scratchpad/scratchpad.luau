@@ -9,6 +9,8 @@
 --
 -- plugin.toml loads this file on the host; selftest.sh loads it against stubs.
 
+local icon = require("./icon.luau")
+
 local STATUS_DIR = "pi-hypr-agent-monitor"
 local STATUS_FILE = "status.json"
 
@@ -30,28 +32,15 @@ local SPAWN_GRACE_MS = 20000
 local SPAWNED_UNTIL = "spawned_until"
 local LAST_STATE = "last_state"
 
--- The launcher identity is the Pi glyph in every state, so the widget reads as
--- "bring Pi here" and never as a power button. The badge is what changes, so a
--- screenshot alone tells the states apart without relying on color, and a "+"
--- badge on a stopped Pi also says the click starts it.
---
--- Both glyphs take on_surface, the palette's role for text and icons on a bar:
--- it is the only role a palette guarantees to contrast with the bar. "outline"
--- is the border role and the accent roles are tuned for fills, so on some
--- built-in palettes they fall to 1.3:1 and 2.2:1 against the bar, which is the
--- invisible icon this widget had. A role token is also what makes the icon
--- follow the theme: the host resolves it against the active palette and
--- repaints when that palette changes, where a hex value would freeze it.
-local IDENTITY = { glyph = "math-pi", color = "on_surface" }
+local SEEN_WAIT = "seen_wait"
+local ACKNOWLEDGED_WAIT = "acknowledged_wait"
 
--- Every state the widget can report, and the badge that tells it apart. Glyph
--- names are Tabler names.
 local LOOK = {
-  working = { badge = "loader", label = "Pi is working - click to show or hide it" },
-  waiting = { badge = "bell", label = "Pi is waiting for you - click to show or hide it" },
-  idle = { label = "Pi is idle - click to show or hide it" },
-  unknown = { badge = "alert-triangle", label = "Pi status is unreadable - click to show or hide it" },
-  not_running = { badge = "plus", label = "Pi is not running - click to start it" },
+  working = "Pi is working - click to show or hide it",
+  waiting = "Pi is waiting for you - click to show or hide it",
+  idle = "Pi is idle - click to show or hide it",
+  unknown = "Pi status is unreadable - click to show or hide it",
+  not_running = "Pi is not running - click to start it",
 }
 
 local KNOWN_STATES = { working = true, waiting = true, idle = true }
@@ -118,7 +107,12 @@ local function readState()
   if type(pid) ~= "number" or pid ~= math.floor(pid) or pid < 1 then return "unknown" end
   if not noctalia.fileExists("/proc/" .. tostring(pid)) then return "not_running" end
 
-  if KNOWN_STATES[document.state] then return document.state end
+  if KNOWN_STATES[document.state] then
+    -- A newly published wait must rearm attention even if a short turn fell
+    -- between polls. Include the session and pid so a restart cannot reuse an ack.
+    local token = tostring(pid) .. ":" .. tostring(document.session_id) .. ":" .. tostring(document.updated_at)
+    return document.state, token
+  end
   return "unknown"
 end
 
@@ -207,20 +201,24 @@ local function compositor(op, onDone)
   local done = onDone or function() end
 
   if op == "visible" then
-    return noctalia.runAsync({ "hyprctl", "-j", "monitors" }, function(result)
-      local visible = false
+    local accepted = noctalia.runAsync({ "hyprctl", "-j", "monitors" }, function(result)
+      local visible, valid = false, false
       if type(result) == "table" and result.exitCode == 0 then
         local monitors = noctalia.json.decode(result.stdout)
+        valid = type(monitors) == "table" and #monitors > 0
         for _, monitor in ipairs(type(monitors) == "table" and monitors or {}) do
           local special = type(monitor) == "table" and monitor.specialWorkspace or nil
-          if type(special) == "table" and special.name ~= "" and
-            (special.name == workspace() or special.name == "special:" .. workspace()) then
+          if type(special) ~= "table" or type(special.name) ~= "string" then
+            valid = false
+          elseif special.name == workspace() or special.name == "special:" .. workspace() then
             visible = true
           end
         end
       end
-      done(visible)
+      done(visible, valid)
     end)
+    if accepted == false then done(false, false) end
+    return accepted
   end
 
   -- toggle_special takes the bare name: it prefixes "special:" itself.
@@ -251,14 +249,35 @@ end
 
 -- ── The widget ────────────────────────────────────────────────────────────────
 
-local function paint(state)
-  local look = LOOK[state]
-  local glyphs = { ui.glyph({ name = IDENTITY.glyph, size = 14, color = IDENTITY.color }) }
-  if look.badge then glyphs[#glyphs + 1] = ui.glyph({ name = look.badge, size = 12, color = IDENTITY.color }) end
-  -- The capsule clips to bar thickness, so the pair stacks on a side bar.
-  local container = barWidget.isVertical() and ui.column or ui.row
-  barWidget.render(container({ gap = 2, align = "center" }, glyphs))
-  barWidget.setTooltip(look.label)
+local function paint(state, token)
+  local acknowledged = state == "waiting" and noctalia.state.get(ACKNOWLEDGED_WAIT) == token
+  local display = acknowledged and "idle" or state
+  barWidget.render(icon.render(display, noctalia.nowMs()))
+  barWidget.setTooltip(acknowledged and "Pi is waiting (seen) - click to show or hide it" or LOOK[state])
+  noctalia.setUpdateInterval((display == "working" or display == "waiting") and icon.interval or 1000)
+end
+
+local nextVisibilityCheck = 0
+local function observeWaiting(state, token)
+  if state ~= "waiting" then
+    noctalia.state.set(SEEN_WAIT, "")
+    noctalia.state.set(ACKNOWLEDGED_WAIT, "")
+    nextVisibilityCheck = 0
+    return
+  end
+  local now = noctalia.nowMs()
+  if now < nextVisibilityCheck then return end
+  nextVisibilityCheck = now + 1000
+  compositor("visible", function(visible, valid)
+    local current, currentToken = readState()
+    if not valid or current ~= "waiting" or currentToken ~= token then return end
+    if visible then
+      noctalia.state.set(SEEN_WAIT, token)
+    elseif noctalia.state.get(SEEN_WAIT) == token then
+      noctalia.state.set(ACKNOWLEDGED_WAIT, token)
+    end
+    paint(current, currentToken)
+  end)
 end
 
 -- Waiting is the only state worth interrupting for, only on the way into it, and
@@ -292,11 +311,12 @@ local function clearSpawnLatch()
 end
 
 local function tick()
-  local state = readState()
+  local state, token = readState()
   -- A session in the status file is the one a spawn was for, so the latch lifts
   -- as soon as Pi publishes anything at all, readable or not.
   if state ~= "not_running" then clearSpawnLatch() end
-  paint(state)
+  observeWaiting(state, token)
+  paint(state, token)
 
   -- Publish before announcing: the other placement has to see the transition as
   -- already announced when it ticks.
@@ -307,7 +327,6 @@ local function tick()
 end
 
 function update()
-  noctalia.setUpdateInterval(1000)
   tick()
 end
 
@@ -328,8 +347,25 @@ function onClick()
       if ok == false then clearSpawnLatch() end
     end)
   else
-    compositor("toggle")
+    local state, token = readState()
+    if state ~= "waiting" then
+      compositor("toggle")
+      return
+    end
+    compositor("visible", function(visible, valid)
+      compositor("toggle", function(ok)
+        local current, currentToken = readState()
+        if ok and valid and visible and current == "waiting" and currentToken == token then
+          noctalia.state.set(ACKNOWLEDGED_WAIT, token)
+          paint(current, token)
+        end
+      end)
+    end)
   end
+end
+
+function onIpc(event)
+  if event == "toggle" then onClick() end
 end
 
 update()
