@@ -794,7 +794,7 @@ check("reconciliation launches no application or dispatcher", 0, nonQueryLaunchC
 
 queryReplies.clients.stdout = [[
   [
-    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":"DP-1","workspace":{"name":"1"}},
+    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":"DP-1","workspace":{"name":"special:noctalia-sidepad-terminal"}},
     {"class":"noctalia-sidepad-terminal","address":"0x3","monitor":"DP-2","workspace":{"name":"2"}},
     {"class":"noctalia-sidepad-notes","address":"0x4","monitor":"DP-1","workspace":{"name":"2"}},
     {"class":"noctalia-sidepad-notes","address":"0x5","monitor":"DP-2","workspace":{"name":"3"}}
@@ -805,6 +805,8 @@ checkContains("duplicate matches report a recoverable error", "duplicate windows
 checkContains("all ambiguous classes are reported", "duplicate windows for pad 'notes'", duplicate.error)
 check("duplicate matches never adopt an ambiguous address", nil, duplicate.pads[1].address)
 check("duplicate matches are reported as running", true, duplicate.pads[1].running)
+check("duplicate visibility still comes from monitor state", true, duplicate.pads[1].visible)
+check("duplicate output identifies its active monitor", "DP-1", duplicate.pads[1].output)
 check("duplicate snapshots remain observational", 0, nonQueryLaunchCount())
 
 -- A refresh never publishes ready from just one half of the snapshot. Either

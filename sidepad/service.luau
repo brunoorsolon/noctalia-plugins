@@ -280,7 +280,12 @@ local function applySnapshot(clients, monitors)
     if #matches == 0 then
       pad.running, pad.visible, pad.output, pad.address = false, false, nil, nil
     elseif #matches > 1 then
-      pad.running, pad.visible, pad.output, pad.address = true, false, nil, nil
+      local visibleOutput = nil
+      for _, client in ipairs(matches) do
+        visibleOutput = activeWorkspaces[workspaceKey(client.workspace.name)]
+        if visibleOutput then break end
+      end
+      pad.running, pad.visible, pad.output, pad.address = true, visibleOutput ~= nil, visibleOutput, nil
       table.insert(duplicates, ("duplicate windows for pad '%s' (%s)"):format(pad.id, pad.class))
     else
       local client = matches[1]
