@@ -4,6 +4,8 @@ Repository configuration for the shared `issue-management` skill.
 
 - Tracker: GitHub
 - Stale claim window: 24 hours
+- Closed-issue lifecycle cleanup: repository
+- Lifecycle cleanup automation: `.github/workflows/cleanup-closed-issues.yml`
 
 ## Lifecycle labels
 
@@ -33,3 +35,9 @@ Repository configuration for the shared `issue-management` skill.
 | cross-cutting | `delivery:cross-cutting` |
 | critical | `delivery:critical` |
 | unclassified | `delivery:unclassified` |
+
+## Decomposition label
+
+| Role | Label |
+| --- | --- |
+| decomposed | `spec:decomposed` |
