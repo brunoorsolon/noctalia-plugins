@@ -48,6 +48,24 @@ The workspace is one Pi, not one per project. It starts in the configured direct
 
 A click never fails silently. If Hyprland refuses the dispatch — a legacy `hyprland.conf` configuration, an unknown special workspace, a compositor that is not reachable — the widget sends a notification carrying Hyprland's own error; if Noctalia cannot start `hyprctl` at all, it says so. Either way the click stays retryable instead of latching the spawn.
 
+### Hyprland shortcut
+
+Use the same toggle as the bar click from a terminal:
+
+```sh
+noctalia msg plugin magus/pi-scratchpad:scratchpad focused toggle
+```
+
+For example, in `hyprland.lua`:
+
+```lua
+hl.bind("SUPER + grave", hl.dsp.exec_cmd("noctalia msg plugin magus/pi-scratchpad:scratchpad focused toggle"))
+```
+
+Choose your own key combination in Hyprland. The command hides a visible scratchpad, reveals a hidden one, or launches and reveals Pi if it is stopped. It shares the click's launch latch and persistent-session settings.
+
+The widget must be placed on the targeted output. If more than one bar on that output contains it, use `focused:<bar-name>` (for example `focused:main`) instead of `focused`. A connector name such as `DP-1:main` can target a fixed placement when the focused output has no widget. Do not use `all`: that broadcasts a toggle to every placement and could toggle the workspace twice. Noctalia reports a missing or ambiguous target instead of guessing.
+
 ### Settings
 
 | Setting | Default | Purpose |
@@ -63,17 +81,21 @@ No Pi configuration ships inside the plugin: the spawn command is the whole of i
 
 ## What the bar shows
 
-The widget always renders the same launcher identity, the Tabler `math-pi` glyph, so it reads as "bring Pi here" whether or not a session is running and never as a power button. A small badge next to it carries the state.
+The widget is a 20 × 20 pixel-display robot/TV head. Its outline stays the same; the display inside carries the state. It occupies the same square on horizontal and vertical bars.
 
-| State | When | Bar |
+| State | When | Display inside the head |
 | --- | --- | --- |
-| Working | Pi is running a turn | Pi glyph with a `loader` badge |
-| Waiting | Pi wants an answer or an approval | Pi glyph with a `bell` badge |
-| Idle | Pi is up with nothing to do | Pi glyph alone |
-| Not running | There is no status file, or the recorded pid has no live process | Pi glyph with a `plus` badge |
-| Unknown | The file exists and Pi is alive, but the document cannot be read or its state is not one of the three above | Pi glyph with an `alert-triangle` badge |
+| Working | Pi is running a turn | Heartbeat scrolling horizontally to the left |
+| Waiting | Pi wants an answer or an approval | Bell swaying twice, then resting briefly |
+| Idle / stopped | Pi is idle, or there is no live monitored session | Bold π; no plus badge or separate stopped appearance |
+| Waiting, acknowledged | You viewed the waiting scratchpad and hid it | Bold π; tooltip still says Pi is waiting |
+| Unknown | The file exists and Pi is alive, but the document cannot be read or its state is unrecognised | Exclamation mark |
 
-The badge, not the color, is what tells the states apart, so they stay distinguishable on a monochrome bar or in a screenshot. The Pi glyph and its badge both take the palette's `on_surface` role, which a palette guarantees to contrast with the bar: it is what makes the icon follow a custom palette, repaint when the theme changes, and stay legible on light and dark bars. `outline` is deliberately unused, and so are the accent roles: `outline` is the border and separator role, and against the built-in palettes it ranges from 1.3:1 to 3:1, the invisibility the old power glyph suffered from. Each state also names itself and its click action in the tooltip, so the bar never depends on color.
+The artwork inherits **Icon Color → widget Color → theme default** through Noctalia's native glyph rendering. It no longer forces `on_surface` (which bypassed the presentation overrides and left the icon white). Pick a color with enough contrast against your bar. Shapes and tooltips, rather than color alone, carry meaning.
+
+Working and unacknowledged waiting animate at eight frames per second; idle, acknowledged waiting, and unknown update once per second. The artwork is built from native filled-square glyphs, with no external font or image dependency. This preserves the host's per-placement color inheritance, which plugin images do not expose. Fractional scaling and font antialiasing should be checked on the host.
+
+Viewing then hiding a waiting Pi acknowledges only its indicator. It does not answer a question, approve a tool, cancel work, or change the status file. The click and IPC command acknowledge a successful hide immediately. Hiding through another compositor action is detected by a one-second visibility poll; a show/hide entirely between polls cannot be observed. A fresh waiting status publication rearms the bell, including one after a short working turn missed between polls. The companion extension also republishes on model selection, so changing models while waiting can rearm attention. Acknowledgments are shared by all placements and are scoped to the process, session, and status timestamp.
 
 Unknown is deliberately not "not running". A file that cannot be read still says a session was there, so the widget never reports a live Pi as gone and a click toggles the workspace instead of starting a second Pi.
 
@@ -87,8 +109,20 @@ The widget's Luau entry can be exercised without a compositor:
 ./pi-scratchpad/selftest.sh
 ```
 
-It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the state presentation and its palette roles, the tooltips, the click routing, the spawn latch, the waiting notification and the two-placement cases. The `hyprctl` stub answers a dispatch the way a Lua-configured Hyprland does, by evaluating `return hl.dispatch(<argument>)` against a stubbed `hl.dsp`, so a dispatch expression that Hyprland or Lua would reject fails the check instead of passing as a string comparison. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
+It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the state presentation and inherited colors, animation frames, the tooltips, click and IPC routing, the spawn latch, waiting notifications, visibility acknowledgment (including failed and stale observations), and two-placement cases. The `hyprctl` stub answers a dispatch the way a Lua-configured Hyprland does, by evaluating `return hl.dispatch(<argument>)` against a stubbed `hl.dsp`, so a dispatch expression that Hyprland or Lua would reject fails the check instead of passing as a string comparison. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
 
-What it cannot check is the host: whether a real Pi turn moves the indicator, whether the first click spawns and later clicks toggle, whether the window arrives at the configured size, and whether Hyprland accepts the dispatcher expressions on the live version. Those need Hyprland, Noctalia, a terminal and the extension.
+### Preview all icons before approving a change
+
+Generate a self-contained HTML page from the actual `icon.luau` frames and timing:
+
+```sh
+LUAU=/path/to/luau python3 pi-scratchpad/preview.py > /tmp/pi-scratchpad-preview.html
+```
+
+Open the resulting file in a separate browser profile. It has live heartbeat and bell animations, pause and frame-step buttons, a color picker, dark/light backgrounds, and actual-size (20 px), 1.25× (25 px), and enlarged samples. It makes no network requests. The browser draws the exported pixel grid as SVG, while Noctalia uses native filled-square glyphs; this previews the artwork and timing, not a compositor integration test.
+
+On the PR branch, check in Noctalia that changing **Icon Color** affects every state, that the icon stays square at 1.25× and on a vertical bar, and that the shortcut starts/shows/hides a single Pi. Run a turn, view and hide its waiting result, then run another turn to check the bell rearms. Close and reopen the terminal to check the conversation resumes. Check animation smoothness and shell CPU usage on the actual host as well.
+
+What the harness cannot check is the host: whether a real Pi turn moves the indicator, whether the first click spawns and later clicks toggle, whether the window arrives at the configured size, and whether Hyprland accepts the dispatcher expressions on the live version. Those need Hyprland, Noctalia, a terminal and the extension.
 
 The widget speaks Hyprland's Lua dispatcher interface. A `hyprland.lua` configuration evaluates every `hyprctl dispatch` argument as the expression in `hl.dispatch(<argument>)`, so the plugin emits `hl.dsp.exec_cmd(command, rules)` for the launch and `hl.dsp.workspace.toggle_special(name)` for the workspace. On a `hyprland.conf` configuration the same argument reads as a legacy dispatcher pair, and Hyprland answers `Invalid dispatcher`; the widget shows that reply as a notification rather than looking like it did nothing.
