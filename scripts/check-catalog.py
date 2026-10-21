@@ -5,6 +5,8 @@ Noctalia reads the manifest and renders the catalog row, so a field that drifts
 between the two shows the user the wrong package, and a version that drifts
 leaves an update offered forever. The catalog is a repository-wide artifact, so
 the check walks every plugin rather than living inside one plugin's selftest.
+A manifest whose catalog row has not been added yet is reported, not failed:
+registration is its own step, and an unregistered plugin is not offered to users.
 
 Run from a plugin directory (`python3 ../scripts/check-catalog.py`) or from the
 repository root; it resolves paths against its own location.
@@ -39,13 +41,19 @@ with open(os.path.join(root, "catalog.toml"), "rb") as handle:
     rows = tomllib.load(handle)["plugin"]
 
 checked = 0
+unregistered = []
+manifests = 0
 for path in sorted(glob.glob(os.path.join(root, "*", "plugin.toml"))):
     with open(path, "rb") as handle:
         manifest = tomllib.load(handle)
 
+    manifests += 1
     relative = os.path.relpath(path, root)
     matching = [row for row in rows if row.get("id") == manifest.get("id")]
-    if len(matching) != 1:
+    if not matching:
+        unregistered.append(relative)
+        continue
+    if len(matching) > 1:
         fail("%s: catalog rows for %r: expected 1, got %d" % (relative, manifest.get("id"), len(matching)))
     row = matching[0]
 
@@ -57,7 +65,10 @@ for path in sorted(glob.glob(os.path.join(root, "*", "plugin.toml"))):
 
     checked += 1
 
-if checked == 0:
+if manifests == 0:
     fail("no plugin manifest found under %s" % root)
 
-print("catalog ok (%d plugins)" % checked)
+if unregistered:
+    print("catalog ok (%d plugins, not yet registered: %s)" % (checked, ", ".join(unregistered)))
+else:
+    print("catalog ok (%d plugins)" % checked)

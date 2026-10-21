@@ -1,0 +1,75 @@
+id = "magus/sidepad"
+name = "Sidepad"
+version = "0.1.0"
+plugin_api = 24
+author = "magus"
+license = "MIT"
+icon = "layout-sidebar-right"
+description = "Shows the selected external application as a native sidepad on a dedicated Hyprland special workspace."
+tags = ["hyprland", "desktop", "widget", "panel", "service"]
+
+# Width of the pad surface in each mode. The controller reads these when it
+# applies geometry; they are not persisted state.
+[[setting]]
+key = "narrow_width"
+type = "int"
+label_key = "settings.narrow_width.label"
+description_key = "settings.narrow_width.description"
+default = 900
+min = 1
+
+[[setting]]
+key = "wide_width"
+type = "int"
+label_key = "settings.wide_width.label"
+description_key = "settings.wide_width.description"
+default = 1200
+min = 1
+
+[[setting]]
+key = "edge_gap"
+type = "int"
+label_key = "settings.edge_gap.label"
+description_key = "settings.edge_gap.description"
+default = 10
+min = 0
+
+[[setting]]
+key = "top_gap"
+type = "int"
+label_key = "settings.top_gap.label"
+description_key = "settings.top_gap.description"
+default = 100
+min = 0
+
+[[setting]]
+key = "bottom_gap"
+type = "int"
+label_key = "settings.bottom_gap.label"
+description_key = "settings.bottom_gap.description"
+default = 100
+min = 0
+
+[[setting]]
+key = "launch_timeout_ms"
+type = "int"
+label_key = "settings.launch_timeout_ms.label"
+description_key = "settings.launch_timeout_ms.description"
+default = 5000
+min = 1
+
+[[service]]
+id = "controller"
+entry = "service.luau"
+
+[[widget]]
+id = "sidepad"
+entry = "widget.luau"
+
+[[panel]]
+id = "selector"
+entry = "panel.luau"
+width = 360
+height = 420
+placement = "floating"
+position = "center"
