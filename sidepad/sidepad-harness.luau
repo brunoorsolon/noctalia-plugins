@@ -1,7 +1,8 @@
 -- Drives the plugin's entries against a stubbed Noctalia runtime, so entry
 -- loading, the shared request/status contract and both UI consumers are checked
 -- here rather than only on a host with Noctalia and Hyprland. ./selftest.sh
--- injects the entry sources as the global SOURCES table and runs this file.
+-- injects the entry sources as the global SOURCES table, the manifest's panel
+-- address as PANEL_ENTRY_ID, and runs this file.
 --
 -- It is a check, not a plugin entry: plugin.toml never loads it.
 
@@ -62,7 +63,8 @@ local function release()
   for _, notify in ipairs(pending) do notify() end
 end
 
-local lastGlyph, lastTooltip, lastTree = nil, nil, nil
+local lastGlyph, lastGlyphColor, lastTooltip, lastTree = nil, nil, nil, nil
+local toggledPanels = {}
 
 ui = {}
 local function node(kind)
@@ -78,9 +80,13 @@ ui.separator = node("separator")
 panel = { render = function(tree) lastTree = tree end, close = function() end }
 barWidget = {
   setGlyph = function(name) lastGlyph = name end,
+  setGlyphColor = function(role) lastGlyphColor = role end,
   setTooltip = function(content) lastTooltip = content end,
   clearTooltip = function() lastTooltip = nil end,
 }
+-- The bar's right click opens the selector panel by id; the host call is recorded
+-- so the check asserts the panel the widget asks for.
+noctalia.togglePanel = function(id) table.insert(toggledPanels, id) end
 
 -- Each entry calls require at load, so the module for the entry being loaded is
 -- the one require returns.
@@ -143,6 +149,29 @@ local function hasText(tree, needle)
   end) ~= nil
 end
 
+-- A snapshot for the bar to render: one selected pad whose record the snapshot
+-- describes, so a state check changes only the field it is about. The revision
+-- stays whatever the controller last published. `fields` overrides any part of
+-- it, and `selectedPadId = false` is how a nil selection survives a table
+-- literal, which drops nil values.
+local function snapshot(fields)
+  fields = fields or {}
+  local value = status()
+  value.selectedPadId = "terminal"
+  value.busy = false
+  value.error = nil
+  value.pads = {
+    { id = "terminal", name = "Terminal", icon = "terminal-2", running = true, visible = false, output = "DP-1" },
+  }
+  for key, field in pairs(fields) do
+    if key ~= "selectedPadId" then value[key] = field end
+  end
+  if fields.selectedPadId == false then
+    value.selectedPadId = nil
+  end
+  noctalia.state.set(serviceShared.STATUS_KEY, value)
+end
+
 -- ── The declared contract ───────────────────────────────────────────────────
 
 check("the service and the widget share the request key", widgetShared.REQUEST_KEY, serviceShared.REQUEST_KEY)
@@ -200,7 +229,10 @@ check("the controller stamps the accepted request", 1, request().nonce)
 check("the stamp keeps the action", "select", request().action)
 check("the stamp keeps the pad", "terminal", request().padId)
 
+-- The widget only acts on a pad the controller reports as selected, so its click
+-- contract is exercised from a snapshot where an action is available.
 local before = status().revision
+snapshot()
 onClick()
 check("a widget click takes the next nonce", 2, request().nonce)
 check("the widget's request names its action", "toggle", request().action)
@@ -216,6 +248,7 @@ check("the controller answers the panel's request too", before + 1, status().rev
 
 -- Overlapping publications must never step the nonce back. Two intents are held
 -- before the controller answers either, which is the overlap this API allows.
+snapshot()
 before = status().revision
 hold()
 onClick()
@@ -290,7 +323,7 @@ noctalia.state.set(serviceShared.STATUS_KEY, fixture)
 
 check("the bar shows the selected pad's icon", "terminal-2", lastGlyph)
 check("the bar tooltip names the selected pad", "Terminal", tooltipValue("Pad"))
-check("the bar tooltip reports the shown state", "shown", tooltipValue("State"))
+check("the bar tooltip reports the visible state", "visible", tooltipValue("State"))
 
 onOpen()
 checkTrue("the panel renders the pad list", type(lastTree) == "table")
@@ -308,19 +341,134 @@ check("an unimplemented selection is refused truthfully", "select is not availab
 -- The controller republishes its own snapshot, so the fixture cannot outlive it.
 check("the controller owns the snapshot after an action", 0, #status().pads)
 
--- A busy snapshot reaches the bar without inventing a pad state.
-noctalia.state.set(serviceShared.STATUS_KEY, {
-  revision = 41,
-  phase = "ready",
-  selectedPadId = nil,
-  side = "right",
-  widthMode = "wide",
-  busy = true,
-  error = nil,
-  pads = {},
-})
-check("a busy controller shows the busy glyph", "loader", lastGlyph)
+-- ── The bar's states and its two interactions ───────────────────────────────
+
+-- The bar derives every state from the snapshot alone, so each state is asserted
+-- from a snapshot that differs only in what the controller reports.
+local function lastPanel() return toggledPanels[#toggledPanels] end
+
+-- The description has to agree with the click guard: a state that swallows the
+-- left click may not advertise it.
+local function describesLeftClick()
+  return tostring(tooltipValue("Actions")):find("Left click", 1, true) ~= nil
+end
+local function describesRightClick()
+  return tostring(tooltipValue("Actions")):find("right click", 1, true) ~= nil
+end
+
+snapshot()
+check("a hidden pad keeps the pad's icon", "terminal-2", lastGlyph)
+check("a hidden pad is drawn in the muted theme role", "on_surface_variant", lastGlyphColor)
+check("the tooltip names the hidden state", "hidden", tooltipValue("State"))
+check("the tooltip names the selected pad in every state", "Terminal", tooltipValue("Pad"))
+checkTrue("a state that accepts the left click says so", describesLeftClick())
+
+snapshot({ pads = { { id = "terminal", name = "Terminal", running = false, visible = false } } })
+check("a stopped pad is reported as stopped", "stopped", tooltipValue("State"))
+check("a pad without an icon falls back to the default glyph", "layout-sidebar-right", lastGlyph)
+
+snapshot({ pads = { { id = "terminal", name = "Terminal", icon = "terminal-2", running = true, visible = true, output = "DP-1" } } })
+check("a visible pad shows the pad's icon", "terminal-2", lastGlyph)
+check("a visible pad is drawn in the primary theme role", "primary", lastGlyphColor)
+check("the tooltip names the visible state", "visible", tooltipValue("State"))
+
+snapshot({ selectedPadId = false, pads = {} })
 check("an empty snapshot reports no selection", "None selected", tooltipValue("Pad"))
+check("an empty snapshot reports the unavailable state", "unavailable", tooltipValue("State"))
+check("an unavailable pad is drawn in the muted theme role", "on_surface_variant", lastGlyphColor)
+check("an unavailable bar does not advertise the left click it ignores", false, describesLeftClick())
+checkTrue("an unavailable bar still describes the panel it opens", describesRightClick())
+
+snapshot({ busy = true })
+check("a busy controller shows the busy glyph", "loader", lastGlyph)
+check("a busy controller is drawn in the primary theme role", "primary", lastGlyphColor)
+check("the tooltip names the busy state", "busy", tooltipValue("State"))
+check("the busy tooltip still names the selected pad", "Terminal", tooltipValue("Pad"))
+check("a busy bar does not advertise the left click it ignores", false, describesLeftClick())
+checkTrue("a busy bar still describes the panel it opens", describesRightClick())
+
+snapshot({ selectedPadId = false, pads = {}, error = "hyprctl not found" })
+check("an error shows the error glyph", "alert-triangle", lastGlyph)
+check("an error is drawn in the error theme role", "error", lastGlyphColor)
+check("the tooltip names the error state", "error", tooltipValue("State"))
+check("the tooltip reports the error itself", "hyprctl not found", tooltipValue("Error"))
+check("an error with no selection does not advertise the left click", false, describesLeftClick())
+
+snapshot({ error = "launch failed" })
+checkTrue("an error with a selected pad describes the left click it accepts", describesLeftClick())
+check("an error keeps the selected pad named", "Terminal", tooltipValue("Pad"))
+
+-- Busy decides the click, so it is the state the bar draws even while the
+-- controller still reports the failure of the previous attempt; the tooltip
+-- keeps that failure rather than hiding it.
+snapshot({ busy = true, error = "launch failed" })
+check("a busy controller draws busy, not the stale error", "busy", tooltipValue("State"))
+check("a busy controller keeps the reported error in the tooltip", "launch failed", tooltipValue("Error"))
+check("a busy bar does not advertise the left click it ignores", false, describesLeftClick())
+
+-- A selection whose record the snapshot does not describe yet is still the
+-- controller's selection: the bar names it from the selection and treats a pad it
+-- has no runtime detail for as not running and not shown.
+snapshot({ pads = {} })
+check("a named selection is named without its record", "terminal", tooltipValue("Pad"))
+check("a named selection without runtime detail is reported as stopped", "stopped", tooltipValue("State"))
+checkTrue("a named selection still describes the left click", describesLeftClick())
+local namedNonce = request().nonce
+onClick()
+check("a named selection is still toggleable", namedNonce + 1, request().nonce)
+
+-- Left click publishes one toggle request through the shared helper. Two
+-- identical consecutive clicks are two publications, each with its own nonce.
+snapshot()
+local clickNonce = request().nonce
+onClick()
+check("a left click publishes a toggle request", "toggle", request().action)
+check("the click names no pad, so the controller applies its own selection", nil, request().padId)
+check("the click takes the next nonce", clickNonce + 1, request().nonce)
+-- The controller answered with its own snapshot, so the bar's next tooltip is a
+-- rendering of what the controller published, not of a fixture.
+check("the bar renders the snapshot the controller publishes", "None selected", tooltipValue("Pad"))
+
+snapshot()
+clickNonce = request().nonce
+onClick()
+check("an identical consecutive click is still published", "toggle", request().action)
+check("the identical click takes its own nonce", clickNonce + 1, request().nonce)
+
+-- While an operation is in flight the bar publishes nothing: the controller
+-- already owns one operation and a second request would compete with it.
+snapshot({ busy = true })
+local blockedNonce, blockedRevision = request().nonce, status().revision
+onClick()
+check("a click during an in-flight operation publishes no request", blockedNonce, request().nonce)
+check("a click during an in-flight operation leaves the snapshot alone", blockedRevision, status().revision)
+
+snapshot({ selectedPadId = false, pads = {} })
+blockedNonce, blockedRevision = request().nonce, status().revision
+onClick()
+check("a click with no selected pad publishes no request", blockedNonce, request().nonce)
+check("a click with no selected pad leaves the snapshot alone", blockedRevision, status().revision)
+
+-- An error is recoverable through a later action, so the click still publishes.
+snapshot({ error = "launch failed" })
+local retryNonce = request().nonce
+onClick()
+check("a click after an error still requests the toggle", "toggle", request().action)
+check("the retry is a new publication", retryNonce + 1, request().nonce)
+
+-- Right click opens the selector panel by id; it is a local surface, so it stays
+-- reachable while an operation runs and publishes no controller request.
+toggledPanels = {}
+snapshot()
+local panelNonce = request().nonce
+onRightClick()
+check("a right click opens the panel the manifest declares", PANEL_ENTRY_ID, lastPanel())
+check("a right click publishes no controller request", panelNonce, request().nonce)
+
+snapshot({ busy = true })
+onRightClick()
+check("the selector still opens while an operation runs", PANEL_ENTRY_ID, lastPanel())
+check("the panel is asked for once per click", 2, #toggledPanels)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

@@ -85,6 +85,9 @@ trap 'rm -rf "$work"' EXIT
 
 # The entries and their shared module are embedded as long strings so the harness
 # loads each one as its own runtime, the way a plugin runtime loads its entries.
+# The manifest's own address for the panel is injected too, so the harness checks
+# the surface the bar asks the host to open against plugin.toml rather than a copy.
+panel_entry="$(python3 -c 'import pathlib, tomllib; m = tomllib.loads(pathlib.Path("plugin.toml").read_text()); print("%s:%s" % (m["id"], m["panel"][0]["id"]))')"
 {
   printf 'SOURCES = {\n'
   for entry in shared service widget panel; do
@@ -93,6 +96,7 @@ trap 'rm -rf "$work"' EXIT
     printf '\n]==],\n'
   done
   printf '}\n'
+  printf 'PANEL_ENTRY_ID = "%s"\n' "$panel_entry"
   cat sidepad-harness.luau
 } >"$work/run.luau"
 
