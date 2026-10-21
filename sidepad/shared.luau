@@ -1,8 +1,8 @@
 -- The contract the controller, the bar widget and the selector panel share: the
--- two state keys, the command names, and the request helper. Every entry runs in
--- its own VM with its own module instance, so the helper works without shared
--- memory: each call publishes one request value, and the controller acts on the
--- requests in the order it receives them.
+-- two state keys, the command names, the request helper and the accepted-request
+-- shape. Every entry runs in its own VM with its own module instance, so the
+-- helper works without shared memory: a caller publishes one request intent, and
+-- the controller, its only writer of the nonce, stamps and dispatches it.
 
 local M = {}
 
@@ -34,23 +34,31 @@ end
 -- actions that name a pad carry one. An undeclared action is refused before it
 -- reaches the controller, so a caller cannot publish a malformed command.
 --
--- The nonce is taken from the host clock at publication time, without reading
--- shared state. The plugin API has no atomic increment, so a counter read before
--- the write can step backwards when two entry VMs publish at once, and no
--- monotonic clock is exposed. A later publication therefore never carries a
--- smaller nonce. Two requests inside the same millisecond share one, and they
--- stay observable because the host notifies every watcher on every set; the
--- controller's own revision is the strict order it acts on.
+-- The caller publishes the intent only: the controller is the single writer of
+-- the nonce (see M.stamp). The plugin API has no atomic increment, so a nonce a
+-- caller sampled could be published after another entry published a newer one;
+-- one writer removes that window entirely.
 function M.request(action, padId)
   if not M.isAction(action) then
     return nil, "unsupported action: " .. tostring(action)
   end
-  local request = { nonce = noctalia.nowMs(), action = action }
+  local request = { action = action }
   if padId ~= nil then
     request.padId = padId
   end
   noctalia.state.set(M.REQUEST_KEY, request)
   return request
+end
+
+-- The controller's half of the request contract: allocation and publication are
+-- one operation by the only writer of the nonce, so the accepted sequence cannot
+-- step back when two entries publish at once.
+function M.stamp(request, nonce)
+  local accepted = { nonce = nonce, action = request.action }
+  if request.padId ~= nil then
+    accepted.padId = request.padId
+  end
+  return accepted
 end
 
 -- The selected pad record from a status snapshot. Both UI entries read the pad's

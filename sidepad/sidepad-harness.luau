@@ -33,18 +33,20 @@ end
 -- own snapshot. Watchers fire on every set, as the host's do.
 local stateStore = {}
 local watchers = {}
--- Wall-clock milliseconds, moved by the harness so a later request is visibly
--- later. The host exposes this clock and no monotonic one.
-local clock = 1730000000000
-local function advance(ms) clock = clock + ms end
+-- Notifications can be held so two requests are published before the controller
+-- answers either, the closest this API allows to two entries writing at once: a
+-- caller only ever publishes an intent, never a nonce.
+local held = nil
 
 noctalia = {}
 noctalia.string = { trim = function(value) return (value:gsub("^%s+", ""):gsub("%s+$", "")) end }
-function noctalia.nowMs() return clock end
 noctalia.state = {
   set = function(key, value)
     stateStore[key] = copy(value)
-    for _, callback in ipairs(watchers[key] or {}) do callback(copy(value)) end
+    local notify = function()
+      for _, callback in ipairs(watchers[key] or {}) do callback(copy(value)) end
+    end
+    if held then table.insert(held, notify) else notify() end
   end,
   get = function(key) return copy(stateStore[key]) end,
   watch = function(key, callback)
@@ -52,6 +54,13 @@ noctalia.state = {
     table.insert(watchers[key], callback)
   end,
 }
+
+local function hold() held = {} end
+local function release()
+  local pending = held
+  held = nil
+  for _, notify in ipairs(pending) do notify() end
+end
 
 local lastGlyph, lastTooltip, lastTree = nil, nil, nil
 
@@ -85,8 +94,8 @@ end
 -- ── Loading the entries ─────────────────────────────────────────────────────
 
 -- Each entry is its own runtime with its own module cache, so shared.luau is
--- loaded once per entry exactly as the host does it. A nonce counted inside the
--- module would therefore restart at 1 in every VM.
+-- loaded once per entry exactly as the host does it. The accepted nonce lives in
+-- the controller's VM, so the per-VM module instances cannot disagree about it.
 local function loadEntry(entry)
   entryShared = assert(loadstring(SOURCES.shared, "shared.luau"))()
   assert(loadstring(SOURCES[entry], entry .. ".luau"))()
@@ -99,6 +108,13 @@ local panelShared = loadEntry("panel")
 
 local function status() return noctalia.state.get("sidepad.status") end
 local function request() return noctalia.state.get("sidepad.request") end
+
+local function strictlyIncreasing(sequence)
+  for index = 2, #sequence do
+    if sequence[index] <= sequence[index - 1] then return false end
+  end
+  return true
+end
 
 local function tooltipValue(key)
   for _, row in ipairs(lastTooltip or {}) do
@@ -164,45 +180,65 @@ check("a caller cannot add a pad to the snapshot", 0, #reread.pads)
 
 -- ── One action path, from two entry VMs and from IPC ────────────────────────
 
+-- Every accepted request the controller publishes, in publication order: the
+-- sequence is checked on the values a reader sees, not on the controller's own
+-- counter.
+local published = {}
+table.insert(watchers[serviceShared.REQUEST_KEY], function(value)
+  if type(value) == "table" and type(value.nonce) == "number" then
+    table.insert(published, value.nonce)
+  end
+end)
+
+-- A caller publishes the intent; the controller, the only writer of the nonce,
+-- stamps and dispatches it.
+local intent = widgetShared.request("select", "terminal")
+check("a caller publishes its action", "select", intent.action)
+check("a caller publishes its pad", "terminal", intent.padId)
+check("a caller does not allocate the nonce", nil, intent.nonce)
+check("the controller stamps the accepted request", 1, request().nonce)
+check("the stamp keeps the action", "select", request().action)
+check("the stamp keeps the pad", "terminal", request().padId)
+
 local before = status().revision
 onClick()
-check("a widget click publishes a request", clock, request().nonce)
+check("a widget click takes the next nonce", 2, request().nonce)
 check("the widget's request names its action", "toggle", request().action)
 check("the controller answers the widget's request", before + 1, status().revision)
 check("a declared but unimplemented action is refused", "toggle is not available yet", status().error)
 
--- The panel runs in its own VM with its own module instance. A later request
--- carries a larger nonce even though the two VMs share no memory.
-advance(5)
+-- The panel runs in its own VM with its own module instance. The nonce still
+-- increases, because the controller owns it and no caller can allocate one.
 before = status().revision
 onToggle()
-check("a later request from another entry VM carries a larger nonce", true, request().nonce > clock - 5)
+check("a later request from another entry VM takes the next nonce", 3, request().nonce)
 check("the controller answers the panel's request too", before + 1, status().revision)
 
--- Overlapping publications must never step the nonce back. With the clock
--- standing still two entries publishing at once share one nonce, and neither is
--- lower than what was published before; both are still delivered.
-local frozen = request().nonce
+-- Overlapping publications must never step the nonce back. Two intents are held
+-- before the controller answers either, which is the overlap this API allows.
 before = status().revision
+hold()
 onClick()
 onToggle()
-check("overlapping publications never carry a smaller nonce", true, request().nonce >= frozen)
+release()
+check("overlapping publications never carry a smaller nonce", true, request().nonce > 3)
 check("every overlapping publication is still delivered", before + 2, status().revision)
+check("the accepted sequence is strictly increasing", true, strictlyIncreasing(published))
+check("five accepted requests were published", 5, #published)
 
--- The nonce is a change token, not an order: a lower one is a real request and
--- must be dispatched, not discarded as stale.
+-- The controller's own accepted request is not a new intent, so it is not
+-- dispatched twice.
 before = status().revision
-noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 1, action = "refresh" })
-check("a lower nonce is not treated as stale", before + 1, status().revision)
-check("and its action is dispatched", "refresh is not available yet", status().error)
+noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 99, action = "toggle" })
+check("the controller's own stamp is not dispatched again", before, status().revision)
 
--- The host notifies watchers on every set, so two identical requests published
--- in the same millisecond are both delivered even though their nonces match.
-local identical = { nonce = clock, action = "toggle" }
+-- The host notifies watchers on every set, so two identical requests are both
+-- delivered and both accepted.
 before = status().revision
-noctalia.state.set(serviceShared.REQUEST_KEY, identical)
-noctalia.state.set(serviceShared.REQUEST_KEY, identical)
+noctalia.state.set(serviceShared.REQUEST_KEY, { action = "toggle" })
+noctalia.state.set(serviceShared.REQUEST_KEY, { action = "toggle" })
 check("identical consecutive requests are both delivered", before + 2, status().revision)
+check("and both take their own nonce", 7, request().nonce)
 
 -- The helper refuses a command that is not in the contract, without publishing
 -- anything, so the controller never receives an invented action.
@@ -211,7 +247,6 @@ local refused, reason = widgetShared.request("explode")
 check("an undeclared command is refused by the helper", nil, refused)
 check("the refusal names the command", "unsupported action: explode", reason)
 check("a refused command does not publish a request", publishedNonce, request().nonce)
-
 -- IPC lands on the same dispatch, so its answer cannot differ from the UI's.
 before = status().revision
 onIpc("toggle")
@@ -227,8 +262,8 @@ check("IPC routes a declared action with its payload", "select is not available 
 -- Anything other than a well-formed request is reported, not dispatched.
 noctalia.state.set(serviceShared.REQUEST_KEY, "noise")
 check("a non-request value is refused", "malformed request", status().error)
-noctalia.state.set(serviceShared.REQUEST_KEY, { action = "toggle" })
-check("a request without a nonce is refused", "malformed request", status().error)
+noctalia.state.set(serviceShared.REQUEST_KEY, { padId = "terminal" })
+check("a request without an action is refused", "malformed request: action must be a string", status().error)
 noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 50, action = "select", padId = 5 })
 check("a request with a non-string pad is refused", "malformed request: padId must be a string", status().error)
 
