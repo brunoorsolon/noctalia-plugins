@@ -769,14 +769,14 @@ check("the example writes nothing", 0, #writes)
 queryReplies = {
   clients = { exitCode = 0, stdout = [[
     [
-      {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":"DP-1","workspace":{"name":"special:noctalia-sidepad-terminal"}},
-      {"class":"noctalia-sidepad-browser","address":"0x2","monitor":"DP-2","workspace":{"name":"1"}}
+      {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}},
+      {"class":"noctalia-sidepad-browser","address":"0x2","monitor":1,"workspace":{"id":1,"name":"1"}}
     ]
   ]], stderr = "" },
   monitors = { exitCode = 0, stdout = [[
     [
-      {"name":"DP-1","specialWorkspace":{"name":"noctalia-sidepad-terminal"}},
-      {"name":"DP-2","specialWorkspace":{"name":""}}
+      {"id":0,"name":"DP-1","specialWorkspace":{"id":-99,"name":"noctalia-sidepad-terminal"}},
+      {"id":1,"name":"DP-2","specialWorkspace":{"id":0,"name":""}}
     ]
   ]], stderr = "" },
 }
@@ -794,10 +794,10 @@ check("reconciliation launches no application or dispatcher", 0, nonQueryLaunchC
 
 queryReplies.clients.stdout = [[
   [
-    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":"DP-1","workspace":{"name":"special:noctalia-sidepad-terminal"}},
-    {"class":"noctalia-sidepad-terminal","address":"0x3","monitor":"DP-2","workspace":{"name":"2"}},
-    {"class":"noctalia-sidepad-notes","address":"0x4","monitor":"DP-1","workspace":{"name":"2"}},
-    {"class":"noctalia-sidepad-notes","address":"0x5","monitor":"DP-2","workspace":{"name":"3"}}
+    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}},
+    {"class":"noctalia-sidepad-terminal","address":"0x3","monitor":1,"workspace":{"id":2,"name":"2"}},
+    {"class":"noctalia-sidepad-notes","address":"0x4","monitor":0,"workspace":{"id":2,"name":"2"}},
+    {"class":"noctalia-sidepad-notes","address":"0x5","monitor":1,"workspace":{"id":3,"name":"3"}}
   ]
 ]]
 local duplicate = startWith(VALID_PADS)
@@ -808,6 +808,15 @@ check("duplicate matches are reported as running", true, duplicate.pads[1].runni
 check("duplicate visibility still comes from monitor state", true, duplicate.pads[1].visible)
 check("duplicate output identifies its active monitor", "DP-1", duplicate.pads[1].output)
 check("duplicate snapshots remain observational", 0, nonQueryLaunchCount())
+
+queryReplies.clients.stdout = [[
+  [
+    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":7,"name":"noctalia-sidepad-terminal"}}
+  ]
+]]
+local nameCollision = startWith(VALID_PADS)
+check("a regular workspace cannot match by special-workspace name", false, nameCollision.pads[1].visible)
+check("the regular workspace still resolves its monitor name", "DP-1", nameCollision.pads[1].output)
 
 -- A refresh never publishes ready from just one half of the snapshot. Either
 -- callback order is accepted, and each cycle queries each endpoint once.
@@ -832,6 +841,14 @@ queryReplies.monitors = { exitCode = 0, stdout = "[]", stderr = "" }
 local failedCommand = startWith(VALID_PADS)
 checkContains("a failed snapshot query is visible", "hyprctl -j clients failed (exit 7)", failedCommand.error)
 check("command stderr is not exposed", false, failedCommand.error:find("untrusted output", 1, true) ~= nil)
+for _, flag in ipairs({ "timedOut", "stdoutTruncated", "stderrTruncated" }) do
+  local result = { exitCode = 0, stdout = "[]", stderr = "" }
+  result[flag] = true
+  queryReplies.clients = result
+  local incomplete = startWith(VALID_PADS)
+  check(flag .. " prevents a ready snapshot", "error", incomplete.phase)
+  check(flag .. " remains visible", true, type(incomplete.error) == "string")
+end
 queryReplies.clients = { exitCode = 0, stdout = "not json", stderr = "" }
 local invalidSnapshot = startWith(VALID_PADS)
 checkContains("invalid JSON remains recoverable", "hyprctl -j clients returned an invalid snapshot", invalidSnapshot.error)

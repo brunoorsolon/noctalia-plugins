@@ -238,15 +238,18 @@ local function isClient(client)
   return type(client) == "table"
     and type(client.class) == "string"
     and type(client.address) == "string"
-    and type(client.monitor) == "string"
+    and type(client.monitor) == "number"
     and type(client.workspace) == "table"
+    and type(client.workspace.id) == "number"
     and type(client.workspace.name) == "string"
 end
 
 local function isMonitor(monitor)
   return type(monitor) == "table"
+    and type(monitor.id) == "number"
     and type(monitor.name) == "string"
     and type(monitor.specialWorkspace) == "table"
+    and type(monitor.specialWorkspace.id) == "number"
     and type(monitor.specialWorkspace.name) == "string"
 end
 
@@ -256,16 +259,13 @@ local refreshQueued = false
 local configurationError = nil
 local refresh
 
-local function workspaceKey(name)
-  return name:gsub("^special:", "")
-end
-
 local function applySnapshot(clients, monitors)
-  local activeWorkspaces = {}
+  local activeWorkspaces, monitorNames = {}, {}
   for _, monitor in ipairs(monitors) do
-    local name = monitor.specialWorkspace.name
-    if name ~= "" then
-      activeWorkspaces[workspaceKey(name)] = monitor.name
+    monitorNames[monitor.id] = monitor.name
+    local special = monitor.specialWorkspace
+    if special.id ~= 0 and special.name ~= "" then
+      activeWorkspaces[special.id] = monitor.name
     end
   end
 
@@ -282,17 +282,17 @@ local function applySnapshot(clients, monitors)
     elseif #matches > 1 then
       local visibleOutput = nil
       for _, client in ipairs(matches) do
-        visibleOutput = activeWorkspaces[workspaceKey(client.workspace.name)]
+        visibleOutput = activeWorkspaces[client.workspace.id]
         if visibleOutput then break end
       end
       pad.running, pad.visible, pad.output, pad.address = true, visibleOutput ~= nil, visibleOutput, nil
       table.insert(duplicates, ("duplicate windows for pad '%s' (%s)"):format(pad.id, pad.class))
     else
       local client = matches[1]
-      local output = activeWorkspaces[workspaceKey(client.workspace.name)]
+      local output = activeWorkspaces[client.workspace.id]
       pad.running = true
       pad.visible = output ~= nil
-      pad.output = output or client.monitor
+      pad.output = output or monitorNames[client.monitor]
       pad.address = client.address
     end
   end
@@ -305,6 +305,12 @@ end
 local function commandFailure(command, result)
   if type(result) ~= "table" then
     return command .. " could not be started"
+  end
+  if result.timedOut then
+    return command .. " timed out"
+  end
+  if result.stdoutTruncated or result.stderrTruncated then
+    return command .. " output was truncated"
   end
   if result.exitCode ~= 0 then
     return ("%s failed (exit %s)"):format(command, tostring(result.exitCode))
