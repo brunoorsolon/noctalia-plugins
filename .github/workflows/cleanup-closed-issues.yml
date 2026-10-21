@@ -1,0 +1,45 @@
+name: Clean up closed issues
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  issues: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Remove agent lifecycle labels
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          api = f'{os.environ["API"]}/repos/{os.environ["REPO"]}/issues/{os.environ["ISSUE"]}/labels'
+          headers = {"Authorization": f'Bearer {os.environ["TOKEN"]}', "Accept": "application/vnd.github+json"}
+          wanted = {"agent:blocked", "agent:claimed", "agent:ready", "agent:review"}
+          present = set()
+          page = 1
+          while True:
+              with urlopen(Request(f"{api}?per_page=100&page={page}", headers=headers), timeout=30) as response:
+                  labels = json.load(response)
+              present.update(label["name"] for label in labels if label["name"] in wanted)
+              if len(labels) < 100:
+                  break
+              page += 1
+          for name in present:
+              with urlopen(Request(f"{api}/{quote(name, safe='')}", headers=headers, method="DELETE"), timeout=30):
+                  pass
+          PY
