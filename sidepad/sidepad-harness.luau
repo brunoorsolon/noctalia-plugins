@@ -595,6 +595,10 @@ watchers[serviceShared.REQUEST_KEY] = requestWatchers
 check("a pad selection requests select-and-show", "select", request().action)
 check("the request carries the chosen pad", "browser", request().padId)
 check("pending select-and-show remains open", 0, closedPanels)
+check("selection remains disabled while select-and-show is pending", false, buttonByKey(lastTree, "browser").props.enabled)
+check("other controls remain disabled while select-and-show is pending", false, buttonByKey(lastTree, "side").props.enabled)
+buttonByKey(lastTree, "side").props.onClick()
+check("pending selection prevents a competing action", "select", request().action)
 local selectedSuccess = {
   revision = (status().revision or 0) + 1,
   phase = "ready",

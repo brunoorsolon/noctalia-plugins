@@ -5,6 +5,7 @@ local shared = require("./shared.luau")
 
 local isOpen = false
 local pendingSelect = nil
+local render
 
 local function status()
   local value = noctalia.state.get(shared.STATUS_KEY)
@@ -28,21 +29,22 @@ local function selectedPad(snapshot)
 end
 
 local function request(action, padId)
-  if not status().busy then
+  if pendingSelect == nil and not status().busy then
     shared.request(action, padId)
   end
 end
 
 local function selectPad(padId)
   local snapshot = status()
-  if snapshot.busy then return end
+  if snapshot.busy or pendingSelect then return end
   pendingSelect = { padId = padId, revision = snapshot.revision or 0 }
   shared.request("select", padId)
+  if isOpen and pendingSelect then render() end
 end
 
-local function render()
+render = function()
   local snapshot = status()
-  local busy = snapshot.busy == true
+  local busy = snapshot.busy == true or pendingSelect ~= nil
   local selected = selectedPad(snapshot)
   local available = selected ~= nil
   local errorText = type(snapshot.error) == "string" and snapshot.error or nil
@@ -142,7 +144,7 @@ end
 function onToggle()
   local snapshot = status()
   local selected = selectedPad(snapshot)
-  if selected and not snapshot.busy then
+  if selected and not snapshot.busy and pendingSelect == nil then
     request("toggle", selected.id)
   end
 end
