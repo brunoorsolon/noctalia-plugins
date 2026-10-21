@@ -31,16 +31,18 @@ local SPAWN_GRACE_MS = 20000
 -- widget share - without it each bar announces the same waiting turn.
 local SPAWNED_UNTIL = "spawned_until"
 local LAST_STATE = "last_state"
+local REVEAL_UNTIL = "reveal_until"
+local REOPEN_UNTIL = "reopen_until"
 
 local SEEN_WAIT = "seen_wait"
 local ACKNOWLEDGED_WAIT = "acknowledged_wait"
 
 local LOOK = {
-  working = "Pi is working - click to show or hide it",
-  waiting = "Pi is waiting for you - click to show or hide it",
-  idle = "Pi is idle - click to show or hide it",
-  unknown = "Pi status is unreadable - click to show or hide it",
-  not_running = "Pi is not running - click to start it",
+  working = "Pi is working",
+  waiting = "Pi is waiting for you",
+  idle = "Pi is idle",
+  unknown = "Pi status is unreadable",
+  not_running = "Pi is idle",
 }
 
 local KNOWN_STATES = { working = true, waiting = true, idle = true }
@@ -157,8 +159,10 @@ end
 -- and rejects it; that rejection is reported, not swallowed.
 --
 --   "visible" -> onDone(boolean): is the special workspace showing right now?
+--   "mapped"  -> onDone(boolean): has a scratchpad window mapped?
 --   "toggle"  -> show the special workspace if hidden, hide it if shown
---   "spawn"   -> open Pi in the special workspace, then show it
+--   "show"    -> reveal the workspace without ever hiding it
+--   "spawn"   -> launch Pi; reveal it once its window maps
 
 -- hyprctl answers a Lua dispatch with "ok" when it ran. Anything else - a Lua
 -- error, a rejected argument, the legacy config's "Invalid dispatcher" reply -
@@ -221,6 +225,28 @@ local function compositor(op, onDone)
     return accepted
   end
 
+  if op == "mapped" then
+    local accepted = noctalia.runAsync({ "hyprctl", "-j", "clients" }, function(result)
+      local clients = type(result) == "table" and result.exitCode == 0 and noctalia.json.decode(result.stdout) or nil
+      local valid = type(clients) == "table" and (#clients > 0 or next(clients) == nil)
+      for _, client in ipairs(type(clients) == "table" and clients or {}) do
+        if type(client) ~= "table" or type(client.mapped) ~= "boolean" or
+          type(client.workspace) ~= "table" or type(client.workspace.name) ~= "string" then
+          valid = false
+        elseif client.mapped and client.workspace.name == "special:" .. workspace() then
+          return done(true, true)
+        end
+      end
+      done(false, valid)
+    end)
+    if accepted == false then done(false, false) end
+    return accepted
+  end
+
+  if op == "show" then
+    return dispatch("hl.dsp.focus({ workspace = " .. luaQuote("special:" .. workspace()) .. " })", done)
+  end
+
   -- toggle_special takes the bare name: it prefixes "special:" itself.
   if op == "toggle" then
     return dispatch("hl.dsp.workspace.toggle_special(" .. luaQuote(workspace()) .. ")", done)
@@ -235,16 +261,7 @@ local function compositor(op, onDone)
     " && PI_HYPR_MONITOR=1 " .. text("terminal", DEFAULT_TERMINAL) .. " " .. text("spawn", DEFAULT_SPAWN)
   local expression = "hl.dsp.exec_cmd(" .. luaQuote(command) .. ", { float = true, center = true, size = { " ..
     width .. ", " .. height .. " }, workspace = " .. luaQuote("special:" .. workspace()) .. " })"
-  return dispatch(expression, function(ok)
-    if not ok then return done(false) end
-    -- An exec'd window lands in the special workspace but does not reveal it.
-    -- A reveal Hyprland refused is not a launch it refused: Pi is already booting,
-    -- so the latch stays down and the next click cannot start a second one.
-    compositor("visible", function(visible)
-      if visible then return done() end
-      compositor("toggle", function() done() end)
-    end)
-  end)
+  return dispatch(expression, done)
 end
 
 -- ── The widget ────────────────────────────────────────────────────────────────
@@ -253,8 +270,10 @@ local function paint(state, token)
   local acknowledged = state == "waiting" and noctalia.state.get(ACKNOWLEDGED_WAIT) == token
   local display = acknowledged and "idle" or state
   barWidget.render(icon.render(display, noctalia.nowMs()))
-  barWidget.setTooltip(acknowledged and "Pi is waiting (seen) - click to show or hide it" or LOOK[state])
-  noctalia.setUpdateInterval((display == "working" or display == "waiting") and icon.interval or 1000)
+  barWidget.setTooltip(LOOK[display])
+  local pending = math.max(noctalia.state.get(REVEAL_UNTIL) or 0, noctalia.state.get(REOPEN_UNTIL) or 0)
+  local interval = pending > noctalia.nowMs() and 250 or 1000
+  noctalia.setUpdateInterval((display == "working" or display == "waiting") and icon.interval or interval)
 end
 
 local nextVisibilityCheck = 0
@@ -288,7 +307,7 @@ local function announce(previous, state)
   if not notificationsEnabled() then return end
   compositor("visible", function(visible)
     if visible then return end
-    noctalia.notify("Pi is waiting", "Pi needs you. Click the Pi widget to bring the scratchpad up.")
+    noctalia.notify("Pi is waiting", "Pi needs you.")
   end)
 end
 
@@ -302,7 +321,8 @@ local function spawnInFlight()
   local now = noctalia.nowMs()
   if now < spawnAt then return true end
   local published = noctalia.state.get(SPAWNED_UNTIL)
-  return type(published) == "number" and now < published
+  local pending = math.max(noctalia.state.get(REVEAL_UNTIL) or 0, noctalia.state.get(REOPEN_UNTIL) or 0)
+  return (type(published) == "number" and now < published) or now < pending
 end
 
 local function clearSpawnLatch()
@@ -310,7 +330,55 @@ local function clearSpawnLatch()
   noctalia.state.set(SPAWNED_UNTIL, 0)
 end
 
-local function tick()
+local tick
+local function startSpawn()
+  spawnAt = noctalia.nowMs() + SPAWN_GRACE_MS
+  noctalia.state.set(SPAWNED_UNTIL, spawnAt)
+  local deadline = spawnAt
+  compositor("spawn", function(ok)
+    if ok == false then
+      clearSpawnLatch()
+    else
+      noctalia.state.set(REVEAL_UNTIL, deadline)
+      tick()
+    end
+  end)
+end
+
+local revealBusy = 0
+local function revealSpawn()
+  local deadline = noctalia.state.get(REVEAL_UNTIL)
+  if type(deadline) ~= "number" or deadline == 0 then return end
+  if noctalia.nowMs() >= deadline then
+    noctalia.state.set(REVEAL_UNTIL, 0)
+    noctalia.notify("Pi scratchpad did not appear", "No mapped scratchpad window was found within 20 seconds. Check the terminal and spawn command.")
+    return
+  end
+  if revealBusy == deadline then return end
+  revealBusy = deadline
+  compositor("mapped", function(mapped)
+    if revealBusy == deadline then revealBusy = 0 end
+    if not mapped or noctalia.state.get(REVEAL_UNTIL) ~= deadline or noctalia.nowMs() >= deadline then return end
+    -- Consume before dispatch so another placement cannot reveal it twice.
+    noctalia.state.set(REVEAL_UNTIL, 0)
+    -- Mapping can itself show the workspace. An idempotent focus cannot hide it
+    -- again if that happens between our snapshot and the dispatcher running.
+    compositor("show")
+  end)
+end
+
+tick = function()
+  local reopening = noctalia.state.get(REOPEN_UNTIL) or 0
+  if reopening > 0 then
+    if noctalia.nowMs() >= reopening then
+      noctalia.state.set(REOPEN_UNTIL, 0)
+      noctalia.notify("Pi scratchpad reopen timed out", "Pi did not finish exiting within 20 seconds. A second session was not started.")
+    elseif readState() == "not_running" then
+      noctalia.state.set(REOPEN_UNTIL, 0)
+      startSpawn()
+    end
+  end
+  revealSpawn()
   local state, token = readState()
   -- A session in the status file is the one a spawn was for, so the latch lifts
   -- as soon as Pi publishes anything at all, readable or not.
@@ -338,30 +406,34 @@ function onClick()
 
   -- Only a missing or dead process spawns. An unreadable file still means a
   -- session was there, so toggling is the safe verb for it.
-  if readState() == "not_running" then
-    spawnAt = noctalia.nowMs() + SPAWN_GRACE_MS
-    noctalia.state.set(SPAWNED_UNTIL, spawnAt)
-    -- A launch Hyprland refused must not hold the latch down: the next click has
-    -- to be obeyed again, or a transient failure wedges the widget for good.
-    compositor("spawn", function(ok)
-      if ok == false then clearSpawnLatch() end
-    end)
-  else
-    local state, token = readState()
-    if state ~= "waiting" then
-      compositor("toggle")
+  local state, token = readState()
+  if state == "not_running" then return startSpawn() end
+  if state == "unknown" then return compositor("toggle") end
+
+  compositor("mapped", function(mapped, valid)
+    if spawnInFlight() then return end
+    if not valid then
+      noctalia.notify("Pi scratchpad window query failed", "Could not read Hyprland clients. Nothing was launched or toggled.")
       return
     end
-    compositor("visible", function(visible, valid)
+    if not mapped then
+      -- Closing a terminal can unmap it before Pi finishes shutting down. Keep
+      -- this click's intent, but never start another Pi over the live process.
+      noctalia.state.set(REOPEN_UNTIL, noctalia.nowMs() + SPAWN_GRACE_MS)
+      tick()
+      return
+    end
+    if state ~= "waiting" then return compositor("toggle") end
+    compositor("visible", function(visible, visibleValid)
       compositor("toggle", function(ok)
         local current, currentToken = readState()
-        if ok and valid and visible and current == "waiting" and currentToken == token then
+        if ok and visibleValid and visible and current == "waiting" and currentToken == token then
           noctalia.state.set(ACKNOWLEDGED_WAIT, token)
           paint(current, token)
         end
       end)
     end)
-  end
+  end)
 end
 
 function onIpc(event)

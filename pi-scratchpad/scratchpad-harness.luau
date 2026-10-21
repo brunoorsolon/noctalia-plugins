@@ -57,6 +57,14 @@ local monitorReply = nil
 local declineNextMonitor = false
 local deferredMonitor = nil
 local deferMonitor = false
+local mapped = true
+local clientReply = nil
+local declineNextClients = false
+local deferClients = false
+local deferredClients = nil
+local simulateWindows = false
+local mapOnExec = false
+local mapOnMonitorReply = false
 
 -- What the compositor would answer for `hyprctl -j monitors`: one monitor whose
 -- specialWorkspace carries the workspace name while it is showing.
@@ -123,8 +131,21 @@ hl = {
   dispatch = function(dispatcher)
     assert(type(dispatcher) == "table", "hl.dispatch needs a dispatcher table")
     table.insert(calls, dispatcher)
+    if simulateWindows then
+      if dispatcher.kind == "exec_cmd" then
+        mapped = mapOnExec
+        visible = mapOnExec
+      elseif dispatcher.kind == "focus" then
+        visible = true
+      elseif dispatcher.kind == "toggle_special" then
+        visible = not visible
+      end
+    end
   end,
   dsp = {
+    focus = function(options)
+      return { kind = "focus", name = options.workspace }
+    end,
     exec_cmd = function(command, rules)
       return { kind = "exec_cmd", command = command, rules = rules or {} }
     end,
@@ -138,12 +159,32 @@ hl = {
 
 function noctalia.runAsync(argv, onResult)
   local result = { exitCode = 0, stdout = "", stderr = "", timedOut = false, stdoutTruncated = false, stderrTruncated = false }
-  if argv[1] == "hyprctl" and argv[2] == "-j" then
+  if argv[1] == "hyprctl" and argv[2] == "-j" and argv[3] == "clients" then
+    if declineNextClients then
+      declineNextClients = false
+      return false
+    end
+    result.stdout = mapped and ("clients:" .. CONFIG.workspace) or "clients:empty"
+    decoded[result.stdout] = mapped and { { mapped = true, workspace = { name = "special:" .. CONFIG.workspace:gsub("^special:", "") } } } or {}
+    if clientReply then result = clientReply end
+    if mapOnMonitorReply then
+      mapped, visible = true, true
+      mapOnMonitorReply = false
+    end
+    if deferClients then
+      deferredClients = function() onResult(result) end
+      return true
+    end
+  elseif argv[1] == "hyprctl" and argv[2] == "-j" then
     if declineNextMonitor then
       declineNextMonitor = false
       return false
     end
     result.stdout = monitorsJson()
+    if mapOnMonitorReply then
+      mapped, visible = true, true
+      mapOnMonitorReply = false
+    end
     if monitorReply then result = monitorReply end
     if deferMonitor then
       deferredMonitor = function() onResult(result) end
@@ -318,10 +359,10 @@ end
 checkTrue("the working state says working", names(WORKING, "working"))
 checkTrue("the waiting state says waiting", names(WAITING, "waiting"))
 checkTrue("the idle state says idle", names(IDLE, "idle"))
--- The tooltip is also the action feedback: a stopped Pi says the click starts it,
--- a live one says the click shows or hides the scratchpad.
-checkTrue("the not-running tooltip names the action", names(nil, "start"))
-checkTrue("a live session tooltip names the action", names(IDLE, "show"))
+check("stopped shares the idle tooltip", "Pi is idle", tooltipFor(nil))
+for _, fixture in ipairs(STATE_FIXTURES) do
+  checkTrue("status tooltips have no click instructions", not tooltipFor(fixture):lower():find("click", 1, true))
+end
 
 -- When the runtime directory is unset the extension writes under XDG_STATE_HOME,
 -- so the widget has to look there too.
@@ -371,8 +412,8 @@ check("the spawn carries the configured size",
   spawn.rules.size and (spawn.rules.size[1] .. "x" .. spawn.rules.size[2]), "900x600")
 checkTrue("the spawn floats and centres", spawn.rules.float == true and spawn.rules.center == true)
 check("the spawn targets the configured special workspace", spawn.rules.workspace, "special:pi")
-check("the spawn reveals the workspace it spawns into", lastCall() and lastCall().kind, "toggle_special")
-check("the reveal names the workspace once", lastCall() and lastCall().name, "pi")
+check("the spawn reveals the mapped workspace without toggling", lastCall() and lastCall().kind, "focus")
+check("the reveal names the workspace once", lastCall() and lastCall().name, "special:pi")
 -- A quoted "~" never expands under the /bin/sh Hyprland runs, so the working
 -- directory has to be absolute by the time it is quoted.
 checkTrue("the default working directory resolves before it is quoted", spawn.command:find("cd '/home/user'", 1, true) ~= nil)
@@ -425,7 +466,7 @@ show(nil)
 advance(60000)
 onClick()
 check("a special: prefix in the setting is not doubled", callsOf("exec_cmd")[1].rules.workspace, "special:hi")
-check("the reveal is not doubled either", lastCall().name, "hi")
+check("the reveal is not doubled either", lastCall().name, "special:hi")
 CONFIG.workspace = "pi"
 
 -- Configured values reach the compositor unchanged, however they are spelled: a
@@ -439,7 +480,7 @@ advance(60000)
 onClick()
 check("a spawn command with a quote and a backslash arrives unchanged", callsOf("exec_cmd")[1].command,
   "cd '/home/user' && PI_HYPR_MONITOR=1 foot pi \"quoted\" \\ backslash")
-check("a workspace name with a quote and a backslash arrives unchanged", lastCall().name, 'p"i\\x')
+check("a workspace name with a quote and a backslash arrives unchanged", lastCall().name, 'special:p"i\\x')
 check("and is still targeted as a special workspace", callsOf("exec_cmd")[1].rules.workspace, 'special:p"i\\x')
 CONFIG.workspace = "pi"
 CONFIG.spawn = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
@@ -456,7 +497,7 @@ onClick()
 check("a rejected spawn is announced", 1, #notifications)
 checkTrue("the diagnostic carries the compositor's error",
   notifications[1] and notifications[1].body:find("unknown effect 'float'", 1, true) ~= nil)
-check("a rejected spawn does not reveal the workspace", 0, #callsOf("toggle_special"))
+check("a rejected spawn does not reveal the workspace", 0, #callsOf("focus"))
 calls = {}
 onClick()
 check("a failed launch is retried on the next click", 1, spawnCount())
@@ -517,7 +558,7 @@ check("a launch the runtime declined is announced", 1, #notifications)
 calls = {}
 onClick()
 check("a launch the runtime declined is retried on the next click", 1, spawnCount())
-check("and the retry still reveals the workspace", lastCall().kind, "toggle_special")
+check("and the retry still reveals the workspace", lastCall().kind, "focus")
 
 -- The same for a toggle.
 show(WORKING)
@@ -604,7 +645,7 @@ calls = {}
 firstOnIpc("toggle")
 onIpc("toggle")
 check("IPC shares launch deduplication across placements", 1, spawnCount())
-check("IPC launches and reveals a stopped session", 1, #callsOf("toggle_special"))
+check("IPC launches and reveals a stopped session", 1, #callsOf("focus"))
 
 show(IDLE)
 update()
@@ -616,7 +657,8 @@ visible = false
 advance(1000)
 update()
 check("hiding a wait observed on screen restores idle artwork", idle, shape(lastTree))
-checkTrue("acknowledgment does not pretend Pi is no longer waiting", lastTooltip:find("waiting", 1, true) ~= nil)
+check("acknowledged waiting uses the idle display tooltip", "Pi is idle", lastTooltip)
+check("acknowledgment leaves the underlying Pi status untouched", WAITING, files[STATUS_PATH])
 secondUpdate()
 check("acknowledgment is shared across placements", idle, shape(lastTree))
 
@@ -677,6 +719,138 @@ show(WAITING)
 update()
 deferredMonitor()
 checkTrue("stale visibility results cannot acknowledge a different wait", idle ~= shape(lastTree))
+
+-- ── Close/reopen with real visibility effects and delayed window mapping ──────
+simulateWindows = true
+show(IDLE)
+update()
+mapped, visible = false, false -- terminal unmapped; Pi has not exited yet
+calls = {}
+decoded["other-window"] = { { mapped = true, workspace = { name = "1" } } }
+clientReply = { exitCode = 0, stdout = "other-window" }
+onClick()
+secondOnClick()
+check("closing a terminal cannot start a second Pi before the old one exits", 0, spawnCount())
+check("closing a terminal does not waste the click on an empty workspace", 0, #callsOf("toggle_special"))
+clientReply = nil
+show(nil)
+advance(250)
+update()
+check("the original click starts Pi when shutdown finishes", 1, spawnCount())
+mapped = true
+show(IDLE)
+update()
+check("that same click reveals the replacement window", true, visible)
+
+mapped, visible = false, false
+calls, notifications = {}, {}
+onIpc("toggle")
+advance(20000)
+update()
+check("a lingering Pi is not duplicated after the close timeout", 0, spawnCount())
+check("a lingering Pi reports a bounded reopen timeout", 1, #notifications)
+update()
+check("a close timeout is only announced once", 1, #notifications)
+
+show(nil)
+mapped, visible = false, false
+advance(60000)
+calls = {}
+mapOnMonitorReply = true -- mapping between a compositor sample and its callback
+onClick()
+check("a window revealed during the launch query stays visible", true, visible)
+show(IDLE)
+update()
+check("finishing that launch does not hide its window", true, visible)
+
+show(nil)
+mapped, visible = false, false
+advance(60000)
+calls, notifications = {}, {}
+onClick()
+check("one click launches a replacement after close", 1, spawnCount())
+check("launch does not reveal an empty workspace", 0, #callsOf("focus"))
+check("launch never races a visibility sample with a toggle", 0, #callsOf("toggle_special"))
+mapOnMonitorReply = false
+show(WORKING) -- status can arrive before the compositor finishes mapping
+advance(1000)
+update()
+secondOnClick()
+check("a second placement cannot toggle a launch still waiting for mapping", 0, #callsOf("toggle_special"))
+check("nor can it spawn a duplicate", 1, spawnCount())
+mapped, visible = true, true -- Hyprland itself may reveal a non-silent workspace
+advance(250)
+firstUpdate()
+secondUpdate()
+check("mapping completes the original click without another click", true, visible)
+check("only one placement reveals a pending launch", 1, #callsOf("focus"))
+
+-- Repeat the close, this time mapping silently; the original click must still show it.
+show(nil)
+mapped, visible = false, false
+calls = {}
+onIpc("toggle")
+check("IPC reopens a closed scratchpad once", 1, spawnCount())
+advance(1000)
+show(IDLE)
+mapped = true
+update()
+check("a hidden mapped replacement is revealed automatically", true, visible)
+onClick()
+check("an ordinary click still hides an existing session", false, visible)
+onClick()
+check("an ordinary click still reveals an existing session", true, visible)
+check("hiding and showing preserve the status file", IDLE, files[STATUS_PATH])
+check("hiding and showing do not launch more sessions", 1, spawnCount())
+
+show(nil)
+mapped, visible = false, false
+advance(60000)
+calls, notifications = {}, {}
+clientReply = { exitCode = 1, stdout = "" }
+declineNextClients = true
+onClick()
+update()
+check("a failed client query cannot reveal an unconfirmed window", 0, #callsOf("focus"))
+clientReply = { exitCode = 0, stdout = "malformed clients" }
+update()
+check("a malformed client response cannot reveal an unconfirmed window", 0, #callsOf("focus"))
+clientReply = nil
+mapped = true
+show(IDLE)
+update()
+check("refused and failed client queries do not wedge the pending reveal", true, visible)
+check("recovering the query completes the original click", 1, #callsOf("focus"))
+show(nil)
+mapped, visible = false, false
+onClick()
+advance(20000)
+update()
+check("a window that never maps reports a bounded timeout", 1, #notifications)
+update()
+check("the timeout is reported only once across later polls", 1, #notifications)
+onClick()
+check("a timed-out launch can be retried", 3, spawnCount())
+mapped = true
+show(IDLE)
+update()
+
+-- A callback from the timed-out request must not finish a newer launch.
+show(nil)
+advance(60000)
+calls = {}
+mapOnExec, deferClients = true, true
+onClick()
+deferClients, mapOnExec = false, false
+advance(20000)
+update()
+onClick()
+deferredClients()
+check("an old client snapshot cannot reveal the replacement request", 0, #callsOf("focus"))
+mapped = true
+show(IDLE)
+update()
+check("the current request still completes after a stale callback", 1, #callsOf("focus"))
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

@@ -33,7 +33,7 @@ dependencies = ["python3", "pw-dump", "pw-record", "pw-play", "hyprctl", "ps", "
 [[plugin]]
 id = "magus/pi-scratchpad"
 name = "Pi Scratchpad"
-version = "0.3.0"
+version = "0.3.1"
 updated_at = 1789498045
 added_at = 1789498045
 author = "magus"
