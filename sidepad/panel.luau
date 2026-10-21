@@ -13,10 +13,12 @@ local function status()
 end
 
 local function padState(pad)
-  if pad.visible then
-    return type(pad.output) == "string" and ("shown on " .. pad.output) or "shown"
+  local running = pad.running and "running" or "stopped"
+  local visibility = pad.visible and "visible" or "hidden"
+  if pad.visible and type(pad.output) == "string" then
+    visibility = visibility .. " on " .. pad.output
   end
-  return pad.running and "hidden" or "stopped"
+  return running .. " · " .. visibility
 end
 
 local function selectedPad(snapshot)
@@ -142,11 +144,7 @@ function onRefresh()
 end
 
 function onToggle()
-  local snapshot = status()
-  local selected = selectedPad(snapshot)
-  if selected and not snapshot.busy and pendingSelect == nil then
-    request("toggle", selected.id)
-  end
+  request("toggle")
 end
 
 noctalia.state.watch(shared.STATUS_KEY, function(snapshot)
