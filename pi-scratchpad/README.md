@@ -63,13 +63,17 @@ No Pi configuration ships inside the plugin: the spawn command is the whole of i
 
 ## What the bar shows
 
-| State | When | Glyph |
+The widget always renders the same launcher identity, the Tabler `math-pi` glyph, so it reads as "bring Pi here" whether or not a session is running and never as a power button. A small badge next to it carries the state.
+
+| State | When | Bar |
 | --- | --- | --- |
-| Working | Pi is running a turn | `loader` |
-| Waiting | Pi wants an answer or an approval | `bell` |
-| Idle | Pi is up with nothing to do | `robot` |
-| Not running | There is no status file, or the recorded pid has no live process | `power` |
-| Unknown | The file exists and Pi is alive, but the document cannot be read or its state is not one of the three above | `alert-triangle` |
+| Working | Pi is running a turn | Pi glyph with a `loader` badge |
+| Waiting | Pi wants an answer or an approval | Pi glyph with a `bell` badge |
+| Idle | Pi is up with nothing to do | Pi glyph alone |
+| Not running | There is no status file, or the recorded pid has no live process | Pi glyph with a `plus` badge |
+| Unknown | The file exists and Pi is alive, but the document cannot be read or its state is not one of the three above | Pi glyph with an `alert-triangle` badge |
+
+The badge, not the color, is what tells the states apart, so they stay distinguishable on a monochrome bar or in a screenshot. The Pi glyph and its badge both take the palette's `on_surface` role, which a palette guarantees to contrast with the bar: it is what makes the icon follow a custom palette, repaint when the theme changes, and stay legible on light and dark bars. `outline` is deliberately unused, and so are the accent roles: `outline` is the border and separator role, and against the built-in palettes it ranges from 1.3:1 to 3:1, the invisibility the old power glyph suffered from. Each state also names itself and its click action in the tooltip, so the bar never depends on color.
 
 Unknown is deliberately not "not running". A file that cannot be read still says a session was there, so the widget never reports a live Pi as gone and a click toggles the workspace instead of starting a second Pi.
 
@@ -83,7 +87,7 @@ The widget's Luau entry can be exercised without a compositor:
 ./pi-scratchpad/selftest.sh
 ```
 
-It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the click routing, the spawn latch, the waiting notification and the two-placement cases. The `hyprctl` stub answers a dispatch the way a Lua-configured Hyprland does, by evaluating `return hl.dispatch(<argument>)` against a stubbed `hl.dsp`, so a dispatch expression that Hyprland or Lua would reject fails the check instead of passing as a string comparison. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
+It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the state presentation and its palette roles, the tooltips, the click routing, the spawn latch, the waiting notification and the two-placement cases. The `hyprctl` stub answers a dispatch the way a Lua-configured Hyprland does, by evaluating `return hl.dispatch(<argument>)` against a stubbed `hl.dsp`, so a dispatch expression that Hyprland or Lua would reject fails the check instead of passing as a string comparison. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
 
 What it cannot check is the host: whether a real Pi turn moves the indicator, whether the first click spawns and later clicks toggle, whether the window arrives at the configured size, and whether Hyprland accepts the dispatcher expressions on the live version. Those need Hyprland, Noctalia, a terminal and the extension.
 
