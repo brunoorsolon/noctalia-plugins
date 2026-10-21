@@ -115,6 +115,13 @@ local function shellQuote(value)
   return "'" .. value:gsub("'", "'\\''") .. "'"
 end
 
+-- Every value inside a dispatcher expression comes from a setting, so a quote or
+-- a backslash in a spawn command, a path or a workspace name would otherwise end
+-- the expression there and run whatever follows it.
+local function luaQuote(value)
+  return '"' .. value:gsub("[\\\"]", "\\%0"):gsub("\n", "\\n"):gsub("\r", "\\r") .. '"'
+end
+
 -- A folder setting can be "~", "~/project" or an absolute path. Hyprland runs the
 -- spawn line through /bin/sh, but the shell only expands a tilde it can see and
 -- this plugin single-quotes the path, so the expansion has to happen here or the
@@ -134,9 +141,55 @@ end
 -- else in the file names a compositor, so a niri port rewrites the bodies here
 -- and leaves the widget above untouched.
 --
+-- The interface it speaks is Hyprland 0.55's Lua dispatcher API, because a
+-- `hyprland.lua` configuration (the default since 0.55) evaluates every
+-- `hyprctl dispatch` argument as the expression in `hl.dispatch(<argument>)`:
+-- `hl.dsp.exec_cmd(command, rules)` for the launch and
+-- `hl.dsp.workspace.toggle_special(name)` for the workspace. A hyprlang `.conf`
+-- configuration reads the same argument as a legacy "dispatcher argument" pair
+-- and rejects it; that rejection is reported, not swallowed.
+--
 --   "visible" -> onDone(boolean): is the special workspace showing right now?
 --   "toggle"  -> show the special workspace if hidden, hide it if shown
 --   "spawn"   -> open Pi in the special workspace, then show it
+
+-- hyprctl answers a Lua dispatch with "ok" when it ran. Anything else - a Lua
+-- error, a rejected argument, the legacy config's "Invalid dispatcher" reply -
+-- is a failed dispatch, and its text is all the diagnostic there is.
+local function dispatchSucceeded(result)
+  if type(result) ~= "table" or result.exitCode ~= 0 then return false end
+  local stdout = type(result.stdout) == "string" and result.stdout or ""
+  return noctalia.string.trim(stdout) == "ok"
+end
+
+local function dispatchError(result)
+  if type(result) ~= "table" then return "hyprctl did not run" end
+  local stdout = type(result.stdout) == "string" and result.stdout or ""
+  local stderr = type(result.stderr) == "string" and result.stderr or ""
+  local detail = noctalia.string.trim(stdout .. " " .. stderr):gsub("^error:%s*", "")
+  if detail == "" then detail = "hyprctl exited with status " .. tostring(result.exitCode) end
+  return detail
+end
+
+local function dispatch(expression, onDone)
+  local done = onDone or function() end
+  local accepted = noctalia.runAsync({ "hyprctl", "dispatch", expression }, function(result)
+    if dispatchSucceeded(result) then return done(true) end
+    -- The click has to say what Hyprland said, or a misconfigured compositor
+    -- looks exactly like a widget that does nothing.
+    noctalia.notify("Pi scratchpad dispatch failed", dispatchError(result))
+    done(false)
+  end)
+  -- The runtime can decline to start the process at all, and then no result ever
+  -- arrives. A click reported as obeyed would hold the spawn latch down with
+  -- nothing running, so the local refusal is reported and cleared here.
+  if accepted == false then
+    noctalia.notify("Pi scratchpad dispatch failed", "hyprctl could not be started, so nothing was sent to Hyprland.")
+    done(false)
+  end
+  return accepted
+end
+
 local function compositor(op, onDone)
   local done = onDone or function() end
 
@@ -157,23 +210,28 @@ local function compositor(op, onDone)
     end)
   end
 
+  -- toggle_special takes the bare name: it prefixes "special:" itself.
   if op == "toggle" then
-    return noctalia.runAsync({ "hyprctl", "dispatch", "togglespecialworkspace", workspace() }, done)
+    return dispatch("hl.dsp.workspace.toggle_special(" .. luaQuote(workspace()) .. ")", done)
   end
 
-  -- "spawn". Hyprland runs an exec payload through /bin/sh, and the leading
-  -- bracket block is its exec-rule syntax: float, centre, the configured size,
-  -- and the special workspace. PI_HYPR_MONITOR=1 is what makes the companion
+  -- "spawn". exec_cmd runs the command through /bin/sh and its rule table is the
+  -- Lua form of the old bracket block: float, centre, the configured size, and
+  -- the special workspace. PI_HYPR_MONITOR=1 is what makes the companion
   -- extension publish the status file, and it reaches Pi through the terminal.
   local width, height = geometry()
-  local rules = "[float;center;size " .. width .. " " .. height ..
-    ";workspace special:" .. workspace() .. "]"
-  local command = rules .. " cd " .. shellQuote(absolutePath(text("working_dir", DEFAULT_WORKING_DIR))) ..
+  local command = "cd " .. shellQuote(absolutePath(text("working_dir", DEFAULT_WORKING_DIR))) ..
     " && PI_HYPR_MONITOR=1 " .. text("terminal", DEFAULT_TERMINAL) .. " " .. text("spawn", DEFAULT_SPAWN)
-  return noctalia.runAsync({ "hyprctl", "dispatch", "exec", command }, function()
+  local expression = "hl.dsp.exec_cmd(" .. luaQuote(command) .. ", { float = true, center = true, size = { " ..
+    width .. ", " .. height .. " }, workspace = " .. luaQuote("special:" .. workspace()) .. " })"
+  return dispatch(expression, function(ok)
+    if not ok then return done(false) end
     -- An exec'd window lands in the special workspace but does not reveal it.
+    -- A reveal Hyprland refused is not a launch it refused: Pi is already booting,
+    -- so the latch stays down and the next click cannot start a second one.
     compositor("visible", function(visible)
-      if visible then done() else compositor("toggle", done) end
+      if visible then return done() end
+      compositor("toggle", function() done() end)
     end)
   end)
 end
@@ -247,7 +305,11 @@ function onClick()
   if readState() == "not_running" then
     spawnAt = noctalia.nowMs() + SPAWN_GRACE_MS
     noctalia.state.set(SPAWNED_UNTIL, spawnAt)
-    compositor("spawn")
+    -- A launch Hyprland refused must not hold the latch down: the next click has
+    -- to be obeyed again, or a transient failure wedges the widget for good.
+    compositor("spawn", function(ok)
+      if ok == false then clearSpawnLatch() end
+    end)
   else
     compositor("toggle")
   end
