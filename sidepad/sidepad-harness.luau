@@ -19,6 +19,12 @@ local function checkTrue(name, condition)
     print(("FAIL %-64s condition was false"):format(name))
   end
 end
+local function checkContains(name, expected, text)
+  if type(text) ~= "string" or not text:find(expected, 1, true) then
+    failures = failures + 1
+    print(("FAIL %-64s expected to contain [%s] got [%s]"):format(name, expected, tostring(text)))
+  end
+end
 
 -- ── The stub runtime ─────────────────────────────────────────────────────────
 
@@ -55,6 +61,174 @@ noctalia.state = {
     table.insert(watchers[key], callback)
   end,
 }
+
+-- ── The user's configuration and the host calls that read it ────────────────
+
+-- The host decodes pads.json with its JSON parser. The stub decodes for real, so
+-- a fixture is refused because its text is not JSON, not because the check
+-- declared it malformed.
+local function decodeJson(text)
+  -- cursor is the last consumed byte, so the next byte to read is cursor + 1.
+  local cursor = 0
+  local function fail(reason)
+    error(("json: %s at byte %d"):format(reason, cursor + 1), 0)
+  end
+  local function peek()
+    return text:sub(cursor + 1, cursor + 1)
+  end
+  local function skip()
+    while peek():match("%s") do cursor = cursor + 1 end
+  end
+  local function take(byte)
+    if peek() ~= byte then fail(("expected '%s'"):format(byte)) end
+    cursor = cursor + 1
+  end
+  local parseValue
+  local function parseString()
+    take('"')
+    local out = {}
+    while true do
+      local character = peek()
+      if character == "" then fail("unterminated string") end
+      if character == '"' then
+        cursor = cursor + 1
+        return table.concat(out)
+      end
+      if character == "\\" then
+        local escape = text:sub(cursor + 2, cursor + 2)
+        local simple = { ['"'] = '"', ["\\"] = "\\", ["/"] = "/", b = "\b", f = "\f", n = "\n", r = "\r", t = "\t" }
+        if simple[escape] == nil then fail("unsupported escape") end
+        table.insert(out, simple[escape])
+        cursor = cursor + 2
+      else
+        table.insert(out, character)
+        cursor = cursor + 1
+      end
+    end
+  end
+  local function parseArray()
+    take("[")
+    local out = {}
+    local position = 1
+    skip()
+    if peek() == "]" then
+      cursor = cursor + 1
+      return out
+    end
+    while true do
+      -- The host writes every original index, so a JSON null stays a hole with
+      -- the later indices in place; keeping that shape is what lets a fixture
+      -- prove the controller refuses a hidden pad or command argument.
+      local value = parseValue()
+      if value ~= nil then out[position] = value end
+      position = position + 1
+      skip()
+      if peek() == "]" then
+        cursor = cursor + 1
+        return out
+      end
+      take(",")
+      skip()
+    end
+  end
+  local function parseObject()
+    take("{")
+    local out = {}
+    skip()
+    if peek() == "}" then
+      cursor = cursor + 1
+      return out
+    end
+    while true do
+      local key = parseString()
+      skip()
+      take(":")
+      out[key] = parseValue()
+      skip()
+      if peek() == "}" then
+        cursor = cursor + 1
+        return out
+      end
+      take(",")
+      skip()
+    end
+  end
+  function parseValue()
+    skip()
+    local character = peek()
+    if character == "{" then return parseObject() end
+    if character == "[" then return parseArray() end
+    if character == '"' then return parseString() end
+    if text:sub(cursor + 1, cursor + 4) == "true" then
+      cursor = cursor + 4
+      return true
+    end
+    if text:sub(cursor + 1, cursor + 5) == "false" then
+      cursor = cursor + 5
+      return false
+    end
+    if text:sub(cursor + 1, cursor + 4) == "null" then
+      cursor = cursor + 4
+      return nil
+    end
+    local number = text:sub(cursor + 1):match("^%-?%d+%.?%d*")
+    if number then
+      cursor = cursor + #number
+      return tonumber(number)
+    end
+    fail("unexpected value")
+  end
+  local ok, value = pcall(parseValue)
+  if not ok then return nil, value end
+  skip()
+  if cursor < #text then return nil, "trailing content" end
+  return value
+end
+
+-- The plugin data directory the controller reads, and the executables the host
+-- would not find on PATH. Both are switched per fixture below.
+local files = {}
+local absentCommands = {}
+
+noctalia.pluginDataDir = function() return "/data" end
+noctalia.readFile = function(path)
+  local contents = files[path]
+  if contents == nil then return nil, "cannot open file" end
+  return contents
+end
+noctalia.commandExists = function(name) return absentCommands[name] ~= true end
+noctalia.json = { decode = decodeJson }
+
+-- Every process the controller starts, every file it writes and every
+-- notification it raises is recorded: reading configuration must produce none of
+-- them.
+local launches, writes, notifications = {}, {}, {}
+noctalia.runAsync = function(argv) table.insert(launches, argv); return true end
+noctalia.runStream = function(command) table.insert(launches, command); return true end
+noctalia.writeFile = function(path) table.insert(writes, path); return true end
+noctalia.notifyError = function(message) table.insert(notifications, message) end
+
+-- A configuration the controller accepts: three pads, one of them without the
+-- optional icon, and therefore the file every startup check below loads unless
+-- it names its own.
+local VALID_PADS = [[
+{
+  "version": 1,
+  "pads": [
+    { "id": "terminal", "name": "Terminal", "icon": "terminal-2",
+      "class": "noctalia-sidepad-terminal",
+      "command": ["kitty", "--class", "noctalia-sidepad-terminal"] },
+    { "id": "browser", "name": "Browser",
+      "class": "noctalia-sidepad-browser",
+      "command": ["firefox", "--class", "noctalia-sidepad-browser"] },
+    { "id": "notes", "name": "Notes", "icon": "notes",
+      "class": "noctalia-sidepad-notes",
+      "command": ["notes", "--pad"] }
+  ]
+}
+]]
+
+files["/data/pads.json"] = VALID_PADS
 
 local function hold() held = {} end
 local function release()
@@ -198,14 +372,28 @@ check("the initial width mode", "narrow", initial.widthMode)
 check("the initial busy flag", false, initial.busy)
 check("the initial error", nil, initial.error)
 check("the initial selected pad", nil, initial.selectedPadId)
-checkTrue("the snapshot carries a pad list", type(initial.pads) == "table" and #initial.pads == 0)
+check("the snapshot carries the configured pads", 3, #initial.pads)
+check("a configured pad keeps its identity", "terminal", initial.pads[1].id)
+check("a configured pad keeps its name", "Terminal", initial.pads[1].name)
+check("a configured pad keeps its icon", "terminal-2", initial.pads[1].icon)
+check("an optional icon may be absent", nil, initial.pads[2].icon)
+check("a configured pad keeps its exact class", "noctalia-sidepad-terminal", initial.pads[1].class)
+check("a configured command stays an argv array", "kitty", initial.pads[1].command[1])
+check("a configured argv keeps its later arguments", "--class", initial.pads[1].command[2])
+check("the managed workspace derives from the id", "special:noctalia-sidepad-terminal", initial.pads[1].workspace)
+check("an unobserved pad is stopped", false, initial.pads[1].running)
+check("an unobserved pad is hidden", false, initial.pads[1].visible)
+check("an unobserved pad has no output", nil, initial.pads[1].output)
+check("loading a configuration starts nothing", 0, #launches)
+check("loading a configuration writes nothing", 0, #writes)
+check("loading a configuration notifies nobody", 0, #notifications)
 
 -- A consumer gets a copy: editing what it read cannot rewrite the controller.
 initial.revision = 99
 initial.pads[1] = { id = "mutated" }
 local reread = status()
 check("a caller cannot rewrite the published snapshot", 1, reread.revision)
-check("a caller cannot add a pad to the snapshot", 0, #reread.pads)
+check("a caller cannot replace a published pad", "terminal", reread.pads[1].id)
 
 -- ── One action path, from two entry VMs and from IPC ────────────────────────
 
@@ -339,7 +527,8 @@ check("a panel selection publishes a select request", "select", request().action
 check("the request carries the chosen pad", "browser", request().padId)
 check("an unimplemented selection is refused truthfully", "select is not available yet", status().error)
 -- The controller republishes its own snapshot, so the fixture cannot outlive it.
-check("the controller owns the snapshot after an action", 0, #status().pads)
+check("the controller owns the snapshot after an action", 3, #status().pads)
+check("and republishes the configured pads", "terminal", status().pads[1].id)
 
 -- ── The bar's states and its two interactions ───────────────────────────────
 
@@ -486,6 +675,151 @@ snapshot({ busy = true })
 onRightClick()
 check("the selector still opens while an operation runs", PANEL_ENTRY_ID, lastPanel())
 check("the panel is asked for once per click", 2, #toggledPanels)
+
+-- ── Pad configuration ───────────────────────────────────────────────────────
+
+-- The controller reads the user's definitions once at startup, so every fixture
+-- below is a real startup: the entry is loaded again with only that file on
+-- disk, and the processes and notifications it causes are counted from zero.
+local function startWith(padsJson)
+  files = {}
+  if padsJson ~= nil then files["/data/pads.json"] = padsJson end
+  stateStore, watchers, held = {}, {}, nil
+  launches, writes, notifications = {}, {}, {}
+  loadEntry("service")
+  return status()
+end
+
+-- A fixture the controller must refuse: no pads, one actionable reason, and
+-- nothing launched, notified or mutated on the way.
+local function refusedAtStartup(name, padsJson, expected)
+  local snapshot = startWith(padsJson)
+  checkContains(name .. ": reason", expected, snapshot.error)
+  check(name .. ": publishes no pads", 0, #snapshot.pads)
+  check(name .. ": starts nothing", 0, #launches)
+  check(name .. ": writes nothing", 0, #writes)
+  check(name .. ": notifies nobody", 0, #notifications)
+end
+
+-- The shipped example is a configuration the controller must accept, so the
+-- file users copy can never be one their own controller refuses.
+local example = startWith(EXAMPLE_PADS)
+check("the shipped example starts ready", "ready", example.phase)
+check("the shipped example reports no error", nil, example.error)
+check("the shipped example loads its pads", 2, #example.pads)
+check("the shipped example names its first pad", "terminal", example.pads[1].id)
+check("the example's optional icon is kept", "terminal-symbolic", example.pads[1].icon)
+check("the example derives its workspace", "special:noctalia-sidepad-terminal", example.pads[1].workspace)
+check("the example's second pad is accepted too", "browser", example.pads[2].id)
+check("the example starts nothing", 0, #launches)
+check("the example writes nothing", 0, #writes)
+
+-- No file at all: the message has to say where the file belongs and what to do.
+local missing = startWith(nil)
+check("a missing configuration refuses the pads", 0, #missing.pads)
+checkContains("a missing configuration names the path", "/data/pads.json", missing.error)
+checkContains("a missing configuration points at the example", "pads.example.json", missing.error)
+
+-- Malformed or misshapen documents.
+refusedAtStartup("malformed JSON", '{ "version": 1, "pads": [ }', "is not valid JSON")
+refusedAtStartup("an unsupported version", '{ "version": 2, "pads": [] }', "version must be 1")
+refusedAtStartup("a missing pads array", '{ "version": 1 }', "pads must be an array")
+refusedAtStartup("an object instead of an array", '{ "version": 1, "pads": { "terminal": {} } }', "pads must be an array")
+
+-- Uniqueness.
+refusedAtStartup(
+  "a duplicate id",
+  '{ "version": 1, "pads": ['
+    .. '{ "id": "terminal", "name": "One", "class": "class-one", "command": ["kitty"] },'
+    .. '{ "id": "terminal", "name": "Two", "class": "class-two", "command": ["kitty"] }] }',
+  "duplicate pad id 'terminal'"
+)
+refusedAtStartup(
+  "a duplicate class",
+  '{ "version": 1, "pads": ['
+    .. '{ "id": "one", "name": "One", "class": "same-class", "command": ["kitty"] },'
+    .. '{ "id": "two", "name": "Two", "class": "same-class", "command": ["kitty"] }] }',
+  "duplicate pad class 'same-class'"
+)
+
+-- Values that must never reach a selector or a derived workspace name.
+refusedAtStartup(
+  "an id with unsafe characters",
+  '{ "version": 1, "pads": [{ "id": "Terminal Pad", "name": "T", "class": "pad-terminal", "command": ["kitty"] }] }',
+  "id must be a non-empty string of lowercase ASCII letters"
+)
+refusedAtStartup(
+  "an id that is missing",
+  '{ "version": 1, "pads": [{ "name": "T", "class": "pad-terminal", "command": ["kitty"] }] }',
+  "id must be a non-empty string of lowercase ASCII letters"
+)
+refusedAtStartup(
+  "a class with selector syntax",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad,class:^.*$", "command": ["kitty"] }] }',
+  "class must be a non-empty Wayland class"
+)
+refusedAtStartup(
+  "a class that is missing",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "command": ["kitty"] }] }',
+  "class must be a non-empty Wayland class"
+)
+
+-- Arguments stay argv: a value that is not a string would otherwise reach a
+-- launch and be reinterpreted by whatever runs it.
+refusedAtStartup(
+  "a non-string argument",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": ["kitty", 2] }] }',
+  "command[2] must be a string"
+)
+refusedAtStartup(
+  "an empty command",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": [] }] }',
+  "command must be a non-empty array"
+)
+refusedAtStartup(
+  "a command given as a string",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": "kitty --class pad-terminal" }] }',
+  "command must be an array"
+)
+
+-- The host leaves a JSON null as a hole that ipairs stops at, so a null would
+-- hide the value behind it. Both lists are refused rather than half-validated.
+refusedAtStartup(
+  "a null in a command",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": ["kitty", null, 42] }] }',
+  "command has no value at position 2"
+)
+refusedAtStartup(
+  "a null in the pad list",
+  '{ "version": 1, "pads": ['
+    .. '{ "id": "one", "name": "One", "class": "class-one", "command": ["kitty"] },'
+    .. 'null,'
+    .. '{ "id": "two", "name": "Two", "class": "class-two", "command": ["kitty"] }] }',
+  "pads has no value at position 2"
+)
+
+-- The executable check goes through the host, not through a guess about PATH.
+absentCommands["absent-binary"] = true
+refusedAtStartup(
+  "a missing executable",
+  '{ "version": 1, "pads": [{ "id": "terminal", "name": "T", "class": "pad-terminal", "command": ["absent-binary"] }] }',
+  "executable 'absent-binary' was not found"
+)
+absentCommands["absent-binary"] = nil
+
+-- A required field.
+refusedAtStartup(
+  "a missing name",
+  '{ "version": 1, "pads": [{ "id": "terminal", "class": "pad-terminal", "command": ["kitty"] }] }',
+  "name must be a non-empty string"
+)
+
+-- An empty pad list is a valid file: a user who has configured nothing is not in
+-- an error state.
+local empty = startWith('{ "version": 1, "pads": [] }')
+check("an empty pad list starts ready", "ready", empty.phase)
+check("an empty pad list reports no error", nil, empty.error)
+check("an empty pad list publishes no pads", 0, #empty.pads)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

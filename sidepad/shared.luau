@@ -9,6 +9,12 @@ local M = {}
 M.REQUEST_KEY = "sidepad.request"
 M.STATUS_KEY = "sidepad.status"
 
+-- The managed workspace a pad is shown on. It derives from the pad ID alone, so
+-- the name is never configuration and two pads cannot share a workspace.
+function M.workspaceName(id)
+  return "special:noctalia-sidepad-" .. tostring(id)
+end
+
 -- Declared commands. A name belongs to the contract from here on, even while the
 -- slice that implements it is still open: the controller refuses what it cannot
 -- do yet, and a caller cannot invent a command the controller never learns.

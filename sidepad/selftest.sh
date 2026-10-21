@@ -96,6 +96,11 @@ panel_entry="$(python3 -c 'import pathlib, tomllib; m = tomllib.loads(pathlib.Pa
     printf '\n]==],\n'
   done
   printf '}\n'
+  # The shipped example is loaded by the harness as a real startup fixture, so a
+  # corrupt example fails here instead of only in review.
+  printf 'EXAMPLE_PADS = [==[\n'
+  cat pads.example.json
+  printf '\n]==]\n'
   printf 'PANEL_ENTRY_ID = "%s"\n' "$panel_entry"
   cat sidepad-harness.luau
 } >"$work/run.luau"
