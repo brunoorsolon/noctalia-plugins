@@ -199,12 +199,56 @@ end
 noctalia.commandExists = function(name) return absentCommands[name] ~= true end
 noctalia.json = { decode = decodeJson }
 
--- Every process the controller starts, every file it writes and every
--- notification it raises is recorded: reading configuration must produce none of
--- them.
-local launches, writes, notifications = {}, {}, {}
-noctalia.runAsync = function(argv) table.insert(launches, argv); return true end
+-- Process commands, queries, files and notifications are recorded separately so
+-- snapshot refreshes can be proved observational rather than mistaken for actions.
+local launches, writes, notifications, compositorQueries = {}, {}, {}, {}
+local queryReplies = {
+  clients = { exitCode = 0, stdout = "[]", stderr = "" },
+  monitors = { exitCode = 0, stdout = "[]", stderr = "" },
+}
+local declinedQueries, pendingQueries = {}, {}
+local deferQueries = false
+noctalia.runAsync = function(argv, onResult)
+  table.insert(launches, copy(argv))
+  if type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "-j" then
+    local kind = argv[3]
+    table.insert(compositorQueries, copy(argv))
+    if declinedQueries[kind] then return false end
+    if onResult then
+      if deferQueries then
+        table.insert(pendingQueries, { kind = kind, callback = onResult })
+      else
+        onResult(copy(queryReplies[kind]))
+      end
+    end
+  end
+  return true
+end
 noctalia.runStream = function(command) table.insert(launches, command); return true end
+local function queryCount(kind)
+  local count = 0
+  for _, argv in ipairs(compositorQueries) do
+    if kind == nil or argv[3] == kind then count = count + 1 end
+  end
+  return count
+end
+local function finishQuery(kind)
+  for index, pending in ipairs(pendingQueries) do
+    if pending.kind == kind then
+      table.remove(pendingQueries, index)
+      pending.callback(copy(queryReplies[kind]))
+      return true
+    end
+  end
+  return false
+end
+local function nonQueryLaunchCount()
+  local count = 0
+  for _, argv in ipairs(launches) do
+    if type(argv) ~= "table" or argv[1] ~= "hyprctl" or argv[2] ~= "-j" then count = count + 1 end
+  end
+  return count
+end
 noctalia.writeFile = function(path) table.insert(writes, path); return true end
 noctalia.notifyError = function(message) table.insert(notifications, message) end
 
@@ -238,7 +282,7 @@ local function release()
 end
 
 local lastGlyph, lastGlyphColor, lastTooltip, lastTree = nil, nil, nil, nil
-local toggledPanels = {}
+local toggledPanels, closedPanels = {}, 0
 
 ui = {}
 local function node(kind)
@@ -251,7 +295,10 @@ ui.button = node("button")
 ui.glyph = node("glyph")
 ui.separator = node("separator")
 
-panel = { render = function(tree) lastTree = tree end, close = function() end }
+panel = {
+  render = function(tree) lastTree = tree end,
+  close = function() closedPanels = closedPanels + 1 end,
+}
 barWidget = {
   setGlyph = function(name) lastGlyph = name end,
   setGlyphColor = function(role) lastGlyphColor = role end,
@@ -366,7 +413,7 @@ checkTrue("both UI entries watch the status key", #(watchers[serviceShared.STATU
 local initial = status()
 check("the controller publishes before any request", true, type(initial) == "table")
 check("the initial phase", "ready", initial.phase)
-check("the initial revision", 1, initial.revision)
+check("the initial revision", 2, initial.revision)
 check("the initial side", "left", initial.side)
 check("the initial width mode", "narrow", initial.widthMode)
 check("the initial busy flag", false, initial.busy)
@@ -384,7 +431,10 @@ check("the managed workspace derives from the id", "special:noctalia-sidepad-ter
 check("an unobserved pad is stopped", false, initial.pads[1].running)
 check("an unobserved pad is hidden", false, initial.pads[1].visible)
 check("an unobserved pad has no output", nil, initial.pads[1].output)
-check("loading a configuration starts nothing", 0, #launches)
+check("startup queries each snapshot once", 2, #compositorQueries)
+check("startup queries clients once", 1, queryCount("clients"))
+check("startup queries monitors once", 1, queryCount("monitors"))
+check("startup reconciliation launches no application", 0, nonQueryLaunchCount())
 check("loading a configuration writes nothing", 0, #writes)
 check("loading a configuration notifies nobody", 0, #notifications)
 
@@ -392,7 +442,7 @@ check("loading a configuration notifies nobody", 0, #notifications)
 initial.revision = 99
 initial.pads[1] = { id = "mutated" }
 local reread = status()
-check("a caller cannot rewrite the published snapshot", 1, reread.revision)
+check("a caller cannot rewrite the published snapshot", 2, reread.revision)
 check("a caller cannot replace a published pad", "terminal", reread.pads[1].id)
 
 -- ── One action path, from two entry VMs and from IPC ────────────────────────
@@ -429,6 +479,7 @@ check("a declared but unimplemented action is refused", "toggle is not available
 
 -- The panel runs in its own VM with its own module instance. The nonce still
 -- increases, because the controller owns it and no caller can allocate one.
+snapshot()
 before = status().revision
 onToggle()
 check("a later request from another entry VM takes the next nonce", 3, request().nonce)
@@ -517,18 +568,104 @@ onOpen()
 checkTrue("the panel renders the pad list", type(lastTree) == "table")
 check("the panel marks the selected pad", true, buttonByKey(lastTree, "terminal").props.selected)
 check("the panel marks another pad as unselected", false, buttonByKey(lastTree, "browser").props.selected)
-checkTrue("the panel names a pad with its state", hasText(lastTree, "Terminal · shown on DP-1"))
-checkTrue("the panel reports a stopped pad", hasText(lastTree, "Notes · stopped"))
+checkTrue("the panel names a running visible pad", hasText(lastTree, "Terminal · running · visible on DP-1"))
+checkTrue("the panel names a running hidden pad", hasText(lastTree, "Browser · running · hidden"))
+checkTrue("the panel names a stopped hidden pad", hasText(lastTree, "Notes · stopped · hidden"))
 check("the panel shows a pad's icon", "terminal-2", buttonByKey(lastTree, "terminal").props.glyph)
+check("pad names include their selected state for assistive users", true, buttonByKey(lastTree, "terminal").props.text:find("selected", 1, true) ~= nil)
+check("the selected pad shows Hide", "Hide", buttonByKey(lastTree, "visibility").props.text)
+check("a running pad offers the opposite width", "Narrow", buttonByKey(lastTree, "width").props.text)
+check("the panel names the side action", "Move to left", buttonByKey(lastTree, "side").props.text)
+check("a running pad exposes Close", true, buttonByKey(lastTree, "close").props.enabled)
 
--- Selecting a pad from the panel carries the pad id on the same action path.
+-- The selected control actions route through the shared request contract.
+buttonByKey(lastTree, "width").props.onClick()
+check("width action uses the declared toggle contract", "toggle_width", request().action)
+check("width request names the selected pad", "terminal", request().padId)
+snapshot()
+buttonByKey(lastTree, "side").props.onClick()
+check("side action uses the declared switch contract", "switch_side", request().action)
+snapshot()
+buttonByKey(lastTree, "close").props.onClick()
+check("close action uses the declared contract", "close", request().action)
+snapshot({ pads = { { id = "terminal", name = "Terminal", running = true, visible = true, output = "DP-1" } } })
+buttonByKey(lastTree, "visibility").props.onClick()
+check("visibility action follows the selected pad state", "hide", request().action)
+check("visibility request names its pad", "terminal", request().padId)
+-- The controller republishes an error for unsupported actions; failure keeps the panel open.
+check("failed actions do not dismiss the panel", 0, closedPanels)
+check("the panel displays the controller failure", true, hasText(lastTree, "hide is not available yet"))
+
+snapshot({
+  busy = true,
+  pads = {
+    { id = "terminal", name = "Terminal", running = true, visible = true },
+    { id = "browser", name = "Browser", running = true, visible = false },
+  },
+})
+check("busy disables pad selection", false, buttonByKey(lastTree, "browser").props.enabled)
+check("busy disables visibility actions", false, buttonByKey(lastTree, "visibility").props.enabled)
+check("busy disables refresh", false, find(lastTree, function(n) return n.kind == "button" and n.props.text == "Refresh" end).props.enabled)
+local busyNonce = request().nonce
 buttonByKey(lastTree, "browser").props.onClick()
-check("a panel selection publishes a select request", "select", request().action)
+buttonByKey(lastTree, "visibility").props.onClick()
+check("busy panel actions publish nothing", busyNonce, request().nonce)
+
+snapshot({ pads = { { id = "terminal", name = "Terminal", running = false, visible = false } } })
+check("a stopped pad can still be shown", true, buttonByKey(lastTree, "visibility").props.enabled)
+check("width is disabled until the pad is running", false, buttonByKey(lastTree, "width").props.enabled)
+check("close is disabled until the pad is running", false, buttonByKey(lastTree, "close").props.enabled)
+check("side preference remains available for a stopped pad", true, buttonByKey(lastTree, "side").props.enabled)
+buttonByKey(lastTree, "visibility").props.onClick()
+check("a stopped pad's Show button requests show", "show", request().action)
+
+snapshot({ busy = false, selectedPadId = false, pads = {} })
+check("no configured selection disables actions", false, buttonByKey(lastTree, "visibility").props.enabled)
+check("no configured selection disables width changes", false, buttonByKey(lastTree, "width").props.enabled)
+check("no configured selection disables close", false, buttonByKey(lastTree, "close").props.enabled)
+local unavailableNonce = request().nonce
+buttonByKey(lastTree, "visibility").props.onClick()
+check("unavailable actions publish nothing", unavailableNonce, request().nonce)
+
+-- A fresh selection stays open on failure, then dismisses only after the
+-- controller publishes the requested selected pad as visible without an error.
+snapshot({
+  pads = {
+    { id = "terminal", name = "Terminal", running = true, visible = true },
+    { id = "browser", name = "Browser", running = true, visible = false },
+    { id = "notes", name = "Notes", running = false, visible = false },
+  },
+})
+local requestWatchers = watchers[serviceShared.REQUEST_KEY]
+watchers[serviceShared.REQUEST_KEY] = {}
+buttonByKey(lastTree, "browser").props.onClick()
+watchers[serviceShared.REQUEST_KEY] = requestWatchers
+check("a pad selection requests select-and-show", "select", request().action)
 check("the request carries the chosen pad", "browser", request().padId)
-check("an unimplemented selection is refused truthfully", "select is not available yet", status().error)
--- The controller republishes its own snapshot, so the fixture cannot outlive it.
-check("the controller owns the snapshot after an action", 3, #status().pads)
-check("and republishes the configured pads", "terminal", status().pads[1].id)
+check("pending select-and-show remains open", 0, closedPanels)
+check("selection remains disabled while select-and-show is pending", false, buttonByKey(lastTree, "browser").props.enabled)
+check("other controls remain disabled while select-and-show is pending", false, buttonByKey(lastTree, "side").props.enabled)
+buttonByKey(lastTree, "side").props.onClick()
+check("pending selection prevents a competing action", "select", request().action)
+local selectedSuccess = {
+  revision = (status().revision or 0) + 1,
+  phase = "ready",
+  selectedPadId = "browser",
+  side = "left",
+  widthMode = "narrow",
+  busy = false,
+  error = nil,
+  pads = {
+    { id = "terminal", name = "Terminal", icon = "terminal-2", running = true, visible = false },
+    { id = "browser", name = "Browser", icon = "world", running = true, visible = true },
+    { id = "notes", name = "Notes", icon = "notes", running = false, visible = false },
+  },
+}
+noctalia.state.set(serviceShared.STATUS_KEY, selectedSuccess)
+check("successful select-and-show dismisses the panel", 1, closedPanels)
+-- The request watcher was withheld to represent the asynchronous action's pending
+-- interval; restore a stamped request so subsequent entries see a host-like state.
+noctalia.state.set(serviceShared.REQUEST_KEY, { nonce = 99, action = "select", padId = "browser" })
 
 -- ── The bar's states and its two interactions ───────────────────────────────
 
@@ -602,9 +739,9 @@ snapshot({ pads = {} })
 check("a named selection is named without its record", "terminal", tooltipValue("Pad"))
 check("a named selection without runtime detail is reported as stopped", "stopped", tooltipValue("State"))
 checkTrue("a named selection still describes the left click", describesLeftClick())
-local namedNonce = request().nonce
 onClick()
-check("a named selection is still toggleable", namedNonce + 1, request().nonce)
+check("a named selection is still toggleable", "toggle", request().action)
+check("a named selection click is stamped", true, type(request().nonce) == "number")
 
 -- The name survives the states that decide the click too: an operation in flight
 -- and a reported failure both still say which pad they concern.
@@ -685,7 +822,8 @@ local function startWith(padsJson)
   files = {}
   if padsJson ~= nil then files["/data/pads.json"] = padsJson end
   stateStore, watchers, held = {}, {}, nil
-  launches, writes, notifications = {}, {}, {}
+  launches, writes, notifications, compositorQueries = {}, {}, {}, {}
+  pendingQueries = {}
   loadEntry("service")
   return status()
 end
@@ -696,7 +834,8 @@ local function refusedAtStartup(name, padsJson, expected)
   local snapshot = startWith(padsJson)
   checkContains(name .. ": reason", expected, snapshot.error)
   check(name .. ": publishes no pads", 0, #snapshot.pads)
-  check(name .. ": starts nothing", 0, #launches)
+  check(name .. ": issues no compositor queries", 0, #compositorQueries)
+  check(name .. ": starts no application", 0, nonQueryLaunchCount())
   check(name .. ": writes nothing", 0, #writes)
   check(name .. ": notifies nobody", 0, #notifications)
 end
@@ -711,14 +850,135 @@ check("the shipped example names its first pad", "terminal", example.pads[1].id)
 check("the example's optional icon is kept", "terminal-symbolic", example.pads[1].icon)
 check("the example derives its workspace", "special:noctalia-sidepad-terminal", example.pads[1].workspace)
 check("the example's second pad is accepted too", "browser", example.pads[2].id)
-check("the example starts nothing", 0, #launches)
+check("the example queries one snapshot pair", 2, #compositorQueries)
+check("the example starts no application", 0, nonQueryLaunchCount())
 check("the example writes nothing", 0, #writes)
+
+-- A single pair of asynchronous snapshots adopts existing clients and derives
+-- visibility from the monitor's active special workspace.
+queryReplies = {
+  clients = { exitCode = 0, stdout = [[
+    [
+      {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}},
+      {"class":"noctalia-sidepad-browser","address":"0x2","monitor":1,"workspace":{"id":1,"name":"1"}}
+    ]
+  ]], stderr = "" },
+  monitors = { exitCode = 0, stdout = [[
+    [
+      {"id":0,"name":"DP-1","specialWorkspace":{"id":-99,"name":"noctalia-sidepad-terminal"}},
+      {"id":1,"name":"DP-2","specialWorkspace":{"id":0,"name":""}}
+    ]
+  ]], stderr = "" },
+}
+local reconciled = startWith(VALID_PADS)
+check("one pair queries clients and monitors", 2, #compositorQueries)
+check("the snapshot reconciles before startup is ready", "ready", reconciled.phase)
+check("an existing client is adopted as running", true, reconciled.pads[1].running)
+check("the adopted address is retained for controller actions", "0x1", reconciled.pads[1].address)
+check("an active special workspace makes the pad visible", true, reconciled.pads[1].visible)
+check("the active monitor is published as the output", "DP-1", reconciled.pads[1].output)
+check("a unique client on an ordinary workspace stays hidden", false, reconciled.pads[2].visible)
+check("a hidden running client keeps its address", "0x2", reconciled.pads[2].address)
+check("a configured class with no client is stopped", false, reconciled.pads[3].running)
+check("reconciliation launches no application or dispatcher", 0, nonQueryLaunchCount())
+
+queryReplies.clients.stdout = [[
+  [
+    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}},
+    {"class":"noctalia-sidepad-terminal","address":"0x3","monitor":1,"workspace":{"id":2,"name":"2"}},
+    {"class":"noctalia-sidepad-notes","address":"0x4","monitor":0,"workspace":{"id":2,"name":"2"}},
+    {"class":"noctalia-sidepad-notes","address":"0x5","monitor":1,"workspace":{"id":3,"name":"3"}}
+  ]
+]]
+local duplicate = startWith(VALID_PADS)
+checkContains("duplicate matches report a recoverable error", "duplicate windows for pad 'terminal'", duplicate.error)
+checkContains("all ambiguous classes are reported", "duplicate windows for pad 'notes'", duplicate.error)
+check("duplicate matches never adopt an ambiguous address", nil, duplicate.pads[1].address)
+check("duplicate matches are reported as running", true, duplicate.pads[1].running)
+check("duplicate visibility still comes from monitor state", true, duplicate.pads[1].visible)
+check("duplicate output identifies its active monitor", "DP-1", duplicate.pads[1].output)
+check("duplicate snapshots remain observational", 0, nonQueryLaunchCount())
+
+queryReplies.clients.stdout = [[
+  [
+    {"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":7,"name":"noctalia-sidepad-terminal"}}
+  ]
+]]
+local nameCollision = startWith(VALID_PADS)
+check("a regular workspace cannot match by special-workspace name", false, nameCollision.pads[1].visible)
+check("the regular workspace still resolves its monitor name", "DP-1", nameCollision.pads[1].output)
+
+-- A refresh never publishes ready from just one half of the snapshot. Either
+-- callback order is accepted, and each cycle queries each endpoint once.
+queryReplies.clients.stdout = "[]"
+queryReplies.monitors.stdout = "[]"
+deferQueries = true
+local pending = startWith(VALID_PADS)
+check("a pending startup snapshot is not prematurely ready", "starting", pending.phase)
+check("startup waits for both asynchronous results", true, pending.busy)
+check("startup starts exactly one pair", 2, #compositorQueries)
+check("monitor reply alone does not publish ready", true, finishQuery("monitors"))
+check("one missing result keeps startup pending", true, status().busy)
+check("client reply completes startup", true, finishQuery("clients"))
+check("startup becomes ready only after both results", "ready", status().phase)
+check("both callbacks are consumed", 0, #pendingQueries)
+deferQueries = false
+
+-- Failures preserve a recoverable error, and a later explicit refresh rebuilds
+-- truth from a new pair without any compositor mutation.
+queryReplies.clients = { exitCode = 7, stdout = "", stderr = "untrusted output" }
+queryReplies.monitors = { exitCode = 0, stdout = "[]", stderr = "" }
+local failedCommand = startWith(VALID_PADS)
+checkContains("a failed snapshot query is visible", "hyprctl -j clients failed (exit 7)", failedCommand.error)
+check("command stderr is not exposed", false, failedCommand.error:find("untrusted output", 1, true) ~= nil)
+for _, flag in ipairs({ "timedOut", "stdoutTruncated", "stderrTruncated" }) do
+  local result = { exitCode = 0, stdout = "[]", stderr = "" }
+  result[flag] = true
+  queryReplies.clients = result
+  local incomplete = startWith(VALID_PADS)
+  check(flag .. " prevents a ready snapshot", "error", incomplete.phase)
+  check(flag .. " remains visible", true, type(incomplete.error) == "string")
+end
+queryReplies.clients = { exitCode = 0, stdout = "not json", stderr = "" }
+local invalidSnapshot = startWith(VALID_PADS)
+checkContains("invalid JSON remains recoverable", "hyprctl -j clients returned an invalid snapshot", invalidSnapshot.error)
+queryReplies.clients = { exitCode = 0, stdout = "{}", stderr = "" }
+local wrongShape = startWith(VALID_PADS)
+checkContains("an object is not accepted as a snapshot array", "returned an invalid snapshot", wrongShape.error)
+queryReplies.clients = { exitCode = 0, stdout = "[]", stderr = "" }
+declinedQueries.clients = true
+local declinedQuery = startWith(VALID_PADS)
+checkContains("a declined async query remains recoverable", "hyprctl -j clients could not be started", declinedQuery.error)
+check("a declined query still attempts the other half of the pair", 1, queryCount("monitors"))
+declinedQueries.clients = nil
+queryReplies.clients = { exitCode = 0, stdout = "[]", stderr = "" }
+absentCommands.hyprctl = true
+local missingHyprctl = startWith(VALID_PADS)
+checkContains("missing hyprctl is visible", "hyprctl was not found", missingHyprctl.error)
+check("missing hyprctl starts no query", 0, #compositorQueries)
+absentCommands.hyprctl = nil
+onRefresh()
+check("panel refresh recovers status", "ready", status().phase)
+check("panel refresh clears the previous error", nil, status().error)
+check("panel refresh sends the refresh action", "refresh", request().action)
+check("panel refresh queries one pair", 2, #compositorQueries)
+onIpc("refresh")
+check("IPC refresh also queries one pair", 4, #compositorQueries)
+check("refresh and reconciliation remain observational", 0, nonQueryLaunchCount())
+
+queryReplies = {
+  clients = { exitCode = 0, stdout = "[]", stderr = "" },
+  monitors = { exitCode = 0, stdout = "[]", stderr = "" },
+}
 
 -- No file at all: the message has to say where the file belongs and what to do.
 local missing = startWith(nil)
 check("a missing configuration refuses the pads", 0, #missing.pads)
 checkContains("a missing configuration names the path", "/data/pads.json", missing.error)
 checkContains("a missing configuration points at the example", "pads.example.json", missing.error)
+onRefresh()
+checkContains("refresh does not hide a configuration error", "pads.example.json", status().error)
+check("refresh does not query without configured pads", 0, #compositorQueries)
 
 -- Malformed or misshapen documents.
 refusedAtStartup("malformed JSON", '{ "version": 1, "pads": [ }', "is not valid JSON")

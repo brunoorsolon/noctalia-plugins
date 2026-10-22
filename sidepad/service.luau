@@ -208,15 +208,203 @@ local function loadPads()
   return pads
 end
 
--- The one action path: the request watcher below and onIpc both land here, so a
--- UI click and a `noctalia msg plugin` call cannot take different routes.
+-- Parse one compositor JSON array without trusting its contents. Invalid
+-- snapshots leave the last good pad state intact and surface one recoverable
+-- error rather than publishing guessed state.
+local function decodeArray(raw, command, validateItem)
+  if type(raw) ~= "string" then
+    return nil, command .. " returned no output"
+  end
+  if noctalia.string.trim(raw):sub(1, 1) ~= "[" then
+    return nil, command .. " returned an invalid snapshot"
+  end
+  local ok, value = pcall(noctalia.json.decode, raw)
+  if not ok or type(value) ~= "table" then
+    return nil, command .. " returned invalid JSON"
+  end
+  local length = denseLength(value)
+  if not length then
+    return nil, command .. " returned an invalid snapshot"
+  end
+  for index = 1, length do
+    if not validateItem(value[index]) then
+      return nil, command .. " returned an invalid snapshot"
+    end
+  end
+  return value
+end
+
+local function isClient(client)
+  return type(client) == "table"
+    and type(client.class) == "string"
+    and type(client.address) == "string"
+    and type(client.monitor) == "number"
+    and type(client.workspace) == "table"
+    and type(client.workspace.id) == "number"
+    and type(client.workspace.name) == "string"
+end
+
+local function isMonitor(monitor)
+  return type(monitor) == "table"
+    and type(monitor.id) == "number"
+    and type(monitor.name) == "string"
+    and type(monitor.specialWorkspace) == "table"
+    and type(monitor.specialWorkspace.id) == "number"
+    and type(monitor.specialWorkspace.name) == "string"
+end
+
+local hasSnapshot = false
+local refreshing = false
+local refreshQueued = false
+local configurationError = nil
+local refresh
+
+local function applySnapshot(clients, monitors)
+  local activeWorkspaces, monitorNames = {}, {}
+  for _, monitor in ipairs(monitors) do
+    monitorNames[monitor.id] = monitor.name
+    local special = monitor.specialWorkspace
+    if special.id ~= 0 and special.name ~= "" then
+      activeWorkspaces[special.id] = monitor.name
+    end
+  end
+
+  local duplicates = {}
+  for _, pad in ipairs(status.pads) do
+    local matches = {}
+    for _, client in ipairs(clients) do
+      if client.class == pad.class then
+        table.insert(matches, client)
+      end
+    end
+    if #matches == 0 then
+      pad.running, pad.visible, pad.output, pad.address = false, false, nil, nil
+    elseif #matches > 1 then
+      local visibleOutput = nil
+      for _, client in ipairs(matches) do
+        visibleOutput = activeWorkspaces[client.workspace.id]
+        if visibleOutput then break end
+      end
+      pad.running, pad.visible, pad.output, pad.address = true, visibleOutput ~= nil, visibleOutput, nil
+      table.insert(duplicates, ("duplicate windows for pad '%s' (%s)"):format(pad.id, pad.class))
+    else
+      local client = matches[1]
+      local output = activeWorkspaces[client.workspace.id]
+      pad.running = true
+      pad.visible = output ~= nil
+      pad.output = output or monitorNames[client.monitor]
+      pad.address = client.address
+    end
+  end
+  hasSnapshot = true
+  status.error = #duplicates > 0 and table.concat(duplicates, "; ") or nil
+  status.phase = status.error and "error" or "ready"
+  status.busy = false
+end
+
+local function commandFailure(command, result)
+  if type(result) ~= "table" then
+    return command .. " could not be started"
+  end
+  if result.timedOut then
+    return command .. " timed out"
+  end
+  if result.stdoutTruncated or result.stderrTruncated then
+    return command .. " output was truncated"
+  end
+  if result.exitCode ~= 0 then
+    return ("%s failed (exit %s)"):format(command, tostring(result.exitCode))
+  end
+  return nil
+end
+
+local function completeRefresh(results)
+  local failure = commandFailure("hyprctl -j clients", results.clients)
+    or commandFailure("hyprctl -j monitors", results.monitors)
+  if failure then
+    status.error = failure
+    status.phase = "error"
+    status.busy = false
+  else
+    local clients, clientError = decodeArray(results.clients.stdout, "hyprctl -j clients", isClient)
+    local monitors, monitorError = decodeArray(results.monitors.stdout, "hyprctl -j monitors", isMonitor)
+    if not clients or not monitors then
+      status.error = clientError or monitorError
+      status.phase = "error"
+      status.busy = false
+    else
+      applySnapshot(clients, monitors)
+    end
+  end
+  refreshing = false
+  publish()
+  if refreshQueued then
+    refreshQueued = false
+    refresh()
+  end
+end
+
+local function query(command, callback)
+  local completed = false
+  local function done(result)
+    if completed then return end
+    completed = true
+    callback(result)
+  end
+  local accepted = noctalia.runAsync({ "hyprctl", "-j", command }, done)
+  if accepted == false then
+    done(nil)
+  end
+end
+
+refresh = function()
+  if configurationError then
+    status.error = configurationError
+    status.phase = "error"
+    status.busy = false
+    publish()
+    return
+  end
+  if refreshing then
+    refreshQueued = true
+    return
+  end
+  if not noctalia.commandExists("hyprctl") then
+    status.error = "hyprctl was not found in PATH"
+    status.phase = "error"
+    status.busy = false
+    publish()
+    return
+  end
+  refreshing = true
+  status.phase = hasSnapshot and "refreshing" or "starting"
+  status.busy = true
+  publish()
+  local results, remaining = {}, 2
+  local function received(key, result)
+    results[key] = result
+    remaining = remaining - 1
+    if remaining == 0 then
+      completeRefresh(results)
+    end
+  end
+  -- Both queries belong to this refresh cycle; neither is inferred from the
+  -- other, and no compositor mutation is issued during reconciliation.
+  query("clients", function(result) received("clients", result) end)
+  query("monitors", function(result) received("monitors", result) end)
+end
+
+-- The one action path: the request watcher below and onIpc both land here.
 local function dispatch(action, padId)
   if not shared.isAction(action) then
     refuse("unknown action: " .. tostring(action))
     return
   end
-  -- Every declared action belongs to a later slice. Naming the action is the
-  -- truthful answer for this build: it is in the contract, it is not available.
+  if action == "refresh" then
+    refresh()
+    return
+  end
+  -- Other actions belong to later slices and must not imply work they cannot do.
   refuse(action .. " is not available yet")
 end
 
@@ -260,15 +448,16 @@ function onIpc(event, payload)
   dispatch(event, padId)
 end
 
--- Startup: one read of the user's definitions. A failure publishes no pads and
--- the reason in the status error both UI entries already render, so the user is
--- told what to fix while every caller stays usable; nothing here launches an
--- application or moves a window.
+-- Startup reads user definitions, then reconciles every configured class before
+-- publishing the ready phase. A failure stays visible without launching or moving
+-- any application.
 local configured, configError = loadPads()
 if configured then
   status.pads = configured
+  refresh()
 else
+  configurationError = configError
   status.error = configError
+  status.phase = "error"
+  publish()
 end
-
-publish()
