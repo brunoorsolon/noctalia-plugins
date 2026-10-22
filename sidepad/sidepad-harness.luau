@@ -828,6 +828,65 @@ local function startWith(padsJson)
   return status()
 end
 
+-- An active asynchronous operation owns busy state. A second IPC action is
+-- rejected before it can start another command, and an explicit command failure
+-- notifies only after its result has been reconciled.
+local operationStart = startWith(VALID_PADS)
+check("operation fixture starts ready", "ready", operationStart.phase)
+deferQueries = true
+queryReplies = {
+  clients = { exitCode = 0, stdout = "[]", stderr = "" },
+  monitors = { exitCode = 0, stdout = "[]", stderr = "" },
+}
+local queriesBeforeOperation = queryCount()
+onIpc("refresh")
+check("an IPC operation publishes busy while pending", true, status().busy)
+check("a pending operation starts one snapshot pair", queriesBeforeOperation + 2, queryCount())
+local activeStatus = status()
+activeStatus.selectedPadId = "terminal"
+noctalia.state.set(serviceShared.STATUS_KEY, activeStatus)
+local activeNonce = request() and request().nonce or 0
+onClick()
+check("the widget suppresses a second request while busy", activeNonce, request() and request().nonce or 0)
+onIpc("toggle")
+check("a duplicate IPC operation cannot start another command", queriesBeforeOperation + 2, queryCount())
+check("a duplicate leaves the active operation busy", true, status().busy)
+check("a rejected duplicate does not notify", 0, #notifications)
+finishQuery("clients")
+finishQuery("monitors")
+check("busy clears after operation results", false, status().busy)
+check("successful operation leaves status recoverable", "ready", status().phase)
+deferQueries = false
+
+-- Startup refreshes are silent; the explicit IPC refresh reports a safe error,
+-- clears busy, and permits a later request to recover.
+queryReplies.clients = { exitCode = 4, stdout = "", stderr = "private details" }
+onIpc("refresh")
+checkContains("explicit failure remains actionable in status", "hyprctl -j clients failed (exit 4)", status().error)
+check("explicit failure notifies once", 1, #notifications)
+check("notification omits command stderr", false, notifications[1]:find("private details", 1, true) ~= nil)
+check("a failed operation clears busy for recovery", false, status().busy)
+for _, failure in ipairs({
+  { name = "failed start", decline = true },
+  { name = "timeout", result = { exitCode = 0, stdout = "[]", stderr = "", timedOut = true } },
+  { name = "truncated stdout", result = { exitCode = 0, stdout = "[]", stderr = "", stdoutTruncated = true } },
+  { name = "truncated stderr", result = { exitCode = 0, stdout = "[]", stderr = "", stderrTruncated = true } },
+}) do
+  queryReplies.clients = failure.result or { exitCode = 0, stdout = "[]", stderr = "" }
+  declinedQueries.clients = failure.decline or nil
+  local previousNotifications = #notifications
+  onIpc("refresh")
+  check(failure.name .. " clears busy", false, status().busy)
+  check(failure.name .. " remains actionable", true, type(status().error) == "string")
+  check(failure.name .. " notifies explicit action", previousNotifications + 1, #notifications)
+end
+declinedQueries.clients = nil
+queryReplies.clients = { exitCode = 0, stdout = "[]", stderr = "" }
+onIpc("refresh")
+check("a later successful operation recovers", "ready", status().phase)
+check("successful recovery clears the operation error", nil, status().error)
+deferQueries = false
+
 -- A fixture the controller must refuse: no pads, one actionable reason, and
 -- nothing launched, notified or mutated on the way.
 local function refusedAtStartup(name, padsJson, expected)
