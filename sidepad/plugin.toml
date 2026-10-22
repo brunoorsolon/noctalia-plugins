@@ -7,6 +7,7 @@ license = "MIT"
 icon = "layout-sidebar-right"
 description = "Shows the selected external application as a native sidepad on a dedicated Hyprland special workspace."
 tags = ["hyprland", "desktop", "widget", "panel", "service"]
+dependencies = ["hyprctl", "socat"]
 
 # Width of the pad surface in each mode. The controller reads these when it
 # applies geometry; they are not persisted state.

@@ -5,10 +5,7 @@ Noctalia reads the manifest and renders the catalog row, so a field that drifts
 between the two shows the user the wrong package, and a version that drifts
 leaves an update offered forever. The catalog is a repository-wide artifact, so
 the check walks every plugin rather than living inside one plugin's selftest.
-A plugin whose catalog row has not been added yet is listed here as pending and
-reported instead of failing the check: registration is its own step, and an
-unregistered plugin is not offered to users. Every other manifest still needs
-exactly one row, so a lost or typo'd row keeps failing its own plugin.
+Every manifest needs exactly one catalog row.
 
 Run from a plugin directory (`python3 ../scripts/check-catalog.py`) or from the
 repository root; it resolves paths against its own location.
@@ -33,10 +30,6 @@ FIELDS = (
 )
 
 
-# Manifests that landed before their catalog row. Registration is the last step
-# of the plugin's own breakdown; remove the entry with that registration.
-PENDING_REGISTRATION = {"sidepad"}
-
 
 def fail(message):
     sys.exit("FAIL: %s" % message)
@@ -48,7 +41,6 @@ with open(os.path.join(root, "catalog.toml"), "rb") as handle:
     rows = tomllib.load(handle)["plugin"]
 
 checked = 0
-unregistered = []
 manifests = 0
 for path in sorted(glob.glob(os.path.join(root, "*", "plugin.toml"))):
     with open(path, "rb") as handle:
@@ -57,9 +49,6 @@ for path in sorted(glob.glob(os.path.join(root, "*", "plugin.toml"))):
     manifests += 1
     relative = os.path.relpath(path, root)
     matching = [row for row in rows if row.get("id") == manifest.get("id")]
-    if not matching and os.path.dirname(relative) in PENDING_REGISTRATION:
-        unregistered.append(relative)
-        continue
     if len(matching) != 1:
         fail("%s: catalog rows for %r: expected 1, got %d" % (relative, manifest.get("id"), len(matching)))
     row = matching[0]
@@ -75,7 +64,4 @@ for path in sorted(glob.glob(os.path.join(root, "*", "plugin.toml"))):
 if manifests == 0:
     fail("no plugin manifest found under %s" % root)
 
-if unregistered:
-    print("catalog ok (%d plugins, not yet registered: %s)" % (checked, ", ".join(unregistered)))
-else:
-    print("catalog ok (%d plugins)" % checked)
+print("catalog ok (%d plugins)" % checked)

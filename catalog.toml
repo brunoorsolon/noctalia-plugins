@@ -44,3 +44,18 @@ deprecated = false
 plugin_api = 24
 tags = ["hyprland", "desktop", "widget", "agent"]
 dependencies = ["hyprctl", "foot", "pi"]
+
+[[plugin]]
+id = "magus/sidepad"
+name = "Sidepad"
+version = "0.1.0"
+updated_at = 1792680987
+added_at = 1792680987
+author = "magus"
+license = "MIT"
+icon = "layout-sidebar-right"
+description = "Shows the selected external application as a native sidepad on a dedicated Hyprland special workspace."
+deprecated = false
+plugin_api = 24
+tags = ["hyprland", "desktop", "widget", "panel", "service"]
+dependencies = ["hyprctl", "socat"]
