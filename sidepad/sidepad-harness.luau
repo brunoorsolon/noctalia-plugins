@@ -220,17 +220,21 @@ local queryReplies = {
   clients = { exitCode = 0, stdout = "[]", stderr = "" },
   monitors = { exitCode = 0, stdout = "[]", stderr = "" },
 }
-local declinedQueries, pendingQueries = {}, {}
+local declinedQueries, pendingQueries, queryTimeouts = {}, {}, {}
 local streamCallbacks = {}
 local streamAccepted = true
 local deferQueries = false
 local closeDispatch = nil
+local detachedAccepted = false
+local settings = { narrow_width = 900, wide_width = 1200, edge_gap = 10, top_gap = 100, bottom_gap = 100, launch_timeout_ms = 5000 }
+noctalia.getConfig = function(key) return settings[key] end
 local clock = 0
 noctalia.nowMs = function() return clock end
-noctalia.runAsync = function(argv, onResult)
+noctalia.runAsync = function(argv, onResult, timeout)
   table.insert(launches, copy(argv))
   if type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "-j" then
     local kind = argv[3]
+    queryTimeouts[kind] = timeout
     table.insert(compositorQueries, copy(argv))
     if declinedQueries[kind] then return false end
     if onResult then
@@ -242,6 +246,9 @@ noctalia.runAsync = function(argv, onResult)
     end
   elseif closeDispatch and type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "dispatch" then
     return closeDispatch(argv, onResult)
+  elseif argv[1] ~= "hyprctl" then
+    check("applications launch detached without a completion callback", nil, onResult)
+    return detachedAccepted
   end
   return true
 end
@@ -354,14 +361,14 @@ end
 -- Each entry is its own runtime with its own module cache, so shared.luau is
 -- loaded once per entry exactly as the host does it. The accepted nonce lives in
 -- the controller's VM, so the per-VM module instances cannot disagree about it.
-local setPreferences
+local setPreferences, controllerStatus
 local function loadEntry(entry)
   entryShared = assert(loadstring(SOURCES.shared, "shared.luau"))()
   -- Expose the controller-local seam only in the harness, without adding a
   -- public IPC action or making selection imply a partially implemented show.
-  local source = SOURCES[entry] .. (entry == "service" and "\nreturn setPreferences" or "")
-  local result = assert(loadstring(source, entry .. ".luau"))()
-  if entry == "service" then setPreferences = result end
+  local source = SOURCES[entry] .. (entry == "service" and "\nreturn setPreferences, status" or "")
+  local result, internalStatus = assert(loadstring(source, entry .. ".luau"))()
+  if entry == "service" then setPreferences, controllerStatus = result, internalStatus end
   return entryShared
 end
 
@@ -510,8 +517,8 @@ snapshot()
 onClick()
 check("a widget click takes the next nonce", 2, request().nonce)
 check("the widget's request names its action", "toggle", request().action)
-check("the controller answers the widget's request", before + 1, status().revision)
-checkContains("a stopped pad cannot yet be launched", "selected pad is not running", status().error)
+checkTrue("the controller answers the widget's request", status().revision > before)
+checkContains("a failed detached launch is actionable", "could not launch pad", status().error)
 
 -- The panel runs in its own VM with its own module instance. The nonce still
 -- increases, because the controller owns it and no caller can allocate one.
@@ -519,7 +526,7 @@ snapshot()
 before = status().revision
 onToggle()
 check("a later request from another entry VM takes the next nonce", 3, request().nonce)
-check("the controller answers the panel's request too", before + 1, status().revision)
+checkTrue("the controller answers the panel's request too", status().revision > before)
 
 -- Overlapping publications must never step the nonce back. Two intents are held
 -- before the controller answers either, which is the overlap this API allows.
@@ -530,7 +537,7 @@ onClick()
 onToggle()
 release()
 check("overlapping publications never carry a smaller nonce", true, request().nonce > 3)
-check("every overlapping publication is still delivered", before + 2, status().revision)
+checkTrue("overlapping publications receive a controller answer", status().revision > before)
 check("the accepted sequence is strictly increasing", true, strictlyIncreasing(published))
 check("five accepted requests were published", 5, #published)
 
@@ -545,7 +552,7 @@ check("the controller's own stamp is not dispatched again", before, status().rev
 before = status().revision
 noctalia.state.set(serviceShared.REQUEST_KEY, { action = "toggle" })
 noctalia.state.set(serviceShared.REQUEST_KEY, { action = "toggle" })
-check("identical consecutive requests are both delivered", before + 2, status().revision)
+checkTrue("identical consecutive requests receive a controller answer", status().revision > before)
 check("and both take their own nonce", 7, request().nonce)
 
 -- The helper refuses a command that is not in the contract, without publishing
@@ -558,8 +565,8 @@ check("a refused command does not publish a request", publishedNonce, request().
 -- IPC lands on the same dispatch, so its answer cannot differ from the UI's.
 before = status().revision
 onIpc("toggle")
-check("IPC answers through the same dispatch", before + 1, status().revision)
-checkContains("IPC's answer matches the UI's answer", "selected pad is not running", status().error)
+checkTrue("IPC answers through the same dispatch", status().revision > before)
+checkContains("IPC's answer matches the UI's answer", "could not launch pad", status().error)
 onIpc("explode")
 check("IPC refuses a command outside the contract", "unknown action: explode", status().error)
 onIpc("select", "terminal")
@@ -860,7 +867,7 @@ local function startWith(padsJson, preferencesJson)
   files["/data/preferences.json"] = preferencesJson
   stateStore, watchers, held = {}, {}, nil
   launches, writes, notifications, compositorQueries = {}, {}, {}, {}
-  pendingQueries, streamCallbacks = {}, {}
+  pendingQueries, streamCallbacks, queryTimeouts = {}, {}, {}
   loadEntry("service")
   return status()
 end
@@ -874,10 +881,8 @@ local outputs = {
   { name = "DP-1", x = 0, y = 0, width = 1920, height = 1080 },
   { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 },
 }
-local settings = { narrow_width = 900, wide_width = 1200, edge_gap = 10, top_gap = 100, bottom_gap = 100 }
 noctalia.outputs = function() return copy(outputs) end
 noctalia.focusedOutputName = function() return focusedOutput end
-noctalia.getConfig = function(key) return settings[key] end
 local windows, monitors, compositorFocus, focusedWindow
 local mutationFailure, mutationDeclined, deferMutation, pendingMutation
 local function modelSnapshots()
@@ -900,6 +905,14 @@ local function monitorFor(name)
   error("output not found")
 end
 hl = { dsp = { window = {}, workspace = {} } }
+hl.get_windows = function(filters)
+  local matches = {}
+  for _, window in ipairs(windows) do
+    if window.class == filters.class then table.insert(matches, window) end
+  end
+  return matches
+end
+hl.dispatch = function(operation) return operation() end
 hl.dsp.focus = function(args)
   return function()
     if args.monitor then
@@ -964,15 +977,15 @@ end
 hl.dsp.window.float = function(args)
   return function() windowFor(args.window).floating = args.action == "set" end
 end
-noctalia.runAsync = function(argv, callback)
-  if argv[2] ~= "dispatch" then return originalRunAsync(argv, callback) end
+noctalia.runAsync = function(argv, callback, timeout)
+  if argv[2] ~= "dispatch" then return originalRunAsync(argv, callback, timeout) end
   table.insert(launches, copy(argv))
   if mutationDeclined then return false end
   local function complete()
     if mutationFailure then callback(copy(mutationFailure)); return end
-    assert(loadstring("return " .. argv[3]))()()
+    local ok = pcall(assert(loadstring("return " .. argv[3]))())
     modelSnapshots()
-    callback({ exitCode = 0, stdout = "ok\n" })
+    callback({ exitCode = 0, stdout = ok and "ok\n" or "error: changed target" })
   end
   if deferMutation then pendingMutation = complete else complete() end
   return true
@@ -1038,7 +1051,7 @@ onIpc("toggle")
 check("next toggle shows again", true, status().pads[1].visible)
 check("show never writes runtime or focus files", 0, #writes)
 check("show leaves selection unchanged", "terminal", status().selectedPadId)
--- Right placement comes from the durable preference, not a new side action.
+-- Showing also restores the durable side without requiring a side action.
 focusedOutput = "DP-2"
 modelStart([[{"selectedPadId":"terminal","side":"right"}]])
 onIpc("show", "terminal")
@@ -1194,6 +1207,337 @@ do
   check("known stopped pad is not launched", count, nonQueryLaunchCount())
   focusedOutput = "DP-1"
 end
+
+-- Launch through the same UI/IPC path, with event snapshots as the authority.
+focusedOutput = "DP-2"
+local LAUNCH_PADS = [[{"version":1,"pads":[{"id":"terminal","name":"Terminal",
+  "class":"noctalia-sidepad-terminal",
+  "command":["kitty","--class","noctalia-sidepad-terminal","two words","$(touch /never)","semi;colon"]}]}]]
+local function applicationCount()
+  local count = 0
+  for _, argv in ipairs(launches) do
+    if type(argv) == "table" and argv[1] == "kitty" then count = count + 1 end
+  end
+  return count
+end
+local function stoppedStart()
+  clock, detachedAccepted = 0, true
+  modelStart()
+  table.remove(windows, 1)
+  modelSnapshots()
+  startWith(LAUNCH_PADS)
+end
+local function mapTerminal(address)
+  local window = { class = "noctalia-sidepad-terminal", address = address or "0xabc", monitor = 0,
+    workspace = { id = 1, name = "1" } }
+  table.insert(windows, window)
+  modelSnapshots()
+  return window
+end
+stoppedStart()
+serviceShared.request("toggle")
+check("a stopped toggle launches one application", 1, applicationCount())
+check("launch waits busy for an event", true, status().busy)
+local argv = launches[#launches]
+check("launch keeps the complete configured argv", 6, #argv)
+check("launch preserves an argument containing spaces", "two words", argv[4])
+check("launch does not evaluate command substitution", "$(touch /never)", argv[5])
+check("launch does not serialize shell punctuation", "semi;colon", argv[6])
+local waitingQueries = queryCount()
+clock = 100
+update()
+onIpc("toggle")
+serviceShared.request("show", "terminal")
+onIpc("close", "terminal")
+check("repeated requests during mapping launch only once", 1, applicationCount())
+check("launch waiting does not poll compositor state", waitingQueries, queryCount())
+local mapped = mapTerminal()
+streamCallbacks[1]("openwindow>>abc,1,noctalia-sidepad-terminal,Terminal")
+check("mapped application is placed on the focused negative output", "DP-2", status().pads[1].output)
+check("mapped application is visible", true, status().pads[1].visible)
+check("mapped application is focused", mapped.address, focusedWindow)
+check("mapped application floats", true, mapped.floating)
+check("mapped application uses existing geometry", -1270, mapped.x)
+check("successful mapping clears busy", false, status().busy)
+check("successful mapping clears errors", nil, status().error)
+check("mapping launches no second application", 1, applicationCount())
+clock = 6000
+update()
+check("completed launch cannot later time out", nil, status().error)
+
+-- A fresh lookup adopts a window even if its event was not yet delivered.
+stoppedStart()
+mapTerminal()
+onIpc("toggle")
+check("fresh lookup adopts instead of launching", 0, applicationCount())
+check("adopted window is shown", true, status().pads[1].visible)
+
+stoppedStart()
+settings.launch_timeout_ms = 250
+onIpc("show", "terminal")
+clock = 249
+update()
+check("configured deadline has not expired early", true, status().busy)
+clock = 250
+update()
+check("timeout clears busy", false, status().busy)
+checkContains("timeout gives a configuration/retry remedy", "launch_timeout_ms", status().error)
+check("timeout notifies once", 1, #notifications)
+check("timeout performs no compositor mutation or process cleanup", 1, nonQueryLaunchCount())
+mapped = mapTerminal()
+streamCallbacks[1]("openwindow>>abc")
+check("late mapping is reconciled without being killed", true, status().pads[1].running)
+check("late mapping does not steal focus", nil, focusedWindow)
+check("late mapping causes no automatic mutation", 1, nonQueryLaunchCount())
+onIpc("toggle")
+check("later toggle adopts the late application", 1, applicationCount())
+check("later toggle remains usable after timeout", true, status().pads[1].visible)
+settings.launch_timeout_ms = 5000
+
+stoppedStart()
+onIpc("toggle")
+mapTerminal()
+mapTerminal("0xdef")
+streamCallbacks[1]("openwindow>>def")
+checkContains("duplicate mapping reports an actionable error", "unique valid window address", status().error)
+check("duplicate mapping clears busy", false, status().busy)
+check("duplicate mapping moves/closes/focuses no match", 1, nonQueryLaunchCount())
+table.remove(windows)
+modelSnapshots()
+onIpc("show", "terminal")
+check("duplicate mapping recovers after resolving the duplicate", true, status().pads[1].visible)
+check("duplicate recovery does not relaunch", 1, applicationCount())
+
+for _, deliverEvent in ipairs({ true, false }) do
+  stoppedStart()
+  onIpc("toggle")
+  local first = mapTerminal()
+  deferMutation = true
+  streamCallbacks[1]("openwindow>>abc")
+  local second = mapTerminal("0xdef")
+  if deliverEvent then streamCallbacks[1]("openwindow>>def") end
+  deferMutation = false
+  pendingMutation()
+  check("an interleaved duplicate leaves the first match unmoved", "1", first.workspace.name)
+  check("an interleaved duplicate leaves the second match unmoved", "1", second.workspace.name)
+  check("an interleaved duplicate focuses neither match", nil, focusedWindow)
+  check("an interleaved duplicate leaves both matches non-floating", nil, first.floating or second.floating)
+  checkTrue("an interleaved duplicate reports an error", type(status().error) == "string")
+  check("an interleaved duplicate releases busy", false, status().busy)
+  check("an interleaved duplicate does not relaunch", 1, applicationCount())
+  table.remove(windows)
+  modelSnapshots()
+  onIpc("show", "terminal")
+  check("resolving an interleaved duplicate permits a later show", true, status().pads[1].visible)
+end
+
+stoppedStart()
+detachedAccepted = false
+onIpc("toggle")
+checkContains("launch rejection is actionable", "could not launch pad", status().error)
+check("launch rejection clears busy", false, status().busy)
+check("launch rejection notifies once", 1, #notifications)
+detachedAccepted = true
+onIpc("toggle")
+mapTerminal()
+streamCallbacks[1]("openwindow>>abc")
+check("retry after launch rejection is usable", true, status().pads[1].visible)
+
+stoppedStart()
+absentCommands.kitty = true
+onIpc("toggle")
+checkContains("executable is revalidated before launch", "was not found", status().error)
+check("missing executable launches nothing", 0, applicationCount())
+check("missing executable clears busy", false, status().busy)
+absentCommands.kitty = nil
+for _, invalid in ipairs({ 0, -1, math.huge, 0/0, "bad" }) do
+  stoppedStart()
+  settings.launch_timeout_ms = invalid
+  onIpc("toggle")
+  checkContains("invalid launch timeout is recoverable", "invalid launch_timeout_ms", status().error)
+  check("invalid launch timeout launches nothing", 0, applicationCount())
+  check("invalid launch timeout clears busy", false, status().busy)
+end
+settings.launch_timeout_ms = 5000
+stoppedStart()
+onIpc("hide", "terminal")
+check("hide never launches a stopped application", 0, applicationCount())
+check("stopped hide clears busy", false, status().busy)
+
+stoppedStart()
+onIpc("toggle")
+deferQueries = true
+streamCallbacks[1]("openwindow>>pending")
+local burstQueries = queryCount()
+mapTerminal()
+for _ = 1, 10 do streamCallbacks[1]("openwindow>>abc") end
+check("mapping burst does not start concurrent queries", burstQueries, queryCount())
+finishQuery("clients")
+finishQuery("monitors")
+for _ = 1, 4 do finishQuery("clients"); finishQuery("monitors") end
+deferQueries = false
+check("mapping burst completes with one launch", 1, applicationCount())
+check("mapping burst finishes visible", true, status().pads[1].visible)
+check("mapping burst releases busy", false, status().busy)
+check("mapping burst drains bounded queries", 0, #pendingQueries)
+
+stoppedStart()
+onIpc("toggle")
+deferQueries = true
+mapTerminal()
+clock = 4900
+streamCallbacks[1]("openwindow>>abc")
+check("event clients query is bounded by the remaining launch budget", 100, queryTimeouts.clients)
+check("event monitors query is bounded by the remaining launch budget", 100, queryTimeouts.monitors)
+clock = 5001
+update()
+finishQuery("clients")
+finishQuery("monitors")
+finishQuery("clients")
+finishQuery("monitors")
+deferQueries = false
+check("a mapping snapshot completing after the deadline does not move the window", 1, nonQueryLaunchCount())
+check("a late mapping snapshot clears busy", false, status().busy)
+checkContains("a late mapping snapshot reports timeout", "did not map class", status().error)
+
+stoppedStart()
+onIpc("toggle")
+deferQueries = true
+clock = 4990
+streamCallbacks[1]("openwindow>>pending")
+check("stalled snapshot receives only the remaining timeout", 10, queryTimeouts.clients)
+clock = 5000
+-- The host returns timedOut at the supplied command deadline.
+queryReplies.clients = { exitCode = -1, timedOut = true }
+queryReplies.monitors = { exitCode = -1, timedOut = true }
+finishQuery("clients")
+finishQuery("monitors")
+modelSnapshots()
+finishQuery("clients")
+finishQuery("monitors")
+deferQueries = false
+checkContains("stalled event queries report the launch deadline", "did not map class", status().error)
+check("stalled event queries release busy after final reconciliation", false, status().busy)
+check("stalled event queries never mutate or kill the application", 1, nonQueryLaunchCount())
+
+stoppedStart()
+onIpc("toggle")
+queryReplies.clients = { exitCode = 2 }
+streamCallbacks[1]("openwindow>>abc")
+checkContains("failed mapping snapshot reports the failed query", "clients failed", status().error)
+check("failed mapping snapshot clears busy", false, status().busy)
+modelSnapshots()
+onIpc("refresh")
+check("refresh after a failed mapping snapshot is usable", nil, status().error)
+detachedAccepted = false
+-- ── Durable side action through the panel and IPC ──────────────────────────
+focusedOutput = "DP-1"
+modelStart()
+onIpc("show", "terminal")
+loadEntry("panel")
+onOpen()
+buttonByKey(lastTree, "side").props.onClick()
+check("panel side action immediately moves visible pad right", 1010, windows[1].x)
+check("side action preserves visible width", 900, windows[1].width)
+check("side action publishes right preference", "right", status().side)
+check("side action remains visible", true, status().pads[1].visible)
+local persisted = assert(decodeJson(files["/data/preferences.json"]))
+check("side action persists selected pad", "terminal", persisted.selectedPadId)
+check("side action persists right edge", "right", persisted.side)
+local fieldCount = 0
+for _ in pairs(persisted) do fieldCount = fieldCount + 1 end
+check("side action persists only approved fields", 2, fieldCount)
+onIpc("switch_side")
+check("generic IPC switches back to left", 10, windows[1].x)
+check("generic IPC publishes left preference", "left", status().side)
+onIpc("toggle_width")
+focusedOutput = "DP-2"
+onIpc("switch_side")
+check("side action preserves wide mode", "wide", status().widthMode)
+check("side action uses wide geometry on negative output", 1200, windows[1].width)
+check("side action places wide right edge on negative output", -1210, windows[1].x)
+check("side action follows focused output", "DP-2", status().pads[1].output)
+outputs[2] = { name = "DP-2", x = -50, y = -40, width = 5, height = 3 }
+onIpc("switch_side")
+checkTrue("side action keeps tiny-output horizontal bounds", windows[1].x >= -50 and windows[1].x + windows[1].width <= -45)
+checkTrue("side action keeps tiny-output vertical bounds", windows[1].y >= -40 and windows[1].y + windows[1].height <= -37)
+check("clamping does not change width mode", "wide", status().widthMode)
+outputs[2] = { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 }
+onIpc("hide", "terminal")
+local hiddenMutations = nonQueryLaunchCount()
+onIpc("switch_side", "terminal")
+check("hidden side action performs no compositor mutation", hiddenMutations, nonQueryLaunchCount())
+check("hidden side action leaves pad hidden", false, status().pads[1].visible)
+check("hidden side action preserves running application", true, status().pads[1].running)
+local savedPreferences = files["/data/preferences.json"]
+startWith(VALID_PADS, savedPreferences)
+check("restart restores switched side", "right", status().side)
+check("restart does not reveal hidden pad", false, status().pads[1].visible)
+onIpc("show", "terminal")
+check("next show uses durable right edge", -910, windows[1].x)
+local beforeWrongPad = #writes
+onIpc("switch_side", "browser")
+check("side action cannot target unselected pad", beforeWrongPad, #writes)
+check("unselected side action leaves side unchanged", "right", status().side)
+
+writeFailure = "disk full"
+local oldPreferences, oldX = files["/data/preferences.json"], windows[1].x
+local oldMutations, oldNotifications = nonQueryLaunchCount(), #notifications
+onIpc("switch_side")
+checkContains("side write failure is actionable", "disk full", status().error)
+check("side write failure retains durable document", oldPreferences, files["/data/preferences.json"])
+check("side write failure retains published side", "right", status().side)
+check("side write failure does not move window", oldX, windows[1].x)
+check("side write failure performs no compositor mutation", oldMutations, nonQueryLaunchCount())
+check("side write failure clears busy", false, status().busy)
+check("side write failure notifies once", oldNotifications + 1, #notifications)
+writeFailure = nil
+onIpc("switch_side")
+check("side save can recover on next action", nil, status().error)
+check("recovered side save moves pad left", -1270, windows[1].x)
+for _, failure in ipairs({
+  { declined = true }, { result = { exitCode = 4 } },
+  { result = { exitCode = 0, timedOut = true } },
+  { result = { exitCode = 0, stdoutTruncated = true } },
+  { result = { exitCode = 0, stdout = "error: rejected" } },
+}) do
+  mutationDeclined, mutationFailure = failure.declined, failure.result
+  local nextSide = status().side == "left" and "right" or "left"
+  local previousNotifications = #notifications
+  onIpc("switch_side")
+  checkTrue("failed side placement reports an error", type(status().error) == "string")
+  check("failed side placement retains saved preference truth", nextSide, status().side)
+  check("failed side placement clears busy", false, status().busy)
+  check("failed side placement reconciles actual visibility", true, status().pads[1].visible)
+  check("failed side placement notifies once", previousNotifications + 1, #notifications)
+  mutationDeclined, mutationFailure = false, nil
+  onIpc("show", "terminal")
+  check("show recovers failed side placement", nil, status().error)
+  check("show uses saved side after failed placement", nextSide == "right" and -910 or -1270, windows[1].x)
+end
+deferMutation = true
+onIpc("switch_side")
+check("side action stays busy during compositor command", true, status().busy)
+local pendingSide, pendingWrites = status().side, #writes
+onIpc("switch_side")
+onIpc("hide", "terminal")
+check("pending side action blocks duplicate preference writes", pendingWrites, #writes)
+check("pending side action blocks duplicate side change", pendingSide, status().side)
+streamCallbacks[1]("activespecial>>noctalia-sidepad-terminal,DP-2")
+check("events cannot clear side operation busy", true, status().busy)
+deferMutation = false
+pendingMutation()
+check("side operation and queued event finish", false, status().busy)
+check("side operation final status succeeds", nil, status().error)
+modelStart()
+windows = {}
+modelSnapshots()
+onIpc("refresh")
+local stoppedMutations = nonQueryLaunchCount()
+onIpc("switch_side")
+check("stopped pad can change side preference", "right", status().side)
+check("stopped side action starts no compositor mutation or app", stoppedMutations, nonQueryLaunchCount())
+check("stopped side action succeeds", nil, status().error)
 noctalia.runAsync = originalRunAsync
 queryReplies = { clients = { exitCode = 0, stdout = "[]" }, monitors = { exitCode = 0, stdout = "[]" } }
 

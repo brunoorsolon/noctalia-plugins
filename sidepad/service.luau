@@ -1,6 +1,5 @@
 -- The controller owns configuration, reconciliation and serialized actions.
--- Existing windows are shown, hidden, resized and closed here; launching and
--- other actions are refused until their own slices implement them.
+-- Launching and existing-window actions share one serialized action path.
 
 local shared = require("./shared.luau")
 
@@ -318,6 +317,7 @@ local streamFailureRevision = 0
 local streamRecoveryRevision = nil
 local refreshQueuedRecovery = nil
 local closeOperation = nil
+local launchWait = nil
 local refresh
 local operationActive = false
 local refreshContinuation = nil
@@ -419,7 +419,7 @@ local function completeRefresh(results, recoveryRevision)
   refreshContinuation = nil
   publish()
   if continuation then continuation(failure, clients) end
-  if refreshQueued and not operationActive and not refreshing then
+  if refreshQueued and (not operationActive or launchWait) and not refreshing then
     local recovery = refreshQueuedRecovery
     refreshQueued, refreshQueuedRecovery = false, nil
     refresh(recovery)
@@ -433,7 +433,9 @@ local function query(command, callback)
     completed = true
     callback(result)
   end
-  local accepted = noctalia.runAsync({ "hyprctl", "-j", command }, done)
+  -- A slow event snapshot must not extend the configured mapping wait.
+  local timeout = launchWait and math.max(1, launchWait.deadline - noctalia.nowMs()) or nil
+  local accepted = noctalia.runAsync({ "hyprctl", "-j", command }, done, timeout)
   if accepted == false then
     done(nil)
   end
@@ -524,6 +526,8 @@ refresh = function(explicitAction, recoveryRevision, continuation)
     return
   end
   ensureEventStream()
+  -- Mapping events may refresh during a launch wait, but not during mutations.
+  if launchWait and not continuation then continuation = launchWait.onSnapshot end
   if refreshing or (operationActive and not continuation) then
     refreshQueued = true
     if recoveryRevision then refreshQueuedRecovery = recoveryRevision end
@@ -632,6 +636,9 @@ local function closePad(pad)
 end
 
 function update()
+  if launchWait and noctalia.nowMs() >= launchWait.deadline and not refreshing then
+    launchWait.timeout()
+  end
   if closeOperation and closeOperation.stage == "waiting" and not refreshing then
     closeOperation.stage = "verify"
     refresh(false, nil, verifyClose)
@@ -674,23 +681,59 @@ end
 
 local function windowAction(action)
   operationActive = true
-  -- Reconcile before using addresses or toggling visibility, not just after:
-  -- events may still be queued when the user clicks.
-  refresh(false, nil, function(snapshotFailure)
-    local function finish(operationFailure)
-      refresh(false, nil, function(refreshFailure)
-        operationActive = false
-        status.busy = false
-        status.error = operationFailure or refreshFailure or status.error
-        status.phase = status.error and "error" or "ready"
-        publish()
-        if operationFailure or refreshFailure then noctalia.notifyError(status.error) end
-      end)
-    end
+  local function finish(operationFailure)
+    launchWait = nil
+    refresh(false, nil, function(refreshFailure)
+      operationActive = false
+      status.busy = false
+      status.error = operationFailure or refreshFailure or status.error
+      status.phase = status.error and "error" or "ready"
+      publish()
+      if operationFailure or refreshFailure then noctalia.notifyError(status.error) end
+    end)
+  end
+  local function perform(snapshotFailure)
     if snapshotFailure then finish(snapshotFailure); return end
     local pad = shared.selectedPad(status)
-    if not pad or not pad.running then
-      finish("selected pad is not running; start its application and retry")
+    if not pad then finish("no selected pad is configured"); return end
+    if action == "switch_side" then
+      local saved, problem = setPreferences(status.selectedPadId, status.side == "left" and "right" or "left")
+      if not saved then finish(problem); return end
+      -- Hidden or stopped pads only change preference; showing them is a separate action.
+      if not pad.visible then finish(); return end
+    end
+    if not pad.running then
+      if action == "hide" or action == "toggle_width" then finish("selected pad is not running"); return end
+      if not noctalia.commandExists(pad.command[1]) then
+        finish(("executable '%s' was not found; install it or edit pads.json"):format(pad.command[1]))
+        return
+      end
+      local timeout = noctalia.getConfig("launch_timeout_ms")
+      if not finite(timeout) or timeout < 1 then
+        finish("invalid launch_timeout_ms; set a positive timeout and retry")
+        return
+      end
+      if not streamStarted then finish(streamError); return end
+      local function timedOut()
+        finish(("pad '%s' did not map class '%s' within %s ms; check its command/class or increase launch_timeout_ms, then refresh or retry"):format(pad.id, pad.class, timeout))
+      end
+      launchWait = {
+        deadline = noctalia.nowMs() + timeout,
+        timeout = timedOut,
+        onSnapshot = function(failure)
+          if noctalia.nowMs() >= launchWait.deadline then timedOut()
+          elseif failure then finish(failure)
+          elseif pad.running then
+            launchWait = nil
+            perform()
+          end
+        end,
+      }
+      -- No callback: the host detaches the application instead of tracking/killing it.
+      action = "show"
+      if noctalia.runAsync(pad.command) == false then
+        finish(("could not launch pad '%s'; check its command in pads.json and retry"):format(pad.id))
+      end
       return
     end
     if not pad.address or not pad.address:match("^0x%x+$") then
@@ -748,6 +791,14 @@ local function windowAction(action)
         finish()
         return
       end
+      -- Recheck inside every queued mutation; a second window may map meanwhile.
+      expression = ([=[function()
+        local windows = hl.get_windows({ class = %q })
+        if #windows ~= 1 or windows[1].address ~= %q then
+          error("Sidepad visibility target changed; resolve duplicate windows, refresh and retry")
+        end
+        return hl.dispatch(%s)
+      end]=]):format(pad.class, pad.address, expression)
       local completed = false
       local function done(result)
         if completed then return end
@@ -761,7 +812,9 @@ local function windowAction(action)
       if noctalia.runAsync({ "hyprctl", "dispatch", expression }, done) == false then done(nil) end
     end
     run(1)
-  end)
+  end
+  -- Reconcile before using addresses or deciding to launch, not just afterward.
+  refresh(false, nil, perform)
 end
 
 -- The one action path: the request watcher below and onIpc both land here.
@@ -773,7 +826,7 @@ local function dispatch(action, padId)
     refuse("unknown action: " .. tostring(action), true)
     return
   end
-  if (action == "close" or action == "toggle_width") and padId == nil then padId = status.selectedPadId end
+  if (action == "close" or action == "toggle_width" or action == "switch_side") and padId == nil then padId = status.selectedPadId end
   if action ~= "toggle" and action ~= "refresh" then
     if type(padId) ~= "string" or padId == "" then
       refuse(action .. " requires a pad id", true)
@@ -810,13 +863,9 @@ local function dispatch(action, padId)
       if pad.id == padId then closePad(pad); return end
     end
   end
-  if action == "toggle" or action == "show" or action == "hide" or action == "toggle_width" then
+  if action == "toggle" or action == "show" or action == "hide" or action == "toggle_width" or action == "switch_side" then
     if padId ~= nil and padId ~= status.selectedPadId then
       refuse("action requires the selected pad", true)
-      return
-    end
-    if not shared.selectedPad(status) or not shared.selectedPad(status).running then
-      refuse("selected pad is not running; start its application and retry", true)
       return
     end
     windowAction(action)
