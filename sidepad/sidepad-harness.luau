@@ -207,6 +207,8 @@ local queryReplies = {
   monitors = { exitCode = 0, stdout = "[]", stderr = "" },
 }
 local declinedQueries, pendingQueries = {}, {}
+local streamCallbacks = {}
+local streamAccepted = true
 local deferQueries = false
 noctalia.runAsync = function(argv, onResult)
   table.insert(launches, copy(argv))
@@ -224,7 +226,11 @@ noctalia.runAsync = function(argv, onResult)
   end
   return true
 end
-noctalia.runStream = function(command) table.insert(launches, command); return true end
+noctalia.runStream = function(command, onLine)
+  table.insert(launches, command)
+  table.insert(streamCallbacks, onLine)
+  return streamAccepted
+end
 local function queryCount(kind)
   local count = 0
   for _, argv in ipairs(compositorQueries) do
@@ -245,7 +251,7 @@ end
 local function nonQueryLaunchCount()
   local count = 0
   for _, argv in ipairs(launches) do
-    if type(argv) ~= "table" or argv[1] ~= "hyprctl" or argv[2] ~= "-j" then count = count + 1 end
+    if type(argv) == "table" and not (argv[1] == "hyprctl" and argv[2] == "-j") then count = count + 1 end
   end
   return count
 end
@@ -823,7 +829,7 @@ local function startWith(padsJson)
   if padsJson ~= nil then files["/data/pads.json"] = padsJson end
   stateStore, watchers, held = {}, {}, nil
   launches, writes, notifications, compositorQueries = {}, {}, {}, {}
-  pendingQueries = {}
+  pendingQueries, streamCallbacks = {}, {}
   loadEntry("service")
   return status()
 end
@@ -965,11 +971,77 @@ check("panel refresh queries one pair", 2, #compositorQueries)
 onIpc("refresh")
 check("IPC refresh also queries one pair", 4, #compositorQueries)
 check("refresh and reconciliation remain observational", 0, nonQueryLaunchCount())
+check("startup starts one event stream", 1, #streamCallbacks)
+checkTrue("event stream uses Hyprland's socket and reconnects", type(launches[1]) == "string"
+  and launches[1]:find("while true", 1, true) ~= nil
+  and launches[1]:find("socat -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
+local streamCallback = streamCallbacks[1]
+local beforeStreamEvent = #compositorQueries
+streamCallback("openwindow>>0x1,terminal,1")
+check("a relevant event invalidates one snapshot pair", beforeStreamEvent + 2, #compositorQueries)
+queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":1,"name":"1"}}]]=]
+queryReplies.monitors.stdout = [=[[{"id":0,"name":"DP-1","specialWorkspace":{"id":0,"name":""}}]]=]
+streamCallback("openwindow>>0x1,terminal,1")
+check("an opened pad appears in refreshed state", true, status().pads[1].running)
+queryReplies.clients.stdout = "[]"
+streamCallback("closewindow>>0x1")
+check("application exit updates the snapshot to stopped", false, status().pads[1].running)
+queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}}]]=]
+queryReplies.monitors.stdout = [=[[{"id":1,"name":"DP-2","specialWorkspace":{"id":-99,"name":"noctalia-sidepad-terminal"}}]]=]
+streamCallback("focusedmon>>DP-2,1")
+check("output focus refreshes visible pad output", "DP-2", status().pads[1].output)
+check("output-focus events issue no move or focus command", 0, nonQueryLaunchCount())
+beforeStreamEvent = #compositorQueries
+streamCallback("windowtitle>>0x1,title")
+check("an irrelevant event does not refresh the snapshot", beforeStreamEvent, #compositorQueries)
+check("event-driven refreshes do not issue compositor mutations", 0, nonQueryLaunchCount())
+queryReplies.clients.stdout = "[]"
+queryReplies.monitors.stdout = "[]"
+
+deferQueries = true
+beforeStreamEvent = #compositorQueries
+streamCallback("closewindow>>0x1")
+streamCallback("openwindow>>0x2,terminal,1")
+streamCallback("workspacev2>>1,workspace")
+check("an event burst during refresh starts one pair", beforeStreamEvent + 2, #compositorQueries)
+check("event burst refresh is in flight", true, status().busy)
+finishQuery("clients")
+finishQuery("monitors")
+check("events during refresh collapse to one follow-up pair", beforeStreamEvent + 4, #compositorQueries)
+finishQuery("monitors")
+finishQuery("clients")
+check("coalesced refresh settles", false, status().busy)
+check("coalesced refresh returns to ready", "ready", status().phase)
+deferQueries = false
+
+streamCallback("__sidepad_stream_disconnected__")
+checkContains("stream disconnect is visible in status", "event stream disconnected", status().error)
+check("background stream failures do not notify", 0, #notifications)
+streamCallback("closewindow>>0x1")
+check("a reconnecting event clears the stream failure", nil, status().error)
+check("reconnected stream state is ready", "ready", status().phase)
 
 queryReplies = {
   clients = { exitCode = 0, stdout = "[]", stderr = "" },
   monitors = { exitCode = 0, stdout = "[]", stderr = "" },
 }
+
+absentCommands.socat = true
+local missingSocat = startWith(VALID_PADS)
+checkContains("missing socat remains visible", "socat was not found", missingSocat.error)
+check("missing socat does not suppress snapshot refresh", 2, #compositorQueries)
+absentCommands.socat = nil
+onIpc("refresh")
+check("refresh retries and starts a recovered event stream", 1, #streamCallbacks)
+check("refresh recovers from missing socat", nil, status().error)
+
+streamAccepted = false
+local declinedStream = startWith(VALID_PADS)
+checkContains("a rejected event stream is recoverable", "event stream could not be started", declinedStream.error)
+streamAccepted = true
+onIpc("refresh")
+check("a later refresh retries a rejected event stream", 2, #streamCallbacks)
+check("a later refresh clears the rejected-stream error", nil, status().error)
 
 -- No file at all: the message has to say where the file belongs and what to do.
 local missing = startWith(nil)

@@ -257,6 +257,8 @@ local hasSnapshot = false
 local refreshing = false
 local refreshQueued = false
 local configurationError = nil
+local streamStarted = false
+local streamError = nil
 local refresh
 
 local function applySnapshot(clients, monitors)
@@ -297,7 +299,7 @@ local function applySnapshot(clients, monitors)
     end
   end
   hasSnapshot = true
-  status.error = #duplicates > 0 and table.concat(duplicates, "; ") or nil
+  status.error = streamError or (#duplicates > 0 and table.concat(duplicates, "; ") or nil)
   status.phase = status.error and "error" or "ready"
   status.busy = false
 end
@@ -357,6 +359,59 @@ local function query(command, callback)
   end
 end
 
+local STREAM_DISCONNECTED = "__sidepad_stream_disconnected__"
+local EVENT_STREAM_COMMAND = [[while true; do socat -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>/dev/null; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
+
+local relevantEvents = {
+  closewindow = true,
+  focusedmon = true,
+  changefloatingmode = true,
+  monitoradded = true,
+  monitoraddedv2 = true,
+  monitorremoved = true,
+  monitorremovedv2 = true,
+  movewindow = true,
+  movewindowv2 = true,
+  openwindow = true,
+  workspace = true,
+  workspacev2 = true,
+  activespecial = true,
+}
+
+local function setStreamError(message)
+  if streamError == message then return end
+  streamError = message
+  status.error = message
+  status.phase = "error"
+  publish()
+end
+
+local function onStreamLine(line)
+  if line == STREAM_DISCONNECTED then
+    setStreamError("Hyprland event stream disconnected; reconnecting")
+    return
+  end
+  local event = type(line) == "string" and line:match("^([%w_]+)>>")
+  if event and relevantEvents[event] then
+    streamError = nil
+    refresh()
+  end
+end
+
+local function ensureEventStream()
+  if streamStarted then return end
+  if not noctalia.commandExists("socat") then
+    setStreamError("socat was not found in PATH")
+    return
+  end
+  if noctalia.runStream(EVENT_STREAM_COMMAND, onStreamLine) == false then
+    setStreamError("Hyprland event stream could not be started")
+    return
+  end
+  streamStarted = true
+  streamError = nil
+end
+
 refresh = function()
   if configurationError then
     status.error = configurationError
@@ -365,6 +420,7 @@ refresh = function()
     publish()
     return
   end
+  ensureEventStream()
   if refreshing then
     refreshQueued = true
     return
