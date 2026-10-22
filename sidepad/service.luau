@@ -27,9 +27,12 @@ local function publish()
   noctalia.state.set(shared.STATUS_KEY, status)
 end
 
-local function refuse(message)
+local function refuse(message, explicitAction)
   status.error = message
   publish()
+  if explicitAction then
+    noctalia.notifyError(message)
+  end
 end
 
 -- ── Pad configuration ───────────────────────────────────────────────────────
@@ -375,6 +378,8 @@ local function commandFailure(command, result)
   return nil
 end
 
+local refreshNotifiesOnFailure = false
+
 local function completeRefresh(results, recoveryRevision)
   local failure = commandFailure("hyprctl -j clients", results.clients)
     or commandFailure("hyprctl -j monitors", results.monitors)
@@ -386,7 +391,8 @@ local function completeRefresh(results, recoveryRevision)
     local clients, clientError = decodeArray(results.clients.stdout, "hyprctl -j clients", isClient)
     local monitors, monitorError = decodeArray(results.monitors.stdout, "hyprctl -j monitors", isMonitor)
     if not clients or not monitors then
-      status.error = clientError or monitorError
+      failure = clientError or monitorError
+      status.error = failure
       status.phase = "error"
       status.busy = false
     else
@@ -396,6 +402,10 @@ local function completeRefresh(results, recoveryRevision)
       applySnapshot(clients, monitors)
     end
   end
+  if failure and refreshNotifiesOnFailure then
+    noctalia.notifyError(failure)
+  end
+  refreshNotifiesOnFailure = false
   refreshing = false
   publish()
   if refreshQueued then
@@ -484,7 +494,10 @@ local function ensureEventStream()
   streamStarted = true
 end
 
-refresh = function(recoveryRevision)
+refresh = function(explicitAction, recoveryRevision)
+  if type(explicitAction) ~= "boolean" then
+    recoveryRevision, explicitAction = explicitAction, false
+  end
   if recoveryRevision == nil and streamConnected and streamError then
     recoveryRevision = streamRecoveryRevision
   end
@@ -493,6 +506,9 @@ refresh = function(recoveryRevision)
     status.phase = "error"
     status.busy = false
     publish()
+    if explicitAction then
+      noctalia.notifyError(configurationError)
+    end
     return
   end
   ensureEventStream()
@@ -506,8 +522,12 @@ refresh = function(recoveryRevision)
     status.phase = "error"
     status.busy = false
     publish()
+    if explicitAction then
+      noctalia.notifyError(status.error)
+    end
     return
   end
+  refreshNotifiesOnFailure = explicitAction == true
   refreshing = true
   status.phase = hasSnapshot and "refreshing" or "starting"
   status.busy = true
@@ -528,16 +548,42 @@ end
 
 -- The one action path: the request watcher below and onIpc both land here.
 local function dispatch(action, padId)
-  if not shared.isAction(action) then
-    refuse("unknown action: " .. tostring(action))
+  if status.busy then
     return
   end
+  if not shared.isAction(action) then
+    refuse("unknown action: " .. tostring(action), true)
+    return
+  end
+  if action ~= "toggle" and action ~= "refresh" then
+    if type(padId) ~= "string" or padId == "" then
+      refuse(action .. " requires a pad id", true)
+      return
+    end
+    local found = false
+    for _, pad in ipairs(status.pads) do
+      if pad.id == padId then found = true; break end
+    end
+    if not found then
+      refuse("unknown pad: " .. padId, true)
+      return
+    end
+  elseif padId ~= nil then
+    local found = false
+    for _, pad in ipairs(status.pads) do
+      if pad.id == padId then found = true; break end
+    end
+    if not found then
+      refuse("unknown pad: " .. padId, true)
+      return
+    end
+  end
   if action == "refresh" then
-    refresh()
+    refresh(true)
     return
   end
   -- Other actions belong to later slices and must not imply work they cannot do.
-  refuse(action .. " is not available yet")
+  refuse(action .. " is not available yet", true)
 end
 
 -- The accepted-request sequence. The controller is the only writer of this
@@ -570,8 +616,12 @@ noctalia.state.watch(shared.REQUEST_KEY, function(request)
 end)
 
 function onIpc(event, payload)
+  if payload ~= nil and type(payload) ~= "string" then
+    refuse("malformed IPC payload: pad id must be a string", true)
+    return
+  end
   local padId = nil
-  if type(payload) == "string" then
+  if payload ~= nil then
     local trimmed = noctalia.string.trim(payload)
     if trimmed ~= "" then
       padId = trimmed
