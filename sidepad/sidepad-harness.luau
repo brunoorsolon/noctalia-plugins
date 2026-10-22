@@ -974,6 +974,7 @@ check("refresh and reconciliation remain observational", 0, nonQueryLaunchCount(
 check("startup starts one event stream", 1, #streamCallbacks)
 checkTrue("event stream uses Hyprland's socket and reconnects", type(launches[1]) == "string"
   and launches[1]:find("while true", 1, true) ~= nil
+  and launches[1]:find("__sidepad_stream_reconnecting__", 1, true) ~= nil
   and launches[1]:find("socat -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
 local streamCallback = streamCallbacks[1]
 local beforeStreamEvent = #compositorQueries
@@ -1017,9 +1018,19 @@ deferQueries = false
 streamCallback("__sidepad_stream_disconnected__")
 checkContains("stream disconnect is visible in status", "event stream disconnected", status().error)
 check("background stream failures do not notify", 0, #notifications)
-streamCallback("closewindow>>0x1")
-check("a reconnecting event clears the stream failure", nil, status().error)
+queryReplies.clients.stdout = "[]"
+streamCallback("__sidepad_stream_reconnecting__")
+check("an idle reconnect refreshes missed application exits", false, status().pads[1].running)
+check("a successful reconnect refresh clears the stream failure", nil, status().error)
 check("reconnected stream state is ready", "ready", status().phase)
+
+queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":7,"name":"7"}}]]=]
+queryReplies.monitors.stdout = [=[[{"id":0,"name":"DP-1","specialWorkspace":{"id":0,"name":""}},{"id":1,"name":"DP-2","specialWorkspace":{"id":0,"name":""}}]]=]
+streamCallback("workspace>>7")
+check("pad output starts on its original monitor", "DP-1", status().pads[1].output)
+queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":1,"workspace":{"id":7,"name":"7"}}]]=]
+streamCallback("moveworkspacev2>>7,7,DP-2")
+check("workspace-move events refresh inactive pad output", "DP-2", status().pads[1].output)
 
 queryReplies = {
   clients = { exitCode = 0, stdout = "[]", stderr = "" },

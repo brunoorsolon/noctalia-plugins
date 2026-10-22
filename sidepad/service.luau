@@ -335,6 +335,7 @@ local function completeRefresh(results)
       status.phase = "error"
       status.busy = false
     else
+      if streamStarted then streamError = nil end
       applySnapshot(clients, monitors)
     end
   end
@@ -360,7 +361,8 @@ local function query(command, callback)
 end
 
 local STREAM_DISCONNECTED = "__sidepad_stream_disconnected__"
-local EVENT_STREAM_COMMAND = [[while true; do socat -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>/dev/null; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
+local STREAM_RECONNECTING = "__sidepad_stream_reconnecting__"
+local EVENT_STREAM_COMMAND = [[first=1; while true; do if [ "$first" -eq 0 ]; then printf '%s\n' '__sidepad_stream_reconnecting__'; fi; first=0; socat -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>/dev/null; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
 
 local relevantEvents = {
   closewindow = true,
@@ -372,6 +374,8 @@ local relevantEvents = {
   monitorremovedv2 = true,
   movewindow = true,
   movewindowv2 = true,
+  moveworkspace = true,
+  moveworkspacev2 = true,
   openwindow = true,
   workspace = true,
   workspacev2 = true,
@@ -389,6 +393,9 @@ end
 local function onStreamLine(line)
   if line == STREAM_DISCONNECTED then
     setStreamError("Hyprland event stream disconnected; reconnecting")
+    return
+  elseif line == STREAM_RECONNECTING then
+    refresh()
     return
   end
   local event = type(line) == "string" and line:match("^([%w_]+)>>")
