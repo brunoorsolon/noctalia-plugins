@@ -689,6 +689,12 @@ local function visibilityAction(action)
     end
     if snapshotFailure then finish(snapshotFailure); return end
     local pad = shared.selectedPad(status)
+    if action == "switch_side" and pad then
+      local saved, problem = setPreferences(status.selectedPadId, status.side == "left" and "right" or "left")
+      if not saved then finish(problem); return end
+      -- Hidden or stopped pads only change preference; showing them is a separate action.
+      if not pad.visible then finish(); return end
+    end
     if not pad or not pad.running then
       finish("selected pad is not running; start its application and retry")
       return
@@ -759,7 +765,7 @@ local function dispatch(action, padId)
     refuse("unknown action: " .. tostring(action), true)
     return
   end
-  if action == "close" and padId == nil then padId = status.selectedPadId end
+  if (action == "close" or action == "switch_side") and padId == nil then padId = status.selectedPadId end
   if action ~= "toggle" and action ~= "refresh" then
     if type(padId) ~= "string" or padId == "" then
       refuse(action .. " requires a pad id", true)
@@ -796,12 +802,12 @@ local function dispatch(action, padId)
       if pad.id == padId then closePad(pad); return end
     end
   end
-  if action == "toggle" or action == "show" or action == "hide" then
+  if action == "toggle" or action == "show" or action == "hide" or action == "switch_side" then
     if padId ~= nil and padId ~= status.selectedPadId then
       refuse("action requires the selected pad", true)
       return
     end
-    if not shared.selectedPad(status) or not shared.selectedPad(status).running then
+    if not shared.selectedPad(status) or (action ~= "switch_side" and not shared.selectedPad(status).running) then
       refuse("selected pad is not running; start its application and retry", true)
       return
     end

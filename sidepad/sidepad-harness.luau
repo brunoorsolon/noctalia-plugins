@@ -354,14 +354,14 @@ end
 -- Each entry is its own runtime with its own module cache, so shared.luau is
 -- loaded once per entry exactly as the host does it. The accepted nonce lives in
 -- the controller's VM, so the per-VM module instances cannot disagree about it.
-local setPreferences
+local setPreferences, controllerStatus
 local function loadEntry(entry)
   entryShared = assert(loadstring(SOURCES.shared, "shared.luau"))()
   -- Expose the controller-local seam only in the harness, without adding a
   -- public IPC action or making selection imply a partially implemented show.
-  local source = SOURCES[entry] .. (entry == "service" and "\nreturn setPreferences" or "")
-  local result = assert(loadstring(source, entry .. ".luau"))()
-  if entry == "service" then setPreferences = result end
+  local source = SOURCES[entry] .. (entry == "service" and "\nreturn setPreferences, status" or "")
+  local result, internalStatus = assert(loadstring(source, entry .. ".luau"))()
+  if entry == "service" then setPreferences, controllerStatus = result, internalStatus end
   return entryShared
 end
 
@@ -1038,7 +1038,7 @@ onIpc("toggle")
 check("next toggle shows again", true, status().pads[1].visible)
 check("show never writes runtime or focus files", 0, #writes)
 check("show leaves selection unchanged", "terminal", status().selectedPadId)
--- Right placement comes from the durable preference, not a new side action.
+-- Showing also restores the durable side without requiring a side action.
 focusedOutput = "DP-2"
 modelStart([[{"selectedPadId":"terminal","side":"right"}]])
 onIpc("show", "terminal")
@@ -1100,6 +1100,115 @@ local beforeDuplicate = nonQueryLaunchCount()
 onIpc("show", "terminal")
 checkContains("duplicate selected windows are refused", "unique valid window address", status().error)
 check("duplicates cannot cause any mutation", beforeDuplicate, nonQueryLaunchCount())
+-- ── Durable side action through the panel and IPC ──────────────────────────
+focusedOutput = "DP-1"
+modelStart()
+onIpc("show", "terminal")
+loadEntry("panel")
+onOpen()
+buttonByKey(lastTree, "side").props.onClick()
+check("panel side action immediately moves visible pad right", 1010, windows[1].x)
+check("side action preserves visible width", 900, windows[1].width)
+check("side action publishes right preference", "right", status().side)
+check("side action remains visible", true, status().pads[1].visible)
+local persisted = assert(decodeJson(files["/data/preferences.json"]))
+check("side action persists selected pad", "terminal", persisted.selectedPadId)
+check("side action persists right edge", "right", persisted.side)
+local fieldCount = 0
+for _ in pairs(persisted) do fieldCount = fieldCount + 1 end
+check("side action persists only approved fields", 2, fieldCount)
+onIpc("switch_side")
+check("generic IPC switches back to left", 10, windows[1].x)
+check("generic IPC publishes left preference", "left", status().side)
+-- Width toggling belongs to another slice; arrange its runtime state locally.
+controllerStatus.widthMode = "wide"
+focusedOutput = "DP-2"
+onIpc("switch_side")
+check("side action preserves wide mode", "wide", status().widthMode)
+check("side action uses wide geometry on negative output", 1200, windows[1].width)
+check("side action places wide right edge on negative output", -1210, windows[1].x)
+check("side action follows focused output", "DP-2", status().pads[1].output)
+outputs[2] = { name = "DP-2", x = -50, y = -40, width = 5, height = 3 }
+onIpc("switch_side")
+checkTrue("side action keeps tiny-output horizontal bounds", windows[1].x >= -50 and windows[1].x + windows[1].width <= -45)
+checkTrue("side action keeps tiny-output vertical bounds", windows[1].y >= -40 and windows[1].y + windows[1].height <= -37)
+check("clamping does not change width mode", "wide", status().widthMode)
+outputs[2] = { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 }
+onIpc("hide", "terminal")
+local hiddenMutations = nonQueryLaunchCount()
+onIpc("switch_side", "terminal")
+check("hidden side action performs no compositor mutation", hiddenMutations, nonQueryLaunchCount())
+check("hidden side action leaves pad hidden", false, status().pads[1].visible)
+check("hidden side action preserves running application", true, status().pads[1].running)
+local savedPreferences = files["/data/preferences.json"]
+startWith(VALID_PADS, savedPreferences)
+check("restart restores switched side", "right", status().side)
+check("restart does not reveal hidden pad", false, status().pads[1].visible)
+onIpc("show", "terminal")
+check("next show uses durable right edge", -910, windows[1].x)
+local beforeWrongPad = #writes
+onIpc("switch_side", "browser")
+check("side action cannot target unselected pad", beforeWrongPad, #writes)
+check("unselected side action leaves side unchanged", "right", status().side)
+
+writeFailure = "disk full"
+local oldPreferences, oldX = files["/data/preferences.json"], windows[1].x
+local oldMutations, oldNotifications = nonQueryLaunchCount(), #notifications
+onIpc("switch_side")
+checkContains("side write failure is actionable", "disk full", status().error)
+check("side write failure retains durable document", oldPreferences, files["/data/preferences.json"])
+check("side write failure retains published side", "right", status().side)
+check("side write failure does not move window", oldX, windows[1].x)
+check("side write failure performs no compositor mutation", oldMutations, nonQueryLaunchCount())
+check("side write failure clears busy", false, status().busy)
+check("side write failure notifies once", oldNotifications + 1, #notifications)
+writeFailure = nil
+onIpc("switch_side")
+check("side save can recover on next action", nil, status().error)
+check("recovered side save moves pad left", -1270, windows[1].x)
+for _, failure in ipairs({
+  { declined = true }, { result = { exitCode = 4 } },
+  { result = { exitCode = 0, timedOut = true } },
+  { result = { exitCode = 0, stdoutTruncated = true } },
+  { result = { exitCode = 0, stdout = "error: rejected" } },
+}) do
+  mutationDeclined, mutationFailure = failure.declined, failure.result
+  local nextSide = status().side == "left" and "right" or "left"
+  local previousNotifications = #notifications
+  onIpc("switch_side")
+  checkTrue("failed side placement reports an error", type(status().error) == "string")
+  check("failed side placement retains saved preference truth", nextSide, status().side)
+  check("failed side placement clears busy", false, status().busy)
+  check("failed side placement reconciles actual visibility", true, status().pads[1].visible)
+  check("failed side placement notifies once", previousNotifications + 1, #notifications)
+  mutationDeclined, mutationFailure = false, nil
+  onIpc("show", "terminal")
+  check("show recovers failed side placement", nil, status().error)
+  check("show uses saved side after failed placement", nextSide == "right" and -910 or -1270, windows[1].x)
+end
+deferMutation = true
+onIpc("switch_side")
+check("side action stays busy during compositor command", true, status().busy)
+local pendingSide, pendingWrites = status().side, #writes
+onIpc("switch_side")
+onIpc("hide", "terminal")
+check("pending side action blocks duplicate preference writes", pendingWrites, #writes)
+check("pending side action blocks duplicate side change", pendingSide, status().side)
+streamCallbacks[1]("activespecial>>noctalia-sidepad-terminal,DP-2")
+check("events cannot clear side operation busy", true, status().busy)
+deferMutation = false
+pendingMutation()
+check("side operation and queued event finish", false, status().busy)
+check("side operation final status succeeds", nil, status().error)
+modelStart()
+windows = {}
+modelSnapshots()
+onIpc("refresh")
+local stoppedMutations = nonQueryLaunchCount()
+onIpc("switch_side")
+check("stopped pad can change side preference", "right", status().side)
+check("stopped side action starts no compositor mutation or app", stoppedMutations, nonQueryLaunchCount())
+check("stopped side action succeeds", nil, status().error)
 noctalia.runAsync = originalRunAsync
 queryReplies = { clients = { exitCode = 0, stdout = "[]" }, monitors = { exitCode = 0, stdout = "[]" } }
 
