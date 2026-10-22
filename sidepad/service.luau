@@ -260,6 +260,12 @@ local hasSnapshot = false
 local refreshing = false
 local refreshQueued = false
 local configurationError = nil
+local streamStarted = false
+local streamConnected = false
+local streamError = nil
+local streamFailureRevision = 0
+local streamRecoveryRevision = nil
+local refreshQueuedRecovery = nil
 local refresh
 
 local function applySnapshot(clients, monitors)
@@ -300,7 +306,7 @@ local function applySnapshot(clients, monitors)
     end
   end
   hasSnapshot = true
-  status.error = #duplicates > 0 and table.concat(duplicates, "; ") or nil
+  status.error = streamError or (#duplicates > 0 and table.concat(duplicates, "; ") or nil)
   status.phase = status.error and "error" or "ready"
   status.busy = false
 end
@@ -323,7 +329,7 @@ end
 
 local refreshNotifiesOnFailure = false
 
-local function completeRefresh(results)
+local function completeRefresh(results, recoveryRevision)
   local failure = commandFailure("hyprctl -j clients", results.clients)
     or commandFailure("hyprctl -j monitors", results.monitors)
   if failure then
@@ -339,6 +345,9 @@ local function completeRefresh(results)
       status.phase = "error"
       status.busy = false
     else
+      if recoveryRevision ~= nil and recoveryRevision == streamFailureRevision then
+        streamError, streamRecoveryRevision = nil, nil
+      end
       applySnapshot(clients, monitors)
     end
   end
@@ -349,8 +358,9 @@ local function completeRefresh(results)
   refreshing = false
   publish()
   if refreshQueued then
-    refreshQueued = false
-    refresh()
+    local recovery = refreshQueuedRecovery
+    refreshQueued, refreshQueuedRecovery = false, nil
+    refresh(recovery)
   end
 end
 
@@ -367,7 +377,79 @@ local function query(command, callback)
   end
 end
 
-refresh = function(explicitAction)
+local STREAM_DISCONNECTED = "__sidepad_stream_disconnected__"
+local STREAM_CONNECTED = "__sidepad_stream_connected__"
+local EVENT_STREAM_COMMAND = [[while true; do socat -d -d -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>&1 | while IFS= read -r line; do case "$line" in *" N successfully connected "*) printf '%s\n' '__sidepad_stream_connected__' ;; *) printf '%s\n' "$line" ;; esac; done; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
+
+local relevantEvents = {
+  closewindow = true,
+  focusedmon = true,
+  changefloatingmode = true,
+  monitoradded = true,
+  monitoraddedv2 = true,
+  monitorremoved = true,
+  monitorremovedv2 = true,
+  movewindow = true,
+  movewindowv2 = true,
+  moveworkspace = true,
+  moveworkspacev2 = true,
+  openwindow = true,
+  workspace = true,
+  workspacev2 = true,
+  activespecial = true,
+}
+
+local function setStreamError(message)
+  streamFailureRevision = streamFailureRevision + 1
+  if streamError == message then return end
+  streamError = message
+  status.error = message
+  status.phase = "error"
+  publish()
+end
+
+local function onStreamLine(line)
+  if line == STREAM_DISCONNECTED then
+    streamConnected = false
+    streamRecoveryRevision = nil
+    setStreamError("Hyprland event stream disconnected; reconnecting")
+    return
+  elseif line == STREAM_CONNECTED then
+    if not streamConnected then
+      streamConnected = true
+      streamRecoveryRevision = streamError and streamFailureRevision or nil
+      refresh(streamRecoveryRevision)
+    end
+    return
+  end
+  local event = type(line) == "string" and line:match("^([%w_]+)>>")
+  if event and relevantEvents[event] then
+    streamConnected = true
+    streamRecoveryRevision = streamError and streamFailureRevision or nil
+    refresh(streamRecoveryRevision)
+  end
+end
+
+local function ensureEventStream()
+  if streamStarted then return end
+  if not noctalia.commandExists("socat") then
+    setStreamError("socat was not found in PATH")
+    return
+  end
+  if noctalia.runStream(EVENT_STREAM_COMMAND, onStreamLine) == false then
+    setStreamError("Hyprland event stream could not be started")
+    return
+  end
+  streamStarted = true
+end
+
+refresh = function(explicitAction, recoveryRevision)
+  if type(explicitAction) ~= "boolean" then
+    recoveryRevision, explicitAction = explicitAction, false
+  end
+  if recoveryRevision == nil and streamConnected and streamError then
+    recoveryRevision = streamRecoveryRevision
+  end
   if configurationError then
     status.error = configurationError
     status.phase = "error"
@@ -378,8 +460,10 @@ refresh = function(explicitAction)
     end
     return
   end
+  ensureEventStream()
   if refreshing then
     refreshQueued = true
+    if recoveryRevision then refreshQueuedRecovery = recoveryRevision end
     return
   end
   if not noctalia.commandExists("hyprctl") then
@@ -402,7 +486,7 @@ refresh = function(explicitAction)
     results[key] = result
     remaining = remaining - 1
     if remaining == 0 then
-      completeRefresh(results)
+      completeRefresh(results, recoveryRevision)
     end
   end
   -- Both queries belong to this refresh cycle; neither is inferred from the
