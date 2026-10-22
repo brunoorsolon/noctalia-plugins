@@ -829,15 +829,20 @@ local function startWith(padsJson)
 end
 
 -- An active asynchronous operation owns busy state. A second IPC action is
--- rejected before it can start another command, and an explicit command failure
--- notifies only after its result has been reconciled.
+-- rejected before it starts another command; failed refreshes retain the last
+-- reconciled pad state until a later refresh succeeds.
+queryReplies = {
+  clients = { exitCode = 0, stdout = [[
+    [{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":-99,"name":"special:noctalia-sidepad-terminal"}}]
+  ]], stderr = "" },
+  monitors = { exitCode = 0, stdout = [[
+    [{"id":0,"name":"DP-1","specialWorkspace":{"id":-99,"name":"noctalia-sidepad-terminal"}}]
+  ]], stderr = "" },
+}
 local operationStart = startWith(VALID_PADS)
 check("operation fixture starts ready", "ready", operationStart.phase)
+check("operation fixture has a reconciled running pad", true, operationStart.pads[1].running)
 deferQueries = true
-queryReplies = {
-  clients = { exitCode = 0, stdout = "[]", stderr = "" },
-  monitors = { exitCode = 0, stdout = "[]", stderr = "" },
-}
 local queriesBeforeOperation = queryCount()
 onIpc("refresh")
 check("an IPC operation publishes busy while pending", true, status().busy)
@@ -865,6 +870,7 @@ onIpc("refresh")
 checkContains("explicit failure remains actionable in status", "hyprctl -j clients failed (exit 4)", status().error)
 check("explicit failure notifies once", 1, #notifications)
 check("notification omits command stderr", false, notifications[1]:find("private details", 1, true) ~= nil)
+check("failed refresh retains the last reconciled pad state", true, status().pads[1].running)
 check("a failed operation clears busy for recovery", false, status().busy)
 for _, failure in ipairs({
   { name = "failed start", decline = true },
