@@ -1113,8 +1113,103 @@ local beforeDuplicate = nonQueryLaunchCount()
 onIpc("show", "terminal")
 checkContains("duplicate selected windows are refused", "unique valid window address", status().error)
 check("duplicates cannot cause any mutation", beforeDuplicate, nonQueryLaunchCount())
+-- Width uses the same request/IPC and serialized window path, but must never
+-- change visibility or durable preferences, even on a different focused output.
+do
+  local savedOutputs = copy(outputs)
+  for _, output in ipairs({
+    { name = "DP-1", x = 200, y = 120, width = 1920, height = 1080 },
+    { name = "DP-1", x = -1920, y = -1080, width = 1920, height = 1080 },
+    { name = "DP-1", x = -50, y = -40, width = 500, height = 150 },
+  }) do
+    outputs[1], focusedOutput = output, "DP-1"
+    for _, side in ipairs({ "left", "right" }) do
+      modelStart('{"selectedPadId":"terminal","side":"' .. side .. '"}')
+      onIpc("show", "terminal")
+      for _, mode in ipairs({ "wide", "narrow" }) do
+        serviceShared.request("toggle_width", "terminal")
+        local window = windows[1]
+        check("width toggles through the UI request", mode, status().widthMode)
+        check("toggle preserves chosen edge", side, status().side)
+        check("toggle preserves visibility", true, status().pads[1].visible)
+        check("toggle applies configured or clamped width", math.min(settings[mode .. "_width"], output.width - 10), window.width)
+        check("toggle keeps selected edge aligned", side == "left" and output.x + 10 or output.x + output.width - 10, side == "left" and window.x or window.x + window.width)
+        checkTrue("toggle stays within output bounds", window.x >= output.x and window.x + window.width <= output.x + output.width
+          and window.y >= output.y and window.y + window.height <= output.y + output.height)
+        check("width is not persisted", 0, #writes)
+      end
+    end
+  end
+  outputs = savedOutputs
+  focusedOutput = "DP-1"
+  modelStart()
+  onIpc("toggle_width")
+  check("width adopts an already-running tiled window as floating", true, windows[1].floating)
+  check("width applies geometry without a prior show", 1200, windows[1].width)
+  check("width does not move the adopted window into another workspace", "1", windows[1].workspace.name)
+  check("width leaves another managed workspace visible", "special:noctalia-sidepad-orphan", monitors[2].specialWorkspace.name)
+  modelStart()
+  onIpc("show", "terminal")
+  onIpc("hide", "terminal")
+  focusedOutput, compositorFocus, focusedWindow = "DP-2", "DP-2", "0x2"
+  onIpc("toggle_width")
+  check("IPC without a pad ID toggles selected width", "wide", status().widthMode)
+  check("hidden width remains on its owning output", 10, windows[1].x)
+  check("hidden pad stays hidden", false, status().pads[1].visible)
+  check("hidden workspace is not revealed on its owner", 0, monitors[1].specialWorkspace.id)
+  check("hidden workspace is not revealed on the focused output", 0, monitors[2].specialWorkspace.id)
+  check("hidden toggle does not change focus", "DP-2", compositorFocus)
+  check("hidden toggle does not focus its client", "0x2", focusedWindow)
+  check("hidden toggle preserves application", 2, #windows)
+  local count = nonQueryLaunchCount()
+  onIpc("toggle_width", "browser")
+  check("unselected pad cannot be resized", count, nonQueryLaunchCount())
+  outputs[1].width = 0
+  onIpc("toggle_width")
+  checkContains("invalid width geometry is actionable", "invalid focused-output geometry", status().error)
+  check("invalid geometry retains mode", "wide", status().widthMode)
+  check("invalid geometry clears busy", false, status().busy)
+  outputs[1].width = 1920
+  for _, failure in ipairs({
+    { declined = true }, { result = { exitCode = 4 } },
+    { result = { exitCode = 0, timedOut = true } },
+    { result = { exitCode = 0, stdoutTruncated = true } },
+    { result = { exitCode = 0, stdout = "error: dispatcher rejected" } },
+  }) do
+    mutationDeclined, mutationFailure = failure.declined, failure.result
+    local previous = #notifications
+    onIpc("toggle_width")
+    checkTrue("width failure remains actionable", type(status().error) == "string")
+    check("width failure notifies once", previous + 1, #notifications)
+    check("width failure clears busy", false, status().busy)
+    check("width failure retains last completed mode", "wide", status().widthMode)
+  end
+  mutationDeclined, mutationFailure, deferMutation = false, nil, true
+  onIpc("toggle_width")
+  check("width mutation holds busy", true, status().busy)
+  count = nonQueryLaunchCount()
+  onIpc("toggle_width")
+  onIpc("show", "terminal")
+  check("width blocks competing mutations", count, nonQueryLaunchCount())
+  deferMutation = false
+  pendingMutation()
+  check("width retry recovers", nil, status().error)
+  check("width retry completes narrow mode", "narrow", status().widthMode)
+  check("width retry clears busy", false, status().busy)
+  windows = {}
+  modelSnapshots()
+  count = nonQueryLaunchCount()
+  onIpc("toggle_width")
+  checkContains("newly stopped pad is refused after fresh lookup", "not running", status().error)
+  check("stopped pad is not launched or mutated", count, nonQueryLaunchCount())
+  check("stopped pad retains mode", "narrow", status().widthMode)
+  onIpc("toggle_width")
+  check("known stopped pad is not launched", count, nonQueryLaunchCount())
+  focusedOutput = "DP-1"
+end
 
 -- Launch through the same UI/IPC path, with event snapshots as the authority.
+focusedOutput = "DP-2"
 local LAUNCH_PADS = [[{"version":1,"pads":[{"id":"terminal","name":"Terminal",
   "class":"noctalia-sidepad-terminal",
   "command":["kitty","--class","noctalia-sidepad-terminal","two words","$(touch /never)","semi;colon"]}]}]]
@@ -1355,8 +1450,7 @@ check("side action persists only approved fields", 2, fieldCount)
 onIpc("switch_side")
 check("generic IPC switches back to left", 10, windows[1].x)
 check("generic IPC publishes left preference", "left", status().side)
--- Width toggling belongs to another slice; arrange its runtime state locally.
-controllerStatus.widthMode = "wide"
+onIpc("toggle_width")
 focusedOutput = "DP-2"
 onIpc("switch_side")
 check("side action preserves wide mode", "wide", status().widthMode)
