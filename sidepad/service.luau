@@ -433,7 +433,9 @@ local function query(command, callback)
     completed = true
     callback(result)
   end
-  local accepted = noctalia.runAsync({ "hyprctl", "-j", command }, done)
+  -- A slow event snapshot must not extend the configured mapping wait.
+  local timeout = launchWait and math.max(1, launchWait.deadline - noctalia.nowMs()) or nil
+  local accepted = noctalia.runAsync({ "hyprctl", "-j", command }, done, timeout)
   if accepted == false then
     done(nil)
   end
@@ -713,8 +715,8 @@ local function visibilityAction(action)
         deadline = noctalia.nowMs() + timeout,
         timeout = timedOut,
         onSnapshot = function(failure)
-          if failure then finish(failure)
-          elseif noctalia.nowMs() >= launchWait.deadline then timedOut()
+          if noctalia.nowMs() >= launchWait.deadline then timedOut()
+          elseif failure then finish(failure)
           elseif pad.running then
             launchWait = nil
             perform()

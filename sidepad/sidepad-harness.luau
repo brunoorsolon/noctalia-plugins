@@ -220,7 +220,7 @@ local queryReplies = {
   clients = { exitCode = 0, stdout = "[]", stderr = "" },
   monitors = { exitCode = 0, stdout = "[]", stderr = "" },
 }
-local declinedQueries, pendingQueries = {}, {}
+local declinedQueries, pendingQueries, queryTimeouts = {}, {}, {}
 local streamCallbacks = {}
 local streamAccepted = true
 local deferQueries = false
@@ -230,10 +230,11 @@ local settings = { narrow_width = 900, wide_width = 1200, edge_gap = 10, top_gap
 noctalia.getConfig = function(key) return settings[key] end
 local clock = 0
 noctalia.nowMs = function() return clock end
-noctalia.runAsync = function(argv, onResult)
+noctalia.runAsync = function(argv, onResult, timeout)
   table.insert(launches, copy(argv))
   if type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "-j" then
     local kind = argv[3]
+    queryTimeouts[kind] = timeout
     table.insert(compositorQueries, copy(argv))
     if declinedQueries[kind] then return false end
     if onResult then
@@ -866,7 +867,7 @@ local function startWith(padsJson, preferencesJson)
   files["/data/preferences.json"] = preferencesJson
   stateStore, watchers, held = {}, {}, nil
   launches, writes, notifications, compositorQueries = {}, {}, {}, {}
-  pendingQueries, streamCallbacks = {}, {}
+  pendingQueries, streamCallbacks, queryTimeouts = {}, {}, {}
   loadEntry("service")
   return status()
 end
@@ -968,8 +969,8 @@ end
 hl.dsp.window.float = function(args)
   return function() windowFor(args.window).floating = args.action == "set" end
 end
-noctalia.runAsync = function(argv, callback)
-  if argv[2] ~= "dispatch" then return originalRunAsync(argv, callback) end
+noctalia.runAsync = function(argv, callback, timeout)
+  if argv[2] ~= "dispatch" then return originalRunAsync(argv, callback, timeout) end
   table.insert(launches, copy(argv))
   if mutationDeclined then return false end
   local function complete()
@@ -1258,7 +1259,10 @@ stoppedStart()
 onIpc("toggle")
 deferQueries = true
 mapTerminal()
+clock = 4900
 streamCallbacks[1]("openwindow>>abc")
+check("event clients query is bounded by the remaining launch budget", 100, queryTimeouts.clients)
+check("event monitors query is bounded by the remaining launch budget", 100, queryTimeouts.monitors)
 clock = 5001
 update()
 finishQuery("clients")
@@ -1269,6 +1273,26 @@ deferQueries = false
 check("a mapping snapshot completing after the deadline does not move the window", 1, nonQueryLaunchCount())
 check("a late mapping snapshot clears busy", false, status().busy)
 checkContains("a late mapping snapshot reports timeout", "did not map class", status().error)
+
+stoppedStart()
+onIpc("toggle")
+deferQueries = true
+clock = 4990
+streamCallbacks[1]("openwindow>>pending")
+check("stalled snapshot receives only the remaining timeout", 10, queryTimeouts.clients)
+clock = 5000
+-- The host returns timedOut at the supplied command deadline.
+queryReplies.clients = { exitCode = -1, timedOut = true }
+queryReplies.monitors = { exitCode = -1, timedOut = true }
+finishQuery("clients")
+finishQuery("monitors")
+modelSnapshots()
+finishQuery("clients")
+finishQuery("monitors")
+deferQueries = false
+checkContains("stalled event queries report the launch deadline", "did not map class", status().error)
+check("stalled event queries release busy after final reconciliation", false, status().busy)
+check("stalled event queries never mutate or kill the application", 1, nonQueryLaunchCount())
 
 stoppedStart()
 onIpc("toggle")
