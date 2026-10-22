@@ -570,7 +570,7 @@ checkContains("IPC's answer matches the UI's answer", "could not launch pad", st
 onIpc("explode")
 check("IPC refuses a command outside the contract", "unknown action: explode", status().error)
 onIpc("select", "terminal")
-check("IPC routes a declared action with its payload", "select is not available yet", status().error)
+checkContains("IPC select reaches the launch/show lifecycle", "could not launch pad", status().error)
 
 -- ── The request boundary ────────────────────────────────────────────────────
 
@@ -953,12 +953,13 @@ hl.dsp.window.move = function(args)
       for _, monitor in ipairs(monitors) do
         if monitor.specialWorkspace.name == args.workspace then owner = monitor; break end
       end
-      window.workspace = { id = -99, name = args.workspace }
+      local workspaceId = args.workspace == "special:noctalia-sidepad-terminal" and -99 or -98
+      window.workspace = { id = workspaceId, name = args.workspace }
       window.monitor = owner.id
       -- Hyprland follows workspace moves unless follow=false is supplied.
       if args.follow ~= false then
         compositorFocus = owner.name
-        owner.specialWorkspace = { id = -99, name = args.workspace }
+        owner.specialWorkspace = { id = workspaceId, name = args.workspace }
         focusedWindow = window.address
       end
     else
@@ -1429,6 +1430,103 @@ check("failed mapping snapshot clears busy", false, status().busy)
 modelSnapshots()
 onIpc("refresh")
 check("refresh after a failed mapping snapshot is usable", nil, status().error)
+-- Select-and-show reuses launch/show without replacing or closing either client.
+do
+  focusedOutput = "DP-1"
+  modelStart()
+  onIpc("show", "terminal")
+  loadEntry("widget")
+  loadEntry("panel")
+  onOpen()
+  local closedBefore = closedPanels
+  buttonByKey(lastTree, "browser").props.onClick()
+  check("select persists the new target before waiting for its window", "browser", assert(decodeJson(files["/data/preferences.json"])).selectedPadId)
+  check("select publishes its durable target", "browser", status().selectedPadId)
+  check("select stays busy while the new pad maps", true, status().busy)
+  check("panel stays open during selection", closedBefore, closedPanels)
+  local waitingCount = nonQueryLaunchCount()
+  onIpc("select", "terminal")
+  onClick()
+  check("competing requests cannot interrupt select", waitingCount, nonQueryLaunchCount())
+  check("competing requests cannot replace selection", "browser", status().selectedPadId)
+  local browser = { class = "noctalia-sidepad-browser", address = "0xb", monitor = 0, workspace = { id = 1, name = "1" } }
+  table.insert(windows, browser)
+  modelSnapshots()
+  streamCallbacks[1]("openwindow>>b")
+  check("successful selection clears busy", false, status().busy)
+  check("successful selection clears errors", nil, status().error)
+  check("selection hides the old pad", false, status().pads[1].visible)
+  check("selection shows the new pad", true, status().pads[2].visible)
+  check("selection preserves the old running pad", true, status().pads[1].running)
+  check("selection preserves the new running pad", true, status().pads[2].running)
+  check("selection focuses the new window", "0xb", focusedWindow)
+  check("widget renders selected pad from controller", "Browser", tooltipValue("Pad"))
+  check("widget renders selected runtime state", "visible", tooltipValue("State"))
+  check("panel dismisses only after actual select success", closedBefore + 1, closedPanels)
+  onOpen()
+  check("panel renders the same selected ID", true, buttonByKey(lastTree, "browser").props.selected)
+  checkTrue("panel renders the same visible runtime state", hasText(lastTree, "Browser · running · visible on DP-1"))
+  local appCount = 0
+  for _, argv in ipairs(launches) do
+    if type(argv) == "table" and argv[1] == "firefox" then appCount = appCount + 1 end
+  end
+  check("stopped selection launches only once", 1, appCount)
+  onClick()
+  check("generic widget action hides the newly selected pad", false, status().pads[2].visible)
+  onIpc("toggle")
+  check("generic IPC shows the newly selected pad", true, status().pads[2].visible)
+  focusedOutput = "DP-2"
+  onIpc("select", "terminal")
+  check("running selection hides browser", false, status().pads[2].visible)
+  check("running selection follows the focused output", "DP-2", status().pads[1].output)
+  onIpc("select", "browser")
+  onIpc("select", "browser")
+  check("reselecting the visible pad keeps it visible", true, status().pads[2].visible)
+  check("running selection hides terminal on another output", 0, monitors[1].specialWorkspace.id)
+  check("running selection shows only browser on focused output", "special:noctalia-sidepad-browser", monitors[2].specialWorkspace.name)
+  check("running selection preserves both clients and the orphan", 3, #windows)
+  check("running selection keeps the same client address", "0xb", browser.address)
+  local savedPreferences = files["/data/preferences.json"]
+  startWith(VALID_PADS, savedPreferences)
+  check("selected ID survives controller reload", "browser", status().selectedPadId)
+  check("reload reconstructs selected visibility", true, status().pads[2].visible)
+  local count, savedWrites = nonQueryLaunchCount(), #writes
+  for _, id in ipairs({ "missing", "browser;close", "" }) do
+    onIpc("select", id)
+    check("invalid selection cannot launch or mutate", count, nonQueryLaunchCount())
+    check("invalid selection cannot persist", savedWrites, #writes)
+    check("invalid selection keeps the last target", "browser", status().selectedPadId)
+    checkTrue("invalid selection explains the failure", type(status().error) == "string")
+  end
+  writeFailure = "disk full"
+  onIpc("select", "terminal")
+  checkContains("selection write failure is actionable", "disk full", status().error)
+  check("failed save retains old selection", "browser", status().selectedPadId)
+  check("failed save retains old durable selection", savedPreferences, files["/data/preferences.json"])
+  check("failed save performs no compositor mutation", count, nonQueryLaunchCount())
+  check("failed save clears busy", false, status().busy)
+  writeFailure = nil
+  mutationFailure = { exitCode = 4 }
+  onIpc("select", "terminal")
+  checkTrue("failed show reports an actionable error", type(status().error) == "string")
+  check("failed show retains saved selection truth", "terminal", status().selectedPadId)
+  check("failed show reconciles old pad visibility", true, status().pads[2].visible)
+  check("failed show clears busy", false, status().busy)
+  mutationFailure = nil
+  onIpc("toggle")
+  check("generic retry recovers failed selection show", true, status().pads[1].visible)
+  check("generic retry hides the previous visible pad", false, status().pads[2].visible)
+  onIpc("select", "notes")
+  clock = clock + settings.launch_timeout_ms
+  update()
+  checkContains("selection timeout remains actionable", "did not map class", status().error)
+  check("selection timeout clears busy", false, status().busy)
+  check("selection timeout preserves previous process", true, status().pads[1].running)
+  onIpc("select", "browser")
+  check("later selection recovers after timeout", nil, status().error)
+  check("later selection shows the requested pad", true, status().pads[2].visible)
+end
+
 detachedAccepted = false
 -- ── Durable side action through the panel and IPC ──────────────────────────
 focusedOutput = "DP-1"

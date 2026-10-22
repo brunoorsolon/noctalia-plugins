@@ -679,7 +679,7 @@ local function specialName(monitor)
   return monitor.specialWorkspace.name:gsub("^special:", "")
 end
 
-local function windowAction(action)
+local function windowAction(action, padId)
   operationActive = true
   local function finish(operationFailure)
     launchWait = nil
@@ -694,6 +694,11 @@ local function windowAction(action)
   end
   local function perform(snapshotFailure)
     if snapshotFailure then finish(snapshotFailure); return end
+    if action == "select" then
+      local saved, problem = setPreferences(padId, status.side)
+      if not saved then finish(problem); return end
+      action = "show"
+    end
     local pad = shared.selectedPad(status)
     if not pad then finish("no selected pad is configured"); return end
     if action == "switch_side" then
@@ -863,12 +868,12 @@ local function dispatch(action, padId)
       if pad.id == padId then closePad(pad); return end
     end
   end
-  if action == "toggle" or action == "show" or action == "hide" or action == "toggle_width" or action == "switch_side" then
-    if padId ~= nil and padId ~= status.selectedPadId then
+  if action == "select" or action == "toggle" or action == "show" or action == "hide" or action == "toggle_width" or action == "switch_side" then
+    if action ~= "select" and padId ~= nil and padId ~= status.selectedPadId then
       refuse("action requires the selected pad", true)
       return
     end
-    windowAction(action)
+    windowAction(action, padId)
     return
   end
   -- Other actions belong to later slices and must not imply work they cannot do.
