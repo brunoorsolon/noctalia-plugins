@@ -16,7 +16,7 @@ local STATUS_FILE = "status.json"
 
 local DEFAULT_WORKSPACE = "pi"
 local DEFAULT_TERMINAL = "foot"
-local DEFAULT_SPAWN = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
+local DEFAULT_SPAWN = "pi -c --session-dir ~/.local/state/pi-companion/sessions"
 local DEFAULT_WORKING_DIR = "~"
 local DEFAULT_GEOMETRY = "900x600"
 
@@ -159,7 +159,7 @@ end
 -- and rejects it; that rejection is reported, not swallowed.
 --
 --   "visible" -> onDone(boolean): is the special workspace showing right now?
---   "mapped"  -> onDone(boolean): has a scratchpad window mapped?
+--   "mapped"  -> onDone(boolean): has a companion window mapped?
 --   "toggle"  -> show the special workspace if hidden, hide it if shown
 --   "show"    -> reveal the workspace without ever hiding it
 --   "spawn"   -> launch Pi; reveal it once its window maps
@@ -188,14 +188,14 @@ local function dispatch(expression, onDone)
     if dispatchSucceeded(result) then return done(true) end
     -- The click has to say what Hyprland said, or a misconfigured compositor
     -- looks exactly like a widget that does nothing.
-    noctalia.notify("Pi scratchpad dispatch failed", dispatchError(result))
+    noctalia.notify("Pi Companion dispatch failed", dispatchError(result))
     done(false)
   end)
   -- The runtime can decline to start the process at all, and then no result ever
   -- arrives. A click reported as obeyed would hold the spawn latch down with
   -- nothing running, so the local refusal is reported and cleared here.
   if accepted == false then
-    noctalia.notify("Pi scratchpad dispatch failed", "hyprctl could not be started, so nothing was sent to Hyprland.")
+    noctalia.notify("Pi Companion dispatch failed", "hyprctl could not be started, so nothing was sent to Hyprland.")
     done(false)
   end
   return accepted
@@ -214,7 +214,7 @@ local function revealExpression(action)
     local special = monitor and monitor.active_special_workspace
     if not special or special.name ~= %s then return result end
     local windows = hl.get_windows({ workspace = special, floating = true })
-    if #windows ~= 1 then error("Expected one floating scratchpad window for placement") end
+    if #windows ~= 1 then error("Expected one floating companion window for placement") end
     local window = windows[1]
     local mw, mh = monitor.width, monitor.height
     if monitor.transform %% 2 == 1 then mw, mh = mh, mw end
@@ -330,7 +330,7 @@ local function observeWaiting(state, token)
 end
 
 -- Waiting is the only state worth interrupting for, only on the way into it, and
--- only while the scratchpad is hidden - Pi asking for attention on screen is
+-- only while the companion is hidden - Pi asking for attention on screen is
 -- already the notification.
 local function announce(previous, state)
   if state ~= "waiting" or previous == nil or previous == "waiting" then return end
@@ -381,7 +381,7 @@ local function revealSpawn()
   if type(deadline) ~= "number" or deadline == 0 then return end
   if noctalia.nowMs() >= deadline then
     noctalia.state.set(REVEAL_UNTIL, 0)
-    noctalia.notify("Pi scratchpad did not appear", "No mapped scratchpad window was found within 20 seconds. Check the terminal and spawn command.")
+    noctalia.notify("Pi Companion did not appear", "No mapped companion window was found within 20 seconds. Check the terminal and spawn command.")
     return
   end
   if revealBusy == deadline then return end
@@ -402,7 +402,7 @@ tick = function()
   if reopening > 0 then
     if noctalia.nowMs() >= reopening then
       noctalia.state.set(REOPEN_UNTIL, 0)
-      noctalia.notify("Pi scratchpad reopen timed out", "Pi did not finish exiting within 20 seconds. A second session was not started.")
+      noctalia.notify("Pi Companion reopen timed out", "Pi did not finish exiting within 20 seconds. A second session was not started.")
     elseif readState() == "not_running" then
       noctalia.state.set(REOPEN_UNTIL, 0)
       startSpawn()
@@ -443,7 +443,7 @@ function onClick()
   compositor("mapped", function(mapped, valid)
     if spawnInFlight() then return end
     if not valid then
-      noctalia.notify("Pi scratchpad window query failed", "Could not read Hyprland clients. Nothing was launched or toggled.")
+      noctalia.notify("Pi Companion window query failed", "Could not read Hyprland clients. Nothing was launched or toggled.")
       return
     end
     if not mapped then
