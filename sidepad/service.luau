@@ -1,10 +1,6 @@
--- Controller entry: the single place an action is accepted. This slice owns the
--- pad configuration boundary: pads.json is read as data, checked, and turned
--- into the pad records every caller renders. No action is implemented yet, so
--- every declared action is refused here instead of half-working: the name
--- exists, no compositor operation is behind it yet. Nothing in this file
--- launches a process or touches a window, so an invalid configuration costs the
--- user one status error and nothing else.
+-- Controller entry: configuration, durable preferences and observational
+-- compositor reconciliation. Selection/show and side reposition remain separate
+-- actions; their preference changes go through setPreferences below.
 
 local shared = require("./shared.luau")
 
@@ -15,7 +11,6 @@ local status = {
   revision = 0,
   phase = "ready",
   selectedPadId = nil,
-  -- Defaults until the durable preference slice restores the user's own.
   side = "left",
   widthMode = "narrow",
   busy = false,
@@ -206,6 +201,62 @@ local function loadPads()
     table.insert(pads, pad)
   end
   return pads
+end
+
+-- ── Durable preferences ─────────────────────────────────────────────────────
+
+local function validSelection(id)
+  for _, pad in ipairs(status.pads) do
+    if pad.id == id then return true end
+  end
+  return id == nil and #status.pads == 0
+end
+
+local function validSide(side)
+  return side == "left" or side == "right"
+end
+
+local function loadPreferences()
+  status.selectedPadId = status.pads[1] and status.pads[1].id or nil
+  status.side = "left"
+  local directory = noctalia.pluginDataDir()
+  if not directory then return end
+  local raw = noctalia.readFile(directory .. "/preferences.json")
+  if type(raw) ~= "string" then return end
+  local document = noctalia.json.decode(raw)
+  if type(document) ~= "table" or not validSelection(document.selectedPadId) or not validSide(document.side) then
+    return
+  end
+  status.selectedPadId, status.side = document.selectedPadId, document.side
+end
+
+-- Controller-local seam for the later selection and placement actions. A failed
+-- save returns an actionable error and leaves the last durable values intact;
+-- the action caller reports that failure instead of claiming success.
+local function setPreferences(selectedPadId, side)
+  if not validSelection(selectedPadId) then
+    return nil, "cannot save preferences: selected pad is not configured"
+  end
+  if not validSide(side) then
+    return nil, "cannot save preferences: side must be left or right"
+  end
+  if status.selectedPadId == selectedPadId and status.side == side then return true end
+  local directory, directoryError = noctalia.pluginDataDir()
+  if not directory then
+    return nil, "cannot save preferences: no plugin data directory: " .. tostring(directoryError)
+  end
+  local path = directory .. "/preferences.json"
+  local document, encodeError = noctalia.json.encode({ selectedPadId = selectedPadId, side = side })
+  if not document then
+    return nil, "cannot encode preferences: " .. tostring(encodeError)
+  end
+  local written, writeError = noctalia.writeFile(path, document)
+  if not written then
+    return nil, "cannot save " .. path .. ": " .. tostring(writeError)
+  end
+  status.selectedPadId, status.side = selectedPadId, side
+  publish()
+  return true
 end
 
 -- Parse one compositor JSON array without trusting its contents. Invalid
@@ -535,6 +586,7 @@ end
 local configured, configError = loadPads()
 if configured then
   status.pads = configured
+  loadPreferences()
   refresh()
 else
   configurationError = configError
