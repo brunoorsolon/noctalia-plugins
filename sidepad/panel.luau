@@ -1,61 +1,129 @@
--- Selector panel entry: the same status snapshot the bar renders, with one
--- control per configured pad and the requests this surface owns. It is thin on
--- purpose: the accessible selector, its disabled states and its dismissal rules
--- belong to the panel slice, which replaces this tree.
+-- Selector panel entry: it renders the controller's copied snapshot and sends
+-- requests through the same shared contract as the bar.
 
 local shared = require("./shared.luau")
 
 local isOpen = false
+local pendingSelect = nil
+local render
 
 local function status()
   local value = noctalia.state.get(shared.STATUS_KEY)
-  if type(value) ~= "table" then
-    return {}
-  end
-  return value
+  return type(value) == "table" and value or {}
 end
 
-local function stateText(pad)
-  if pad.visible then
-    return type(pad.output) == "string" and ("shown on " .. pad.output) or "shown"
+local function padState(pad)
+  local running = pad.running and "running" or "stopped"
+  local visibility = pad.visible and "visible" or "hidden"
+  if pad.visible and type(pad.output) == "string" then
+    visibility = visibility .. " on " .. pad.output
   end
-  return pad.running and "hidden" or "stopped"
+  return running .. " · " .. visibility
 end
 
-local function render()
-  local s = status()
+local function selectedPad(snapshot)
+  for _, pad in ipairs(type(snapshot.pads) == "table" and snapshot.pads or {}) do
+    if type(pad) == "table" and pad.id == snapshot.selectedPadId then
+      return pad
+    end
+  end
+  return nil
+end
+
+local function request(action, padId)
+  if pendingSelect == nil and not status().busy then
+    shared.request(action, padId)
+  end
+end
+
+local function selectPad(padId)
+  local snapshot = status()
+  if snapshot.busy or pendingSelect then return end
+  pendingSelect = { padId = padId, revision = snapshot.revision or 0 }
+  shared.request("select", padId)
+  if isOpen and pendingSelect then render() end
+end
+
+render = function()
+  local snapshot = status()
+  local busy = snapshot.busy == true or pendingSelect ~= nil
+  local selected = selectedPad(snapshot)
+  local available = selected ~= nil
+  local errorText = type(snapshot.error) == "string" and snapshot.error or nil
   local children = {
     ui.row({ align = "center", justify = "space_between" }, {
       ui.label({ text = "Sidepad", fontSize = 16, fontWeight = "bold", flexGrow = 1 }),
-      ui.button({ glyph = "refresh", variant = "ghost", tooltip = "Refresh pad state", onClick = "onRefresh" }),
+      ui.button({ text = "Refresh", enabled = not busy, onClick = "onRefresh" }),
     }),
   }
 
-  local errorText = type(s.error) == "string" and s.error or nil
   if errorText then
     table.insert(children, ui.label({ text = errorText, color = "error", fontSize = 12 }))
   end
+  if busy then
+    table.insert(children, ui.label({ text = "Operation in progress.", color = "primary", fontSize = 12 }))
+  end
 
-  local pads = type(s.pads) == "table" and s.pads or {}
+  local pads = type(snapshot.pads) == "table" and snapshot.pads or {}
   if #pads == 0 then
     table.insert(children, ui.label({ text = "No pads configured yet.", color = "on_surface_variant" }))
   else
     for _, pad in ipairs(pads) do
       local icon = type(pad.icon) == "string" and pad.icon ~= "" and pad.icon or "app-window"
+      local name = type(pad.name) == "string" and pad.name ~= "" and pad.name or pad.id
+      local label = name .. " · " .. padState(pad)
+      local isSelected = pad.id == snapshot.selectedPadId
+      if isSelected then label = label .. " · selected" end
       table.insert(children, ui.button({
         key = pad.id,
-        text = (pad.name or pad.id) .. " · " .. stateText(pad),
+        text = label,
         glyph = icon,
-        selected = pad.id == s.selectedPadId,
+        selected = isSelected,
+        enabled = not busy,
         onClick = function()
-          shared.request("select", pad.id)
+          selectPad(pad.id)
         end,
       }))
     end
   end
 
+  local visible = available and selected.visible == true
+  local running = available and selected.running == true
+  local side = snapshot.side == "right" and "right" or "left"
+  local widthMode = snapshot.widthMode == "wide" and "wide" or "narrow"
   table.insert(children, ui.row({ gap = 8 }, {
-    ui.button({ text = "Show or hide", onClick = "onToggle" }),
+    ui.button({
+      key = "visibility",
+      text = visible and "Hide" or "Show",
+      enabled = available and not busy,
+      onClick = function()
+        if available then request(visible and "hide" or "show", selected.id) end
+      end,
+    }),
+    ui.button({
+      key = "width",
+      text = widthMode == "wide" and "Narrow" or "Wide",
+      enabled = running and not busy,
+      onClick = function()
+        if running then request("toggle_width", selected.id) end
+      end,
+    }),
+    ui.button({
+      key = "side",
+      text = side == "left" and "Move to right" or "Move to left",
+      enabled = available and not busy,
+      onClick = function()
+        if available then request("switch_side", selected.id) end
+      end,
+    }),
+    ui.button({
+      key = "close",
+      text = "Close",
+      enabled = running and not busy,
+      onClick = function()
+        if running then request("close", selected.id) end
+      end,
+    }),
   }))
 
   panel.render(ui.column({ gap = 10, padding = 16 }, children))
@@ -68,18 +136,26 @@ end
 
 function onClose()
   isOpen = false
+  pendingSelect = nil
 end
 
 function onRefresh()
-  shared.request("refresh")
+  request("refresh")
 end
 
 function onToggle()
-  shared.request("toggle")
+  request("toggle")
 end
 
-noctalia.state.watch(shared.STATUS_KEY, function()
-  if isOpen then
-    render()
+noctalia.state.watch(shared.STATUS_KEY, function(snapshot)
+  if pendingSelect and type(snapshot) == "table" and (snapshot.revision or 0) > pendingSelect.revision and not snapshot.busy then
+    local pad = selectedPad(snapshot)
+    local succeeded = snapshot.error == nil and snapshot.selectedPadId == pendingSelect.padId and pad ~= nil and pad.visible == true
+    pendingSelect = nil
+    if succeeded then
+      panel.close()
+      isOpen = false
+    end
   end
+  if isOpen then render() end
 end)
