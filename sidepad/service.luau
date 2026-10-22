@@ -317,6 +317,7 @@ local streamError = nil
 local streamFailureRevision = 0
 local streamRecoveryRevision = nil
 local refreshQueuedRecovery = nil
+local closeOperation = nil
 local refresh
 local operationActive = false
 local refreshContinuation = nil
@@ -385,6 +386,7 @@ end
 local refreshNotifiesOnFailure = false
 
 local function completeRefresh(results, recoveryRevision)
+  local clients
   local failure = commandFailure("hyprctl -j clients", results.clients)
     or commandFailure("hyprctl -j monitors", results.monitors)
   if failure then
@@ -392,7 +394,8 @@ local function completeRefresh(results, recoveryRevision)
     status.phase = "error"
     status.busy = false
   else
-    local clients, clientError = decodeArray(results.clients.stdout, "hyprctl -j clients", isClient)
+    local clientError
+    clients, clientError = decodeArray(results.clients.stdout, "hyprctl -j clients", isClient)
     local monitors, monitorError = decodeArray(results.monitors.stdout, "hyprctl -j monitors", isMonitor)
     if not clients or not monitors then
       failure = clientError or monitorError
@@ -415,7 +418,7 @@ local function completeRefresh(results, recoveryRevision)
   local continuation = refreshContinuation
   refreshContinuation = nil
   publish()
-  if continuation then continuation(failure) end
+  if continuation then continuation(failure, clients) end
   if refreshQueued and not operationActive and not refreshing then
     local recovery = refreshQueuedRecovery
     refreshQueued, refreshQueuedRecovery = false, nil
@@ -557,6 +560,84 @@ refresh = function(explicitAction, recoveryRevision, continuation)
   query("monitors", function(result) received("monitors", result) end)
 end
 
+-- A close is acknowledged only after reconciliation observes the address gone.
+-- A confirmation dialog or refusal gets a bounded wait, never another close.
+local function finishClose(failure)
+  closeOperation = nil
+  operationActive = false
+  status.busy = false
+  if failure then
+    status.error, status.phase = failure, "error"
+    noctalia.notifyError(failure)
+  end
+  publish()
+end
+
+local function verifyClose(failure, clients)
+  local operation = closeOperation
+  if failure or operation.failure then
+    finishClose(operation.failure or failure)
+    return
+  end
+  for _, client in ipairs(clients) do
+    if client.address == operation.address then
+      if noctalia.nowMs() >= operation.deadline then
+        finishClose("pad '" .. operation.pad.id .. "' is still open; close was refused or needs application confirmation")
+      else
+        operation.stage = "waiting"
+      end
+      return
+    end
+  end
+  finishClose()
+end
+
+local function closePad(pad)
+  operationActive = true
+  closeOperation = { pad = pad, stage = "lookup" }
+  refresh(false, nil, function(failure)
+    if failure then return finishClose(failure) end
+    if not pad.running then return finishClose() end
+    if not pad.address then
+      return finishClose("duplicate windows for pad '" .. pad.id .. "'; nothing was closed")
+    end
+    if not pad.address:match("^0x%x+$") or not pad.address:find("[1-9a-fA-F]") then
+      return finishClose("invalid window address for pad '" .. pad.id .. "'; nothing was closed")
+    end
+    local operation = closeOperation
+    operation.address, operation.stage = pad.address, "command"
+    -- Check again inside the compositor: a vanished target must never fall back
+    -- to the focused window, even if clients changed after the lookup snapshot.
+    local expression = ([=[function()
+      local windows = hl.get_windows({ class = %q })
+      if #windows ~= 1 or windows[1].address ~= %q then
+        error("Sidepad close target changed; refresh and retry")
+      end
+      return hl.dispatch(hl.dsp.window.close({ window = windows[1] }))
+    end]=]):format(pad.class, pad.address)
+    local completed = false
+    local function done(result)
+      if completed then return end
+      completed = true
+      operation.failure = commandFailure("hyprctl close", result)
+      if not operation.failure and (type(result.stdout) ~= "string" or noctalia.string.trim(result.stdout) ~= "ok") then
+        operation.failure = "Hyprland rejected close for pad '" .. pad.id .. "'; refresh and retry"
+      end
+      operation.deadline = noctalia.nowMs() + 2000
+      operation.stage = "verify"
+      refresh(false, nil, verifyClose)
+    end
+    if noctalia.runAsync({ "hyprctl", "dispatch", expression }, done) == false then done(nil) end
+  end)
+end
+
+function update()
+  if closeOperation and closeOperation.stage == "waiting" and not refreshing then
+    closeOperation.stage = "verify"
+    refresh(false, nil, verifyClose)
+  end
+end
+
 local function finite(value)
   return type(value) == "number" and value == value and math.abs(value) < math.huge
 end
@@ -671,13 +752,14 @@ end
 
 -- The one action path: the request watcher below and onIpc both land here.
 local function dispatch(action, padId)
-  if status.busy then
+  if status.busy or closeOperation then
     return
   end
   if not shared.isAction(action) then
     refuse("unknown action: " .. tostring(action), true)
     return
   end
+  if action == "close" and padId == nil then padId = status.selectedPadId end
   if action ~= "toggle" and action ~= "refresh" then
     if type(padId) ~= "string" or padId == "" then
       refuse(action .. " requires a pad id", true)
@@ -704,6 +786,15 @@ local function dispatch(action, padId)
   if action == "refresh" then
     refresh(true)
     return
+  end
+  if action == "close" then
+    if padId ~= status.selectedPadId then
+      refuse("close only targets the selected pad", true)
+      return
+    end
+    for _, pad in ipairs(status.pads) do
+      if pad.id == padId then closePad(pad); return end
+    end
   end
   if action == "toggle" or action == "show" or action == "hide" then
     if padId ~= nil and padId ~= status.selectedPadId then

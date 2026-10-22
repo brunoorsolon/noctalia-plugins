@@ -224,6 +224,9 @@ local declinedQueries, pendingQueries = {}, {}
 local streamCallbacks = {}
 local streamAccepted = true
 local deferQueries = false
+local closeDispatch = nil
+local clock = 0
+noctalia.nowMs = function() return clock end
 noctalia.runAsync = function(argv, onResult)
   table.insert(launches, copy(argv))
   if type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "-j" then
@@ -237,6 +240,8 @@ noctalia.runAsync = function(argv, onResult)
         onResult(copy(queryReplies[kind]))
       end
     end
+  elseif closeDispatch and type(argv) == "table" and argv[1] == "hyprctl" and argv[2] == "dispatch" then
+    return closeDispatch(argv, onResult)
   end
   return true
 end
@@ -1079,7 +1084,8 @@ onIpc("show", "terminal")
 check("mutation remains busy while a command is pending", true, status().busy)
 local commandCount = nonQueryLaunchCount()
 onIpc("hide", "terminal")
-check("overlapping action starts no new command", commandCount, nonQueryLaunchCount())
+onIpc("close", "terminal")
+check("hide and close cannot interrupt a pending show", commandCount, nonQueryLaunchCount())
 streamCallbacks[1]("activespecial>>noctalia-sidepad-terminal,DP-2")
 check("events cannot interrupt mutation busy state", true, status().busy)
 deferMutation = false
@@ -1590,6 +1596,243 @@ check("side can be changed without configured pads", true, setPreferences(nil, "
 local noPads = startWith('{"version":1,"pads":[]}', files["/data/preferences.json"])
 check("empty selection survives reload", nil, noPads.selectedPadId)
 check("side survives reload without pads", "right", noPads.side)
+
+-- ── Selected-window close ───────────────────────────────────────────────────
+-- Execute the actual compositor expression against windows, not canned status
+-- text. Closing a surface leaves its process and sibling surfaces alive.
+local closeWindows, closeRequests, beforeCloseDispatch, pendingClose = {}, {}, nil, nil
+local closeResult, declineClose, deferClose = nil, false, false
+local function closeSnapshot()
+  local clients = {}
+  for _, window in ipairs(closeWindows) do
+    if window.mapped then table.insert(clients, encodeJson(window)) end
+  end
+  queryReplies.clients = { exitCode = 0, stdout = "[" .. table.concat(clients, ",") .. "]", stderr = "" }
+end
+local function closeWindow(class, address)
+  return { class = class, address = address, mapped = true, monitor = 0, pid = 123,
+    workspace = { id = 1, name = "1" } }
+end
+local function finishCloseCommand(callback, expression)
+  if beforeCloseDispatch then beforeCloseDispatch() end
+  local hl = {
+    get_windows = function(filters)
+      local matches = {}
+      for _, window in ipairs(closeWindows) do
+        if window.mapped and window.class == filters.class then table.insert(matches, window) end
+      end
+      return matches
+    end,
+    dsp = { window = { close = function(arguments)
+      assert(arguments.window ~= nil, "close must never fall back to the active window")
+      return { window = arguments.window }
+    end } },
+    dispatch = function(operation)
+      table.insert(closeRequests, operation.window.address)
+      if not operation.window.refuses then operation.window.mapped = false end
+      return { ok = true }
+    end,
+  }
+  local chunk = assert(loadstring("return " .. expression))
+  setfenv(chunk, { hl = hl, error = error })
+  local ok = pcall(chunk())
+  closeSnapshot()
+  callback(closeResult or { exitCode = 0, stdout = ok and "ok" or "error: changed target", stderr = "" })
+end
+closeDispatch = function(argv, callback)
+  if declineClose then return false end
+  if deferClose then
+    pendingClose = function() finishCloseCommand(callback, argv[3]) end
+  elseif closeResult then
+    callback(copy(closeResult))
+  else
+    finishCloseCommand(callback, argv[3])
+  end
+  return true
+end
+local function startCloseFixture()
+  clock, closeRequests, beforeCloseDispatch, pendingClose = 0, {}, nil, nil
+  closeResult, declineClose, deferClose = nil, false, false
+  closeWindows = {
+    closeWindow("noctalia-sidepad-terminal", "0xa1"),
+    closeWindow("ordinary-terminal", "0xb2"),
+    closeWindow("noctalia-sidepad-browser", "0xc3"),
+  }
+  queryReplies.monitors = { exitCode = 0, stdout = "[]", stderr = "" }
+  closeSnapshot()
+  startWith(VALID_PADS)
+end
+
+for _, via in ipairs({ "IPC", "panel" }) do
+  startCloseFixture()
+  if via == "IPC" then
+    onIpc("close")
+  else
+    onOpen()
+    buttonByKey(lastTree, "close").props.onClick()
+  end
+  check(via .. " close sends exactly one normal close", 1, #closeRequests)
+  check(via .. " close targets selected address", "0xa1", closeRequests[1])
+  check(via .. " closes the selected surface", false, closeWindows[1].mapped)
+  check(via .. " preserves sibling surface from the same process", true, closeWindows[2].mapped)
+  check(via .. " preserves the other configured pad", true, closeWindows[3].mapped)
+  check(via .. " reconciles the closed pad", false, status().pads[1].running)
+  check(via .. " close clears busy", false, status().busy)
+  check(via .. " successful close reports no error", nil, status().error)
+  check(via .. " close starts no process or signal command", 1, nonQueryLaunchCount())
+end
+
+startCloseFixture()
+onIpc("close", "browser")
+check("close refuses a pad other than the selected pad", 0, #closeRequests)
+checkContains("nonselected close reports why", "selected pad", status().error)
+
+for _, fixture in ipairs({
+  { name = "stopped", change = function() closeWindows[1].mapped = false end },
+  { name = "duplicate", change = function() table.insert(closeWindows, closeWindow("noctalia-sidepad-terminal", "0xd4")) end },
+  { name = "invalid address", change = function() closeWindows[1].address = "0xa1';kill" end },
+  { name = "null address", change = function() closeWindows[1].address = "0x0" end },
+}) do
+  startCloseFixture()
+  fixture.change()
+  closeSnapshot()
+  onIpc("close", "terminal")
+  check(fixture.name .. " sends no close", 0, #closeRequests)
+  check(fixture.name .. " sends no mutation or signal command", 0, nonQueryLaunchCount())
+  check(fixture.name .. " preserves unrelated surface", true, closeWindows[2].mapped)
+  check(fixture.name .. " clears busy", false, status().busy)
+  if fixture.name == "stopped" then
+    check("zero matches reconcile to stopped", false, status().pads[1].running)
+    check("zero matches are not a close failure", nil, status().error)
+  else
+    checkTrue(fixture.name .. " reports an error", status().error ~= nil)
+  end
+end
+
+-- Changes between lookup and dispatch are checked atomically in Hyprland too.
+for _, fixture in ipairs({
+  { name = "vanished address", change = function() closeWindows[1].mapped = false end },
+  { name = "reused address", change = function() closeWindows[1].class = "ordinary-terminal" end },
+  { name = "replacement address", change = function() closeWindows[1].address = "0xe5" end },
+  { name = "new duplicate", change = function() table.insert(closeWindows, closeWindow("noctalia-sidepad-terminal", "0xd4")) end },
+}) do
+  startCloseFixture()
+  beforeCloseDispatch = fixture.change
+  onIpc("close", "terminal")
+  check(fixture.name .. " cannot fall back to focused/unrelated surface", 0, #closeRequests)
+  check(fixture.name .. " preserves unrelated surface", true, closeWindows[2].mapped)
+  check(fixture.name .. " clears busy", false, status().busy)
+  checkTrue(fixture.name .. " reports rejected target", status().error ~= nil)
+end
+
+startCloseFixture()
+closeWindows[1].refuses = true
+closeSnapshot()
+onIpc("close", "terminal")
+check("refusal waits without blocking rendering", true, status().busy)
+check("refusal keeps the surface mapped", true, closeWindows[1].mapped)
+clock = 2000
+update()
+checkContains("refusal is reported after bounded wait", "still open", status().error)
+check("refusal clears busy", false, status().busy)
+check("refusal never retries or escalates", 1, #closeRequests)
+check("refusal never starts a signal command", 1, nonQueryLaunchCount())
+check("refusal notifies once", 1, #notifications)
+closeWindows[1].refuses = false
+closeSnapshot()
+onIpc("close", "terminal")
+check("close after refusal recovers", false, status().pads[1].running)
+check("close after refusal clears error", nil, status().error)
+
+startCloseFixture()
+closeWindows[1].refuses = true
+closeSnapshot()
+onIpc("close", "terminal")
+closeWindows[1].mapped = false
+closeSnapshot()
+clock = 1000
+update()
+check("delayed application close succeeds before deadline", nil, status().error)
+check("delayed application close clears busy", false, status().busy)
+check("delayed close sends only one request", 1, #closeRequests)
+
+for _, fixture in ipairs({
+  { name = "failed start", decline = true },
+  { name = "nonzero exit", result = { exitCode = 1, stdout = "", stderr = "" } },
+  { name = "timeout", result = { exitCode = 0, stdout = "ok", timedOut = true } },
+  { name = "truncated stdout", result = { exitCode = 0, stdout = "ok", stdoutTruncated = true } },
+  { name = "truncated stderr", result = { exitCode = 0, stdout = "ok", stderrTruncated = true } },
+  { name = "compositor rejection", result = { exitCode = 0, stdout = "error: rejected" } },
+}) do
+  startCloseFixture()
+  closeResult, declineClose = fixture.result, fixture.decline
+  onIpc("close", "terminal")
+  check(fixture.name .. " clears close busy", false, status().busy)
+  checkTrue(fixture.name .. " reports close failure", status().error ~= nil)
+  check(fixture.name .. " reconciles live running state", true, status().pads[1].running)
+  check(fixture.name .. " never closes unrelated surface", true, closeWindows[2].mapped)
+  closeResult, declineClose = nil, false
+  onIpc("close", "terminal")
+  check(fixture.name .. " allows a later close", false, status().pads[1].running)
+end
+
+startCloseFixture()
+deferClose = true
+onIpc("close", "terminal")
+check("pending close owns busy", true, status().busy)
+onIpc("close", "terminal")
+serviceShared.request("close", "terminal")
+onIpc("hide", "terminal")
+serviceShared.request("show", "terminal")
+streamCallbacks[1]("openwindow>>0xd4")
+check("close, hide and show cannot interrupt a pending close", 1, nonQueryLaunchCount())
+check("event during close does not release busy", true, status().busy)
+pendingClose()
+check("close completes after queued compositor event", false, status().busy)
+check("queued event never duplicates close", 1, #closeRequests)
+
+startCloseFixture()
+queryReplies.clients = { exitCode = 4, stdout = "", stderr = "" }
+onIpc("close", "terminal")
+check("failed close lookup never sends a mutation", 0, nonQueryLaunchCount())
+check("failed close lookup clears busy", false, status().busy)
+checkTrue("failed close lookup reports failure", status().error ~= nil)
+closeSnapshot()
+onIpc("close", "terminal")
+check("failed close lookup is recoverable", false, status().pads[1].running)
+
+startCloseFixture()
+deferClose = true
+onIpc("close", "terminal")
+deferQueries = true
+pendingClose()
+queryReplies.clients = { exitCode = 4, stdout = "", stderr = "" }
+finishQuery("clients")
+finishQuery("monitors")
+check("failed post-close reconciliation clears busy", false, status().busy)
+checkTrue("failed post-close reconciliation reports failure", status().error ~= nil)
+check("failed post-close reconciliation retains last snapshot", true, status().pads[1].running)
+check("failed post-close reconciliation never repeats close", 1, #closeRequests)
+deferQueries = false
+closeSnapshot()
+onIpc("refresh")
+check("refresh recovers failed close reconciliation", false, status().pads[1].running)
+check("refresh clears failed close reconciliation error", nil, status().error)
+
+-- Discarding/reloading the controller does not dispatch a close. Startup adopts
+-- surviving surfaces, including one left open by an interrupted close operation.
+startCloseFixture()
+closeWindows[1].refuses = true
+closeSnapshot()
+onIpc("close", "terminal")
+local sentBeforeReload = #closeRequests
+local adopted = startWith(VALID_PADS)
+check("controller reload sends no close or signal", 0, nonQueryLaunchCount())
+check("controller reload preserves outstanding application", true, closeWindows[1].mapped)
+check("controller reload preserves unrelated application", true, closeWindows[2].mapped)
+check("controller reload adopts surviving pad", "0xa1", adopted.pads[1].address)
+check("controller reload clears previous busy", false, adopted.busy)
+check("reload does not add an application close request", sentBeforeReload, #closeRequests)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
