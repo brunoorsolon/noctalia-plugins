@@ -1,6 +1,6 @@
 -- The controller owns configuration, reconciliation and serialized actions.
--- Existing windows are shown/hidden here; launching and other actions are
--- refused until their own slices implement them.
+-- Existing windows are shown, hidden, resized and closed here; launching and
+-- other actions are refused until their own slices implement them.
 
 local shared = require("./shared.luau")
 
@@ -642,8 +642,8 @@ local function finite(value)
   return type(value) == "number" and value == value and math.abs(value) < math.huge
 end
 
-local function placement()
-  local name = noctalia.focusedOutputName()
+local function placement(widthMode, outputName)
+  local name = outputName or noctalia.focusedOutputName()
   local output = nil
   for _, candidate in ipairs(noctalia.outputs()) do
     if candidate.name == name then output = candidate; break end
@@ -652,7 +652,7 @@ local function placement()
     or not finite(output.width) or not finite(output.height) or output.width < 1 or output.height < 1 then
     return nil, "invalid focused-output geometry; check the focused output and retry"
   end
-  local width = noctalia.getConfig(status.widthMode == "wide" and "wide_width" or "narrow_width")
+  local width = noctalia.getConfig((widthMode or status.widthMode) == "wide" and "wide_width" or "narrow_width")
   local edge = noctalia.getConfig("edge_gap")
   local top = noctalia.getConfig("top_gap")
   local bottom = noctalia.getConfig("bottom_gap")
@@ -672,7 +672,7 @@ local function specialName(monitor)
   return monitor.specialWorkspace.name:gsub("^special:", "")
 end
 
-local function visibilityAction(action)
+local function windowAction(action)
   operationActive = true
   -- Reconcile before using addresses or toggling visibility, not just after:
   -- events may still be queued when the user clicks.
@@ -703,11 +703,20 @@ local function visibilityAction(action)
       if monitor.specialWorkspace.id ~= 0 and specialName(monitor) == name then visibleOn = monitor.name end
     end
     local hide = action == "hide" or (action == "toggle" and visibleOn ~= nil)
+    local widthMode = status.widthMode == "narrow" and "wide" or "narrow"
     local commands = {}
     local function add(expression) table.insert(commands, expression) end
     local function focusMonitor(output) add(("hl.dsp.focus({monitor=%q})"):format(output)) end
     local function toggle(workspace) add(("hl.dsp.workspace.toggle_special(%q)"):format(workspace)) end
-    if hide then
+    if action == "toggle_width" then
+      -- Resize on the owning output without focusing or revealing its workspace.
+      if not pad.output then finish("selected pad has no output; refresh and retry"); return end
+      local geometry, problem = placement(widthMode, pad.output)
+      if not geometry then finish(problem); return end
+      local window = ("address:%s"):format(pad.address)
+      add(("hl.dsp.window.resize({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.width, geometry.height))
+      add(("hl.dsp.window.move({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.x, geometry.y))
+    elseif hide then
       if visibleOn then
         focusMonitor(visibleOn)
         toggle(name)
@@ -733,7 +742,11 @@ local function visibilityAction(action)
     end
     local function run(index)
       local expression = commands[index]
-      if not expression then finish(); return end
+      if not expression then
+        if action == "toggle_width" then status.widthMode = widthMode end
+        finish()
+        return
+      end
       local completed = false
       local function done(result)
         if completed then return end
@@ -759,7 +772,7 @@ local function dispatch(action, padId)
     refuse("unknown action: " .. tostring(action), true)
     return
   end
-  if action == "close" and padId == nil then padId = status.selectedPadId end
+  if (action == "close" or action == "toggle_width") and padId == nil then padId = status.selectedPadId end
   if action ~= "toggle" and action ~= "refresh" then
     if type(padId) ~= "string" or padId == "" then
       refuse(action .. " requires a pad id", true)
@@ -796,7 +809,7 @@ local function dispatch(action, padId)
       if pad.id == padId then closePad(pad); return end
     end
   end
-  if action == "toggle" or action == "show" or action == "hide" then
+  if action == "toggle" or action == "show" or action == "hide" or action == "toggle_width" then
     if padId ~= nil and padId ~= status.selectedPadId then
       refuse("action requires the selected pad", true)
       return
@@ -805,7 +818,7 @@ local function dispatch(action, padId)
       refuse("selected pad is not running; start its application and retry", true)
       return
     end
-    visibilityAction(action)
+    windowAction(action)
     return
   end
   -- Other actions belong to later slices and must not imply work they cannot do.
