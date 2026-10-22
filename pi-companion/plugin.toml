@@ -1,13 +1,13 @@
-id = "magus/pi-scratchpad"
-name = "Pi Scratchpad"
-version = "0.4.0"
+id = "magus/pi-companion"
+name = "Pi Companion"
+version = "0.5.0"
 plugin_api = 24
 author = "magus"
 license = "MIT"
 dependencies = ["hyprctl", "foot", "pi"]
 tags = ["hyprland", "desktop", "widget", "agent"]
 icon = "terminal-2"
-description = "Parks one long-lived Pi TUI in a Hyprland special workspace, shows its working, waiting or idle state in the bar, and notifies when Pi starts waiting out of sight."
+description = "Your desktop agent companion, powered by Pi. Keeps one long-lived Pi TUI a shortcut away, shows its working, waiting or idle state, and notifies when Pi needs you out of sight."
 
 [[setting]]
 key = "workspace"
@@ -28,7 +28,7 @@ key = "spawn"
 type = "string"
 label_key = "settings.spawn.label"
 description_key = "settings.spawn.description"
-default = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
+default = "pi -c --session-dir ~/.local/state/pi-companion/sessions"
 
 [[setting]]
 key = "working_dir"
@@ -76,5 +76,5 @@ description_key = "settings.notify.description"
 default = true
 
 [[widget]]
-id = "scratchpad"
-entry = "scratchpad.luau"
+id = "companion"
+entry = "companion.luau"

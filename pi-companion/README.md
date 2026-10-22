@@ -1,4 +1,6 @@
-# Pi Scratchpad
+# Pi Companion
+
+Your desktop agent companion, powered by [Pi](https://pi.dev).
 
 A Noctalia plugin that gives the Pi coding agent a home on the desktop: one long-lived Pi TUI parked in a Hyprland special workspace, a bar widget showing whether it is working, waiting on you or idle, a click that toggles the workspace, and a notification when Pi starts waiting out of sight.
 
@@ -8,15 +10,15 @@ The plugin never renders the conversation. Pi's own TUI is the UI, so nothing is
 
 | Field | Value |
 | --- | --- |
-| ID | `magus/pi-scratchpad` |
-| Entry | Widget: `scratchpad` |
+| ID | `magus/pi-companion` |
+| Entry | Widget: `companion` |
 | Plugin API | 24 |
 | Compositor | Hyprland 0.55+, configured in Lua |
 
 ## Requirements
 
 - **Hyprland 0.55 or newer, configured in Lua (`hyprland.lua`).** Niri has no native special workspace, so this plugin is Hyprland only. Hyprland added its Lua configuration and dispatcher API in 0.55 and deprecated hyprlang there; the widget drives the compositor through `hl.dsp.exec_cmd` and `hl.dsp.workspace.toggle_special`. A legacy `hyprland.conf` configuration does not accept those calls, and the click reports Hyprland's refusal instead of opening Pi.
-- **The companion Pi extension, [pi-hypr-agent-monitor](https://github.com/brunoorsolon/pi-hypr-agent-monitor).** It is what publishes the status file the widget reads. Without it the widget sits on "Pi is not running". Install it with `git clone https://github.com/brunoorsolon/pi-hypr-agent-monitor ~/.pi/agent/extensions/pi-hypr-agent-monitor`, then leave `PI_HYPR_MONITOR` alone; the plugin sets `PI_HYPR_MONITOR=1` for the Pi it spawns, so a Pi you start by hand in another terminal can never overwrite the scratchpad's status.
+- **The companion Pi extension, [pi-hypr-agent-monitor](https://github.com/brunoorsolon/pi-hypr-agent-monitor).** It is what publishes the status file the widget reads. Without it the widget sits on "Pi is not running". Install it with `git clone https://github.com/brunoorsolon/pi-hypr-agent-monitor ~/.pi/agent/extensions/pi-hypr-agent-monitor`, then leave `PI_HYPR_MONITOR` alone; the plugin sets `PI_HYPR_MONITOR=1` for the Pi it spawns, so a Pi you start by hand in another terminal can never overwrite the companion's status.
 - **`hyprctl`** on `PATH`.
 - **A terminal emulator** such as `foot` or `kitty`. The setting is a shell fragment, so a terminal that needs a flag works too: `alacritty -e`, `wezterm start --`.
 - **`pi`** on `PATH`.
@@ -31,12 +33,21 @@ Open **Settings → Plugins**, select **Add source**, and add this Git source:
 | Kind | Git |
 | Location | `https://github.com/brunoorsolon/noctalia-plugins.git` |
 
-Enable **Pi Scratchpad**, then place its bar widget where you want it, the same as any other bar widget. The equivalent commands are:
+Enable **Pi Companion**, then place its bar widget where you want it, the same as any other bar widget. The equivalent commands are:
 
 ```sh
 noctalia msg plugins source add magus git https://github.com/brunoorsolon/noctalia-plugins.git
-noctalia msg plugins enable magus/pi-scratchpad
+noctalia msg plugins enable magus/pi-companion
 ```
+
+### Upgrading from Pi Scratchpad (before 0.5.0)
+
+Version 0.5.0 renames the plugin ID, widget entry and default session directory. Noctalia sees `magus/pi-companion` as a different plugin, not an in-place update. Your existing session files are not moved or deleted automatically.
+
+1. Close the old Pi terminal and wait for Pi to exit. Disable `magus/pi-scratchpad` and remove its `scratchpad` widget from every bar before enabling Pi Companion; both plugins use the same monitor status file and special workspace and must not run together.
+2. To keep the conversation with the new default spawn command, move `~/.local/state/pi-scratchpad` to `~/.local/state/pi-companion` while Pi is stopped, only if the destination does not already exist. If it does exist, keep both directories and set the new plugin's spawn command to your existing session directory instead; do not overwrite either directory.
+3. Enable `magus/pi-companion`, add its `companion` widget to your bars, and reapply your previous settings. If you set a custom spawn command or session directory, keep that command rather than moving the default directory.
+4. Replace shortcut targets such as `magus/pi-scratchpad:scratchpad` with `magus/pi-companion:companion`, as shown below.
 
 ## Usage
 
@@ -46,7 +57,7 @@ If the terminal has disappeared but its monitored Pi is still shutting down, the
 
 Every reveal through the widget or its IPC shortcut reapplies the configured horizontal and vertical alignment on the destination monitor. Both default to **Center**. Placement uses logical monitor dimensions, including scale, rotation and desktop offset, so switching between differently sized monitors does not carry over stale coordinates. The configured window size is capped to the available area on small monitors and restored on larger ones. When Hyprland's Lua API exposes reserved edges for bars and panels, placement excludes them (verified in 0.56.2); 0.55 uses the full monitor area because its Lua API does not expose those edges. Terminal minimum-size constraints can still prevent a window from fitting a very small output.
 
-Alignment changes take effect the next time the scratchpad is shown; hiding does not reposition or resize it. Manual moves and resizes are replaced on the next reveal. Direct Hyprland workspace actions bypass the plugin's placement, so use the shortcut below for consistent alignment. Placement requires one floating window in the configured special workspace; if there are several, the widget reports the ambiguity rather than moving an arbitrary window.
+Alignment changes take effect the next time the companion is shown; hiding does not reposition or resize it. Manual moves and resizes are replaced on the next reveal. Direct Hyprland workspace actions bypass the plugin's placement, so use the shortcut below for consistent alignment. Placement requires one floating window in the configured special workspace; if there are several, the widget reports the ambiguity rather than moving an arbitrary window.
 
 Hiding a special workspace does not touch the process. Pi keeps running and keeps working; only closing the terminal or the compositor exiting ends it. The default spawn command resumes the same conversation with `pi -c` and a `--session-dir` of its own, so only scrollback is lost across a restart. Nothing here needs tmux or herdr, but if you run one, point the spawn command at it.
 
@@ -59,16 +70,16 @@ A click never fails silently. If Hyprland refuses the dispatch — a legacy `hyp
 Use the same toggle as the bar click from a terminal:
 
 ```sh
-noctalia msg plugin magus/pi-scratchpad:scratchpad focused toggle
+noctalia msg plugin magus/pi-companion:companion focused toggle
 ```
 
 For example, in `hyprland.lua`:
 
 ```lua
-hl.bind("SUPER + grave", hl.dsp.exec_cmd("noctalia msg plugin magus/pi-scratchpad:scratchpad focused toggle"))
+hl.bind("SUPER + grave", hl.dsp.exec_cmd("noctalia msg plugin magus/pi-companion:companion focused toggle"))
 ```
 
-Choose your own key combination in Hyprland. The command hides a visible scratchpad, reveals a hidden one, or launches and reveals Pi if it is stopped. It shares the click's launch latch and persistent-session settings.
+Choose your own key combination in Hyprland. The command hides a visible companion, reveals a hidden one, or launches and reveals Pi if it is stopped. It shares the click's launch latch and persistent-session settings.
 
 The widget must be placed on the targeted output. If more than one bar on that output contains it, use `focused:<bar-name>` (for example `focused:main`) instead of `focused`. A connector name such as `DP-1:main` can target a fixed placement when the focused output has no widget. Do not use `all`: that broadcasts a toggle to every placement and could toggle the workspace twice. Noctalia reports a missing or ambiguous target instead of guessing.
 
@@ -76,11 +87,11 @@ The widget must be placed on the targeted output. If more than one bar on that o
 
 | Setting | Default | Purpose |
 | --- | --- | --- |
-| Special workspace | `pi` | The Hyprland special workspace the scratchpad lives in. `pi` and `special:pi` both work. |
+| Special workspace | `pi` | The Hyprland special workspace Pi Companion lives in. `pi` and `special:pi` both work. |
 | Terminal | `foot` | The terminal emulator the spawned Pi runs in. This is a shell fragment, so flags go here too. |
-| Spawn command | `pi -c --session-dir ~/.local/state/pi-scratchpad/sessions` | What the terminal runs. The plugin adds `PI_HYPR_MONITOR=1`. |
+| Spawn command | `pi -c --session-dir ~/.local/state/pi-companion/sessions` | What the terminal runs. The plugin adds `PI_HYPR_MONITOR=1`. |
 | Working directory | `~` | Where the spawned Pi starts. |
-| Window size | `900x600` | Floating size of the scratchpad window, as `WIDTHxHEIGHT`, reapplied on reveal and capped to the monitor's available area. |
+| Window size | `900x600` | Floating size of the companion window, as `WIDTHxHEIGHT`, reapplied on reveal and capped to the monitor's available area. |
 | Vertical alignment | `center` | Top, Center or Bottom of the destination monitor. |
 | Horizontal alignment | `center` | Left, Center or Right of the destination monitor. |
 | Notify when Pi starts waiting | on | Send a notification when Pi changes to waiting while the workspace is hidden. One per turn, even if the widget sits on two bars. |
@@ -96,7 +107,7 @@ The widget is a 20 × 20 pixel-display robot/TV head. Its outline stays the same
 | Working | Pi is running a turn | Heartbeat scrolling horizontally to the left |
 | Waiting | Pi wants an answer or an approval | Bell swaying twice, then resting briefly |
 | Idle / stopped | Pi is idle, or there is no live monitored session | Thin π; no plus badge or separate stopped appearance |
-| Waiting, acknowledged | You viewed the waiting scratchpad and hid it | Thin π; tooltip says “Pi is idle” |
+| Waiting, acknowledged | You viewed the waiting companion and hid it | Thin π; tooltip says “Pi is idle” |
 | Unknown | The file exists and Pi is alive, but the document cannot be read or its state is unrecognised | Exclamation mark |
 
 The artwork inherits **Icon Color → widget Color → theme default** through Noctalia's native glyph rendering. It no longer forces `on_surface` (which bypassed the presentation overrides and left the icon white). Pick a color with enough contrast against your bar. Shapes and tooltips, rather than color alone, carry meaning.
@@ -116,7 +127,7 @@ The status file is `$XDG_RUNTIME_DIR/pi-hypr-agent-monitor/status.json`, or `$XD
 The widget's Luau entry can be exercised without a compositor:
 
 ```sh
-./pi-scratchpad/selftest.sh
+./pi-companion/selftest.sh
 ```
 
 It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, over fixture status files for each of the three states plus a missing file, malformed JSON, an unrecognised `state` and a dead pid, and checks the state presentation and inherited colors, animation frames, the tooltips, click and IPC routing, the spawn latch, waiting notifications, visibility acknowledgment (including failed and stale observations), two-placement cases, and delayed close/reopen mapping. The launch regression models a window becoming visible between a compositor snapshot and its callback, as well as hidden mapping, delayed process shutdown after unmapping, repeated requests, failed/malformed client queries, timeouts, and stale callbacks. Placement checks cover all nine alignments, default and invalid settings, initial launch, IPC show/hide, transfer of an already-visible session between different resolutions, scaling, rotation, negative monitor origins, reserved edges, size capping/restoration, unrelated windows and dispatch failures. The `hyprctl` stub answers a dispatch the way a Lua-configured Hyprland does, by evaluating `return hl.dispatch(<argument>)` against a stubbed `hl.dsp`, so a dispatch expression that Hyprland or Lua would reject fails the check instead of passing as a string comparison. It also runs the repository-wide `scripts/check-catalog.py`, which compares every plugin manifest against its catalog row. It needs `luau` on `PATH`; without one the Luau half is skipped instead of failing. Set `LUAU=/path/to/luau` to point it at a specific interpreter.
@@ -126,7 +137,7 @@ It runs the entry against a stubbed Noctalia runtime and a stubbed `hyprctl`, ov
 Generate a self-contained HTML page from the actual `icon.luau` frames and timing, using Noctalia's installed `noctalia-tabler.ttf` font. The exporter needs Python, Luau, and the Cairo/FreeType shared libraries on Linux; it does not install packages.
 
 ```sh
-LUAU=/path/to/luau python3 pi-scratchpad/preview.py --font /path/to/noctalia-tabler.ttf > /tmp/pi-scratchpad-preview.html
+LUAU=/path/to/luau python3 pi-companion/preview.py --font /path/to/noctalia-tabler.ttf > /tmp/pi-companion-preview.html
 ```
 
 Open the resulting file in a separate browser profile. It has live heartbeat and bell animations, pause and frame-step buttons, a color picker, dark/light backgrounds, and actual-size (20 px), 1.25× (25 px), and enlarged samples. It makes no network requests. Unlike the earlier idealized SVG preview, this page embeds PNG alpha masks rasterized from the real Tabler glyph with Cairo/FreeType. The model follows Noctalia's unhinted grayscale rasterization, padded glyph textures, fixed-cell centering, and pixel snapping. A before sample shows the old spaced-dot renderer using the same font. The exporter also checks that a filled grid has no sub-50%-alpha interior seams at 1× and 1.25× widget scale.

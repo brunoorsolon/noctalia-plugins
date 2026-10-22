@@ -36,7 +36,7 @@ local DEAD_PID = 4243
 local CONFIG = {
   workspace = "pi",
   terminal = "foot",
-  spawn = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions",
+  spawn = "pi -c --session-dir ~/.local/state/pi-companion/sessions",
   working_dir = "~",
   geometry = "900x600",
   notify = true,
@@ -267,9 +267,9 @@ require = function(path)
   return icon
 end
 
-assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
+assert(loadstring(SOURCES.companion, "companion.luau"))()
 local firstUpdate, firstOnClick, firstOnIpc = update, onClick, onIpc
-assert(loadstring(SOURCES.scratchpad, "scratchpad.luau"))()
+assert(loadstring(SOURCES.companion, "companion.luau"))()
 local secondUpdate, secondOnClick = update, onClick
 
 -- ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -520,7 +520,7 @@ check("a spawn command with a quote and a backslash arrives unchanged", callsOf(
 check("a workspace name with a quote and a backslash arrives unchanged", lastCall().name, 'special:p"i\\x')
 check("and is still targeted as a special workspace", callsOf("exec_cmd")[1].rules.workspace, 'special:p"i\\x')
 CONFIG.workspace = "pi"
-CONFIG.spawn = "pi -c --session-dir ~/.local/state/pi-scratchpad/sessions"
+CONFIG.spawn = "pi -c --session-dir ~/.local/state/pi-companion/sessions"
 
 -- ── A rejected dispatch ──────────────────────────────────────────────────────
 
@@ -827,7 +827,7 @@ show(nil)
 mapped, visible = false, false
 calls = {}
 onIpc("toggle")
-check("IPC reopens a closed scratchpad once", 1, spawnCount())
+check("IPC reopens a closed companion once", 1, spawnCount())
 advance(1000)
 show(IDLE)
 mapped = true
@@ -906,14 +906,14 @@ for _, h in ipairs({ { "left", -1910 }, { "center", -1430 }, { "right", -950 } }
     onClick()
     check("launch horizontal placement: " .. h[1] .. "/" .. v[1], h[2], pad.at.x)
     check("launch vertical placement: " .. h[1] .. "/" .. v[1], v[2], pad.at.y)
-    check("placement targets only the scratchpad", 123, unrelated.at.x)
+    check("placement targets only the companion", 123, unrelated.at.x)
     check("placement does not spawn another session", 1, spawnCount())
     show(WORKING)
     update()
     calls = {}
     onIpc("toggle")
-    check("hiding does not reposition the scratchpad", 0, #callsOf("move"))
-    check("hiding does not resize the scratchpad", 0, #callsOf("resize"))
+    check("hiding does not reposition the companion", 0, #callsOf("move"))
+    check("hiding does not resize the companion", 0, #callsOf("resize"))
     check("hiding does not spawn", 0, spawnCount())
   end
 end
@@ -972,12 +972,12 @@ onClick()
 notifications, calls = {}, {}
 placementWindows = { pad, pad }
 onClick()
-check("ambiguous scratchpad windows are not repositioned", 0, #callsOf("move"))
+check("ambiguous companion windows are not repositioned", 0, #callsOf("move"))
 check("ambiguous placement is reported", 1, #notifications)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
 if failures > 0 then
-  error(("scratchpad harness FAILED: %d"):format(failures), 0)
+  error(("companion harness FAILED: %d"):format(failures), 0)
 end
-print(("scratchpad harness ok (%d ticks)"):format(updates))
+print(("companion harness ok (%d ticks)"):format(updates))

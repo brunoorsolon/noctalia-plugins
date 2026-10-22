@@ -3,7 +3,7 @@
 # stubbed hyprctl, so the status file to widget state mapping, the click routing
 # and the waiting notification are checked here rather than only on a host with
 # Noctalia, Hyprland and Pi. Not a plugin entry: plugin.toml never loads
-# scratchpad-harness.luau.
+# companion-harness.luau.
 #
 # Needs a Luau interpreter. Without one the check is skipped, not failed.
 set -euo pipefail
@@ -26,13 +26,13 @@ trap 'rm -rf "$work"' EXIT
 # table, the way a plugin runtime loads its entries.
 {
   printf 'SOURCES = {\n'
-  for entry in scratchpad icon; do
+  for entry in companion icon; do
     printf '%s = [==[\n' "$entry"
     cat "$entry.luau"
     printf '\n]==],\n'
   done
   printf '}\n'
-  cat scratchpad-harness.luau
+  cat companion-harness.luau
 } >"$work/run.luau"
 
 "$LUAU" "$work/run.luau"

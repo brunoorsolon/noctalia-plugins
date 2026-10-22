@@ -16,7 +16,7 @@ Or run:
 noctalia msg plugins source add magus git https://github.com/brunoorsolon/noctalia-plugins.git
 noctalia msg plugins enable magus/masked-wallpaper
 noctalia msg plugins enable magus/dictation
-noctalia msg plugins enable magus/pi-scratchpad
+noctalia msg plugins enable magus/pi-companion
 ```
 
 ## Plugins
@@ -25,7 +25,7 @@ noctalia msg plugins enable magus/pi-scratchpad
 | --- | --- |
 | [Masked Wallpaper Backdrop](masked-wallpaper/) | Keeps a blurred, tinted, decorated lockscreen backdrop in sync with the wallpaper. |
 | [Dictation](dictation/) | Records the microphone you choose and transcribes it with an installed recognition engine and GGUF model. |
-| [Pi Scratchpad](pi-scratchpad/) | Parks one long-lived Pi TUI in a Hyprland special workspace and shows whether it is working, waiting or idle. |
+| [Pi Companion](pi-companion/) | Your desktop agent companion, powered by [Pi](https://pi.dev). Keeps Pi one shortcut away and shows when it is working or needs you. |
 
 Each plugin documents its own requirements, setup, and usage in its directory.
 

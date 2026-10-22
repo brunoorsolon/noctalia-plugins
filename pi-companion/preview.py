@@ -163,7 +163,7 @@ with tempfile.TemporaryDirectory() as tmp:
 
 print('''<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
-<title>Pi Scratchpad · native-font review</title>
+<title>Pi Companion · native-font review</title>
 <style>
 :root { color-scheme: dark; font: 16px system-ui; background: #17151d; color: #efebf6; }
 body { max-width: 1000px; margin: 40px auto; padding: 0 24px; }
@@ -181,7 +181,7 @@ label { display: flex; align-items: center; gap: 8px; }
 .scaled { width: 25px; height: 25px; } .note { border-left: 3px solid #b08bf5; padding-left: 16px; }
 footer { margin-top: 24px; font-size: 14px; overflow-wrap: anywhere; }
 </style>
-<h1>Pi Scratchpad · native-font raster preview</h1>
+<h1>Pi Companion · native-font raster preview</h1>
 <p>Thick robot, thin π / heartbeat / bell, unchanged warning. These are Cairo-rendered Tabler glyphs, not idealized SVG squares.</p>
 <div class="controls">
 <label>Icon color <input id="color" type="color" value="#b08bf5"></label>
