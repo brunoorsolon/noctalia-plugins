@@ -261,6 +261,7 @@ local streamStarted = false
 local streamConnected = false
 local streamError = nil
 local streamFailureRevision = 0
+local streamRecoveryRevision = nil
 local refreshQueuedRecovery = nil
 local refresh
 
@@ -338,7 +339,9 @@ local function completeRefresh(results, recoveryRevision)
       status.phase = "error"
       status.busy = false
     else
-      if recoveryRevision == streamFailureRevision then streamError = nil end
+      if recoveryRevision ~= nil and recoveryRevision == streamFailureRevision then
+        streamError, streamRecoveryRevision = nil, nil
+      end
       applySnapshot(clients, monitors)
     end
   end
@@ -366,7 +369,7 @@ end
 
 local STREAM_DISCONNECTED = "__sidepad_stream_disconnected__"
 local STREAM_CONNECTED = "__sidepad_stream_connected__"
-local EVENT_STREAM_COMMAND = [[while true; do socat -d -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>&1 | while IFS= read -r line; do case "$line" in *" N successfully connected "*) printf '%s\n' '__sidepad_stream_connected__' ;; *) printf '%s\n' "$line" ;; esac; done; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
+local EVENT_STREAM_COMMAND = [[while true; do socat -d -d -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>&1 | while IFS= read -r line; do case "$line" in *" N successfully connected "*) printf '%s\n' '__sidepad_stream_connected__' ;; *) printf '%s\n' "$line" ;; esac; done; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
 
 local relevantEvents = {
   closewindow = true,
@@ -398,20 +401,22 @@ end
 local function onStreamLine(line)
   if line == STREAM_DISCONNECTED then
     streamConnected = false
+    streamRecoveryRevision = nil
     setStreamError("Hyprland event stream disconnected; reconnecting")
     return
   elseif line == STREAM_CONNECTED then
     if not streamConnected then
       streamConnected = true
-      refresh(streamError and streamFailureRevision or nil)
+      streamRecoveryRevision = streamError and streamFailureRevision or nil
+      refresh(streamRecoveryRevision)
     end
     return
   end
   local event = type(line) == "string" and line:match("^([%w_]+)>>")
   if event and relevantEvents[event] then
     streamConnected = true
-    streamError = nil
-    refresh()
+    streamRecoveryRevision = streamError and streamFailureRevision or nil
+    refresh(streamRecoveryRevision)
   end
 end
 
@@ -429,6 +434,9 @@ local function ensureEventStream()
 end
 
 refresh = function(recoveryRevision)
+  if recoveryRevision == nil and streamConnected and streamError then
+    recoveryRevision = streamRecoveryRevision
+  end
   if configurationError then
     status.error = configurationError
     status.phase = "error"

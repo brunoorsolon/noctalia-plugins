@@ -975,7 +975,7 @@ check("startup starts one event stream", 1, #streamCallbacks)
 checkTrue("event stream uses Hyprland's socket and reconnects", type(launches[1]) == "string"
   and launches[1]:find("while true", 1, true) ~= nil
   and launches[1]:find("__sidepad_stream_connected__", 1, true) ~= nil
-  and launches[1]:find("socat -d -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
+  and launches[1]:find("socat -d -d -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
 local streamCallback = streamCallbacks[1]
 local beforeStreamEvent = #compositorQueries
 streamCallback("openwindow>>0x1,terminal,1")
@@ -1030,6 +1030,14 @@ queryReplies.monitors.stdout = [=[[{"id":0,"name":"DP-1","specialWorkspace":{"id
 streamCallback("__sidepad_stream_connected__")
 check("a confirmed idle reconnect clears the disconnect error", nil, status().error)
 check("a confirmed reconnect refreshes current pad state", true, status().pads[1].running)
+streamCallback("__sidepad_stream_disconnected__")
+queryReplies.clients = { exitCode = 7, stdout = "", stderr = "" }
+streamCallback("__sidepad_stream_connected__")
+checkContains("failed recovery remains visible", "hyprctl -j clients failed (exit 7)", status().error)
+queryReplies.clients = { exitCode = 0, stdout = "[]", stderr = "" }
+onIpc("refresh")
+check("explicit retry completes recovery on the connected stream", nil, status().error)
+check("explicit retry returns the controller to ready", "ready", status().phase)
 queryReplies.clients.stdout = "[]"
 streamCallback("__sidepad_stream_disconnected__")
 streamCallback("__sidepad_stream_connected__")
