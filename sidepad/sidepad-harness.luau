@@ -511,7 +511,7 @@ onClick()
 check("a widget click takes the next nonce", 2, request().nonce)
 check("the widget's request names its action", "toggle", request().action)
 check("the controller answers the widget's request", before + 1, status().revision)
-check("a declared but unimplemented action is refused", "toggle is not available yet", status().error)
+checkContains("a stopped pad cannot yet be launched", "selected pad is not running", status().error)
 
 -- The panel runs in its own VM with its own module instance. The nonce still
 -- increases, because the controller owns it and no caller can allocate one.
@@ -559,7 +559,7 @@ check("a refused command does not publish a request", publishedNonce, request().
 before = status().revision
 onIpc("toggle")
 check("IPC answers through the same dispatch", before + 1, status().revision)
-check("IPC's answer matches the UI's answer", "toggle is not available yet", status().error)
+checkContains("IPC's answer matches the UI's answer", "selected pad is not running", status().error)
 onIpc("explode")
 check("IPC refuses a command outside the contract", "unknown action: explode", status().error)
 onIpc("select", "terminal")
@@ -630,7 +630,7 @@ check("visibility action follows the selected pad state", "hide", request().acti
 check("visibility request names its pad", "terminal", request().padId)
 -- The controller republishes an error for unsupported actions; failure keeps the panel open.
 check("failed actions do not dismiss the panel", 0, closedPanels)
-check("the panel displays the controller failure", true, hasText(lastTree, "hide is not available yet"))
+check("the panel displays the controller failure", true, hasText(lastTree, "selected pad is not running"))
 
 snapshot({
   busy = true,
@@ -864,6 +864,244 @@ local function startWith(padsJson, preferencesJson)
   loadEntry("service")
   return status()
 end
+
+-- Existing-window actions use a small compositor model. Execute the generated
+-- Lua expressions against dispatcher-shaped functions, then feed snapshots back
+-- through the real query interface; assertions below concern window outcomes.
+local originalRunAsync = noctalia.runAsync
+local focusedOutput = "DP-1"
+local outputs = {
+  { name = "DP-1", x = 0, y = 0, width = 1920, height = 1080 },
+  { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 },
+}
+local settings = { narrow_width = 900, wide_width = 1200, edge_gap = 10, top_gap = 100, bottom_gap = 100 }
+noctalia.outputs = function() return copy(outputs) end
+noctalia.focusedOutputName = function() return focusedOutput end
+noctalia.getConfig = function(key) return settings[key] end
+local windows, monitors, compositorFocus, focusedWindow
+local mutationFailure, mutationDeclined, deferMutation, pendingMutation
+local function modelSnapshots()
+  local function array(items)
+    local values = {}
+    for _, item in ipairs(items) do table.insert(values, encodeJson(item)) end
+    return "[" .. table.concat(values, ",") .. "]"
+  end
+  queryReplies.clients = { exitCode = 0, stdout = array(windows) }
+  queryReplies.monitors = { exitCode = 0, stdout = array(monitors) }
+end
+local function windowFor(selector)
+  for _, window in ipairs(windows) do
+    if "address:" .. window.address == selector then return window end
+  end
+  error("window not found")
+end
+local function monitorFor(name)
+  for _, monitor in ipairs(monitors) do if monitor.name == name then return monitor end end
+  error("output not found")
+end
+hl = { dsp = { window = {}, workspace = {} } }
+hl.dsp.focus = function(args)
+  return function()
+    if args.monitor then
+      compositorFocus = args.monitor
+    else
+      local window = windowFor(args.window)
+      if window.workspace.name:sub(1, 8) == "special:"
+        and monitorFor(compositorFocus).specialWorkspace.name ~= window.workspace.name then
+        hl.dsp.workspace.toggle_special(window.workspace.name:sub(9))()
+      end
+      focusedWindow = window.address
+    end
+  end
+end
+hl.dsp.workspace.toggle_special = function(name)
+  return function()
+    local target = monitorFor(compositorFocus)
+    local alreadyHere = target.specialWorkspace.name:gsub("^special:", "") == name
+    for _, monitor in ipairs(monitors) do
+      if monitor.specialWorkspace.name:gsub("^special:", "") == name then
+        monitor.specialWorkspace = { id = 0, name = "" }
+      end
+    end
+    if not alreadyHere then
+      target.specialWorkspace = { id = name == "noctalia-sidepad-terminal" and -99 or -98, name = "special:" .. name }
+      for _, window in ipairs(windows) do
+        if window.workspace.name == "special:" .. name then window.monitor = target.id end
+      end
+    end
+  end
+end
+hl.dsp.window.move = function(args)
+  return function()
+    local window = windowFor(args.window)
+    if args.workspace then
+      if window.workspace.name == args.workspace then return end
+      local owner = monitorFor(compositorFocus)
+      for _, monitor in ipairs(monitors) do
+        if monitor.specialWorkspace.name == args.workspace then owner = monitor; break end
+      end
+      window.workspace = { id = -99, name = args.workspace }
+      window.monitor = owner.id
+      -- Hyprland follows workspace moves unless follow=false is supplied.
+      if args.follow ~= false then
+        compositorFocus = owner.name
+        owner.specialWorkspace = { id = -99, name = args.workspace }
+        focusedWindow = window.address
+      end
+    else
+      check("move coordinates are absolute", false, args.relative)
+      window.x, window.y = args.x, args.y
+    end
+  end
+end
+hl.dsp.window.resize = function(args)
+  return function()
+    check("resize dimensions are absolute", false, args.relative)
+    local window = windowFor(args.window)
+    window.width, window.height = args.x, args.y
+  end
+end
+hl.dsp.window.float = function(args)
+  return function() windowFor(args.window).floating = args.action == "set" end
+end
+noctalia.runAsync = function(argv, callback)
+  if argv[2] ~= "dispatch" then return originalRunAsync(argv, callback) end
+  table.insert(launches, copy(argv))
+  if mutationDeclined then return false end
+  local function complete()
+    if mutationFailure then callback(copy(mutationFailure)); return end
+    assert(loadstring("return " .. argv[3]))()()
+    modelSnapshots()
+    callback({ exitCode = 0, stdout = "ok\n" })
+  end
+  if deferMutation then pendingMutation = complete else complete() end
+  return true
+end
+local function modelStart(preferences)
+  windows = {
+    { class = "noctalia-sidepad-terminal", address = "0x1", monitor = 0, workspace = { id = 1, name = "1" } },
+    { class = "unconfigured-app", address = "0x2", monitor = 1, workspace = { id = -98, name = "special:noctalia-sidepad-orphan" } },
+  }
+  monitors = {
+    { id = 0, name = "DP-1", specialWorkspace = { id = 0, name = "" } },
+    { id = 1, name = "DP-2", specialWorkspace = { id = -98, name = "special:noctalia-sidepad-orphan" } },
+  }
+  compositorFocus, focusedWindow = focusedOutput, nil
+  mutationFailure, mutationDeclined, deferMutation, pendingMutation = nil, false, false, nil
+  modelSnapshots()
+  startWith(VALID_PADS, preferences)
+end
+-- A different client can keep the selected pad's workspace on its old output
+-- while the unique selected window itself is on a normal workspace.
+modelStart()
+monitors[2].specialWorkspace = { id = -99, name = "special:noctalia-sidepad-terminal" }
+windows[2].workspace = { id = -99, name = "special:noctalia-sidepad-terminal" }
+modelSnapshots()
+onIpc("refresh")
+onIpc("show", "terminal")
+check("adoption does not follow a retained workspace to its old output", "DP-1", status().pads[1].output)
+check("adoption focuses the unique selected window", "0x1", focusedWindow)
+check("adoption leaves no old-output pad visible", 0, monitors[2].specialWorkspace.id)
+modelStart()
+serviceShared.request("show", "terminal")
+check("show hides an unconfigured reserved workspace on another output", 0, monitors[2].specialWorkspace.id)
+check("show makes selected workspace visible", "special:noctalia-sidepad-terminal", monitors[1].specialWorkspace.name)
+check("show adopts the unique address and focuses it", "0x1", focusedWindow)
+check("show floats the selected window", true, windows[1].floating)
+check("default left placement", 10, windows[1].x)
+check("default top placement", 100, windows[1].y)
+check("configured width", 900, windows[1].width)
+check("height excludes both gaps", 880, windows[1].height)
+check("published visible state comes from final snapshot", true, status().pads[1].visible)
+windows[1].floating, windows[1].x = false, 500
+onIpc("show", "terminal")
+check("repeated show reapplies floating", true, windows[1].floating)
+check("repeated show reapplies geometry", 10, windows[1].x)
+check("repeated show does not toggle a visible pad off", true, status().pads[1].visible)
+focusedOutput = "DP-2"
+onIpc("show", "terminal")
+check("show follows newly focused output", "DP-2", status().pads[1].output)
+check("show removes old output visibility", 0, monitors[1].specialWorkspace.id)
+check("negative output x is preserved", -1270, windows[1].x)
+check("negative output y is preserved", -100, windows[1].y)
+check("second output height", 520, windows[1].height)
+-- Hide uses the pad's output, not the newly focused output or another workspace.
+focusedOutput = "DP-1"
+monitors[1].specialWorkspace = { id = -97, name = "special:unrelated" }
+modelSnapshots()
+onIpc("toggle")
+check("toggle hides the selected workspace on its actual output", false, status().pads[1].visible)
+check("hide leaves unrelated visibility untouched", "special:unrelated", monitors[1].specialWorkspace.name)
+check("hide preserves the application window", 2, #windows)
+check("hide publishes the surviving application", true, status().pads[1].running)
+onIpc("toggle")
+check("next toggle shows again", true, status().pads[1].visible)
+check("show never writes runtime or focus files", 0, #writes)
+check("show leaves selection unchanged", "terminal", status().selectedPadId)
+-- Right placement comes from the durable preference, not a new side action.
+focusedOutput = "DP-2"
+modelStart([[{"selectedPadId":"terminal","side":"right"}]])
+onIpc("show", "terminal")
+check("right edge on a negative output", -910, windows[1].x)
+outputs[2] = { name = "DP-2", x = -50, y = -40, width = 5, height = 3 }
+onIpc("show", "terminal")
+check("tiny output clamps width", 1, windows[1].width)
+check("tiny output clamps height", 1, windows[1].height)
+checkTrue("tiny output contains horizontal bounds", windows[1].x >= -50 and windows[1].x + windows[1].width <= -45)
+checkTrue("tiny output contains vertical bounds", windows[1].y >= -40 and windows[1].y + windows[1].height <= -37)
+for _, invalid in ipairs({ {}, { width = 0 }, { width = 0/0 }, { height = math.huge }, { x = false } }) do
+  outputs[2] = { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 }
+  if next(invalid) == nil then outputs[2] = nil else for key, value in pairs(invalid) do outputs[2][key] = value end end
+  local count = nonQueryLaunchCount()
+  onIpc("show", "terminal")
+  checkContains("invalid output produces recoverable geometry error", "invalid focused-output geometry", status().error)
+  check("invalid output performs no mutation", count, nonQueryLaunchCount())
+  check("invalid output clears busy", false, status().busy)
+end
+outputs[2] = { name = "DP-2", x = -1280, y = -200, width = 1280, height = 720 }
+onIpc("show", "terminal")
+check("valid geometry recovers on the next show", nil, status().error)
+for _, failure in ipairs({
+  { declined = true }, { result = { exitCode = 4 } },
+  { result = { exitCode = 0, timedOut = true } },
+  { result = { exitCode = 0, stdoutTruncated = true } },
+  { result = { exitCode = 0, stderrTruncated = true } },
+  { result = { exitCode = 0, stdout = "error: dispatcher rejected" } },
+}) do
+  mutationDeclined, mutationFailure = failure.declined, failure.result
+  local previous = #notifications
+  onIpc("hide", "terminal")
+  checkTrue("mutation failure is actionable", type(status().error) == "string")
+  check("mutation failure clears busy", false, status().busy)
+  check("mutation failure notifies once", previous + 1, #notifications)
+  check("mutation failure reconciles actual visibility", true, status().pads[1].visible)
+  mutationDeclined, mutationFailure = false, nil
+  onIpc("show", "terminal")
+  check("next action recovers after mutation failure", nil, status().error)
+end
+deferMutation = true
+onIpc("show", "terminal")
+check("mutation remains busy while a command is pending", true, status().busy)
+local commandCount = nonQueryLaunchCount()
+onIpc("hide", "terminal")
+onIpc("close", "terminal")
+check("hide and close cannot interrupt a pending show", commandCount, nonQueryLaunchCount())
+streamCallbacks[1]("activespecial>>noctalia-sidepad-terminal,DP-2")
+check("events cannot interrupt mutation busy state", true, status().busy)
+deferMutation = false
+pendingMutation()
+check("mutation and queued reconciliation finish", false, status().busy)
+check("successful actions keep one client per application", 2, #windows)
+windows[#windows + 1] = copy(windows[1])
+windows[#windows].address = "0x3"
+modelSnapshots()
+onIpc("refresh")
+local beforeDuplicate = nonQueryLaunchCount()
+onIpc("show", "terminal")
+checkContains("duplicate selected windows are refused", "unique valid window address", status().error)
+check("duplicates cannot cause any mutation", beforeDuplicate, nonQueryLaunchCount())
+noctalia.runAsync = originalRunAsync
+queryReplies = { clients = { exitCode = 0, stdout = "[]" }, monitors = { exitCode = 0, stdout = "[]" } }
 
 -- An active asynchronous operation owns busy state. A second IPC action is
 -- rejected before it starts another command; failed refreshes retain the last
@@ -1544,8 +1782,10 @@ onIpc("close", "terminal")
 check("pending close owns busy", true, status().busy)
 onIpc("close", "terminal")
 serviceShared.request("close", "terminal")
+onIpc("hide", "terminal")
+serviceShared.request("show", "terminal")
 streamCallbacks[1]("openwindow>>0xd4")
-check("overlapping close requests start only one command", 1, nonQueryLaunchCount())
+check("close, hide and show cannot interrupt a pending close", 1, nonQueryLaunchCount())
 check("event during close does not release busy", true, status().busy)
 pendingClose()
 check("close completes after queued compositor event", false, status().busy)

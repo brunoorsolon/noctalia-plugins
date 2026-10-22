@@ -1,6 +1,6 @@
--- Controller entry: configuration, durable preferences and observational
--- compositor reconciliation. Selection/show and side reposition remain separate
--- actions; their preference changes go through setPreferences below.
+-- The controller owns configuration, reconciliation and serialized actions.
+-- Existing windows are shown/hidden here; launching and other actions are
+-- refused until their own slices implement them.
 
 local shared = require("./shared.luau")
 
@@ -317,11 +317,14 @@ local streamError = nil
 local streamFailureRevision = 0
 local streamRecoveryRevision = nil
 local refreshQueuedRecovery = nil
-local refreshDone = nil
 local closeOperation = nil
 local refresh
+local operationActive = false
+local refreshContinuation = nil
+local snapshotMonitors = {}
 
 local function applySnapshot(clients, monitors)
+  snapshotMonitors = monitors
   local activeWorkspaces, monitorNames = {}, {}
   for _, monitor in ipairs(monitors) do
     monitorNames[monitor.id] = monitor.name
@@ -411,12 +414,12 @@ local function completeRefresh(results, recoveryRevision)
   end
   refreshNotifiesOnFailure = false
   refreshing = false
-  status.busy = closeOperation ~= nil
-  local done = refreshDone
-  refreshDone = nil
+  status.busy = operationActive
+  local continuation = refreshContinuation
+  refreshContinuation = nil
   publish()
-  if done then done(failure, clients) end
-  if refreshQueued and not closeOperation then
+  if continuation then continuation(failure, clients) end
+  if refreshQueued and not operationActive and not refreshing then
     local recovery = refreshQueuedRecovery
     refreshQueued, refreshQueuedRecovery = false, nil
     refresh(recovery)
@@ -502,14 +505,9 @@ local function ensureEventStream()
   streamStarted = true
 end
 
-refresh = function(explicitAction, recoveryRevision, onDone)
+refresh = function(explicitAction, recoveryRevision, continuation)
   if type(explicitAction) ~= "boolean" then
     recoveryRevision, explicitAction = explicitAction, false
-  end
-  if closeOperation and not onDone then
-    refreshQueued = true
-    if recoveryRevision then refreshQueuedRecovery = recoveryRevision end
-    return
   end
   if recoveryRevision == nil and streamConnected and streamError then
     recoveryRevision = streamRecoveryRevision
@@ -517,16 +515,16 @@ refresh = function(explicitAction, recoveryRevision, onDone)
   if configurationError then
     status.error = configurationError
     status.phase = "error"
-    status.busy = false
+    status.busy = operationActive
     publish()
     if explicitAction then
       noctalia.notifyError(configurationError)
     end
-    if onDone then onDone(configurationError) end
+    if continuation then continuation(configurationError) end
     return
   end
   ensureEventStream()
-  if refreshing then
+  if refreshing or (operationActive and not continuation) then
     refreshQueued = true
     if recoveryRevision then refreshQueuedRecovery = recoveryRevision end
     return
@@ -534,15 +532,15 @@ refresh = function(explicitAction, recoveryRevision, onDone)
   if not noctalia.commandExists("hyprctl") then
     status.error = "hyprctl was not found in PATH"
     status.phase = "error"
-    status.busy = false
+    status.busy = operationActive
     publish()
     if explicitAction then
       noctalia.notifyError(status.error)
     end
-    if onDone then onDone(status.error) end
+    if continuation then continuation(status.error) end
     return
   end
-  refreshDone = onDone
+  refreshContinuation = continuation
   refreshNotifiesOnFailure = explicitAction == true
   refreshing = true
   status.phase = hasSnapshot and "refreshing" or "starting"
@@ -566,6 +564,7 @@ end
 -- A confirmation dialog or refusal gets a bounded wait, never another close.
 local function finishClose(failure)
   closeOperation = nil
+  operationActive = false
   status.busy = false
   if failure then
     status.error, status.phase = failure, "error"
@@ -594,6 +593,7 @@ local function verifyClose(failure, clients)
 end
 
 local function closePad(pad)
+  operationActive = true
   closeOperation = { pad = pad, stage = "lookup" }
   refresh(false, nil, function(failure)
     if failure then return finishClose(failure) end
@@ -636,6 +636,118 @@ function update()
     closeOperation.stage = "verify"
     refresh(false, nil, verifyClose)
   end
+end
+
+local function finite(value)
+  return type(value) == "number" and value == value and math.abs(value) < math.huge
+end
+
+local function placement()
+  local name = noctalia.focusedOutputName()
+  local output = nil
+  for _, candidate in ipairs(noctalia.outputs()) do
+    if candidate.name == name then output = candidate; break end
+  end
+  if not output or not finite(output.x) or not finite(output.y)
+    or not finite(output.width) or not finite(output.height) or output.width < 1 or output.height < 1 then
+    return nil, "invalid focused-output geometry; check the focused output and retry"
+  end
+  local width = noctalia.getConfig(status.widthMode == "wide" and "wide_width" or "narrow_width")
+  local edge = noctalia.getConfig("edge_gap")
+  local top = noctalia.getConfig("top_gap")
+  local bottom = noctalia.getConfig("bottom_gap")
+  if not finite(width) or width < 1 or not finite(edge) or edge < 0
+    or not finite(top) or top < 0 or not finite(bottom) or bottom < 0 then
+    return nil, "invalid placement settings; check widths and gaps and retry"
+  end
+  edge = math.min(edge, output.width - 1)
+  top = math.min(top, output.height - 1)
+  width = math.min(width, output.width - edge)
+  local height = math.max(1, output.height - top - bottom)
+  local x = status.side == "right" and output.x + output.width - width - edge or output.x + edge
+  return { name = name, x = x, y = output.y + top, width = width, height = height }
+end
+
+local function specialName(monitor)
+  return monitor.specialWorkspace.name:gsub("^special:", "")
+end
+
+local function visibilityAction(action)
+  operationActive = true
+  -- Reconcile before using addresses or toggling visibility, not just after:
+  -- events may still be queued when the user clicks.
+  refresh(false, nil, function(snapshotFailure)
+    local function finish(operationFailure)
+      refresh(false, nil, function(refreshFailure)
+        operationActive = false
+        status.busy = false
+        status.error = operationFailure or refreshFailure or status.error
+        status.phase = status.error and "error" or "ready"
+        publish()
+        if operationFailure or refreshFailure then noctalia.notifyError(status.error) end
+      end)
+    end
+    if snapshotFailure then finish(snapshotFailure); return end
+    local pad = shared.selectedPad(status)
+    if not pad or not pad.running then
+      finish("selected pad is not running; start its application and retry")
+      return
+    end
+    if not pad.address or not pad.address:match("^0x%x+$") then
+      finish("selected pad has no unique valid window address; resolve duplicate windows and retry")
+      return
+    end
+    local name = pad.workspace:sub(9)
+    local visibleOn = nil
+    for _, monitor in ipairs(snapshotMonitors) do
+      if monitor.specialWorkspace.id ~= 0 and specialName(monitor) == name then visibleOn = monitor.name end
+    end
+    local hide = action == "hide" or (action == "toggle" and visibleOn ~= nil)
+    local commands = {}
+    local function add(expression) table.insert(commands, expression) end
+    local function focusMonitor(output) add(("hl.dsp.focus({monitor=%q})"):format(output)) end
+    local function toggle(workspace) add(("hl.dsp.workspace.toggle_special(%q)"):format(workspace)) end
+    if hide then
+      if visibleOn then
+        focusMonitor(visibleOn)
+        toggle(name)
+      end
+    else
+      local geometry, problem = placement()
+      if not geometry then finish(problem); return end
+      for _, monitor in ipairs(snapshotMonitors) do
+        local other = specialName(monitor)
+        if monitor.specialWorkspace.id ~= 0 and other ~= name and other:sub(1, 17) == "noctalia-sidepad-" then
+          focusMonitor(monitor.name)
+          toggle(other)
+        end
+      end
+      focusMonitor(geometry.name)
+      local window = ("address:%s"):format(pad.address)
+      add(("hl.dsp.window.move({window=%q,workspace=%q,follow=false})"):format(window, pad.workspace))
+      if visibleOn ~= geometry.name then toggle(name) end
+      add(("hl.dsp.window.float({window=%q,action='set'})"):format(window))
+      add(("hl.dsp.window.resize({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.width, geometry.height))
+      add(("hl.dsp.window.move({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.x, geometry.y))
+      add(("hl.dsp.focus({window=%q})"):format(window))
+    end
+    local function run(index)
+      local expression = commands[index]
+      if not expression then finish(); return end
+      local completed = false
+      local function done(result)
+        if completed then return end
+        completed = true
+        local failure = commandFailure("hyprctl dispatch " .. expression, result)
+        if not failure and (type(result.stdout) ~= "string" or noctalia.string.trim(result.stdout) ~= "ok") then
+          failure = "hyprctl rejected " .. expression .. "; check the Hyprland Lua dispatcher support and retry"
+        end
+        if failure then finish(failure) else run(index + 1) end
+      end
+      if noctalia.runAsync({ "hyprctl", "dispatch", expression }, done) == false then done(nil) end
+    end
+    run(1)
+  end)
 end
 
 -- The one action path: the request watcher below and onIpc both land here.
@@ -683,6 +795,18 @@ local function dispatch(action, padId)
     for _, pad in ipairs(status.pads) do
       if pad.id == padId then closePad(pad); return end
     end
+  end
+  if action == "toggle" or action == "show" or action == "hide" then
+    if padId ~= nil and padId ~= status.selectedPadId then
+      refuse("action requires the selected pad", true)
+      return
+    end
+    if not shared.selectedPad(status) or not shared.selectedPad(status).running then
+      refuse("selected pad is not running; start its application and retry", true)
+      return
+    end
+    visibilityAction(action)
+    return
   end
   -- Other actions belong to later slices and must not imply work they cannot do.
   refuse(action .. " is not available yet", true)
