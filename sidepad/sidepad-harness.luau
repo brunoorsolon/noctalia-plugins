@@ -974,8 +974,8 @@ check("refresh and reconciliation remain observational", 0, nonQueryLaunchCount(
 check("startup starts one event stream", 1, #streamCallbacks)
 checkTrue("event stream uses Hyprland's socket and reconnects", type(launches[1]) == "string"
   and launches[1]:find("while true", 1, true) ~= nil
-  and launches[1]:find("__sidepad_stream_reconnecting__", 1, true) ~= nil
-  and launches[1]:find("socat -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
+  and launches[1]:find("__sidepad_stream_connected__", 1, true) ~= nil
+  and launches[1]:find("socat -d -U - UNIX-CONNECT:\"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock\"", 1, true) ~= nil)
 local streamCallback = streamCallbacks[1]
 local beforeStreamEvent = #compositorQueries
 streamCallback("openwindow>>0x1,terminal,1")
@@ -1018,10 +1018,22 @@ deferQueries = false
 streamCallback("__sidepad_stream_disconnected__")
 checkContains("stream disconnect is visible in status", "event stream disconnected", status().error)
 check("background stream failures do not notify", 0, #notifications)
+deferQueries = true
+onIpc("refresh")
+streamCallback("__sidepad_stream_disconnected__")
+finishQuery("clients")
+finishQuery("monitors")
+checkContains("an older successful query cannot hide a newer disconnect", "event stream disconnected", status().error)
+deferQueries = false
+queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":1,"name":"1"}}]]=]
+queryReplies.monitors.stdout = [=[[{"id":0,"name":"DP-1","specialWorkspace":{"id":0,"name":""}}]]=]
+streamCallback("__sidepad_stream_connected__")
+check("a confirmed idle reconnect clears the disconnect error", nil, status().error)
+check("a confirmed reconnect refreshes current pad state", true, status().pads[1].running)
 queryReplies.clients.stdout = "[]"
-streamCallback("__sidepad_stream_reconnecting__")
+streamCallback("__sidepad_stream_disconnected__")
+streamCallback("__sidepad_stream_connected__")
 check("an idle reconnect refreshes missed application exits", false, status().pads[1].running)
-check("a successful reconnect refresh clears the stream failure", nil, status().error)
 check("reconnected stream state is ready", "ready", status().phase)
 
 queryReplies.clients.stdout = [=[[{"class":"noctalia-sidepad-terminal","address":"0x1","monitor":0,"workspace":{"id":7,"name":"7"}}]]=]
@@ -1044,7 +1056,8 @@ check("missing socat does not suppress snapshot refresh", 2, #compositorQueries)
 absentCommands.socat = nil
 onIpc("refresh")
 check("refresh retries and starts a recovered event stream", 1, #streamCallbacks)
-check("refresh recovers from missing socat", nil, status().error)
+streamCallbacks[1]("__sidepad_stream_connected__")
+check("a confirmed connection recovers missing-socat status", nil, status().error)
 
 streamAccepted = false
 local declinedStream = startWith(VALID_PADS)
@@ -1052,7 +1065,8 @@ checkContains("a rejected event stream is recoverable", "event stream could not 
 streamAccepted = true
 onIpc("refresh")
 check("a later refresh retries a rejected event stream", 2, #streamCallbacks)
-check("a later refresh clears the rejected-stream error", nil, status().error)
+streamCallbacks[2]("__sidepad_stream_connected__")
+check("a confirmed connection clears the rejected-stream error", nil, status().error)
 
 -- No file at all: the message has to say where the file belongs and what to do.
 local missing = startWith(nil)

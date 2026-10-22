@@ -258,7 +258,10 @@ local refreshing = false
 local refreshQueued = false
 local configurationError = nil
 local streamStarted = false
+local streamConnected = false
 local streamError = nil
+local streamFailureRevision = 0
+local refreshQueuedRecovery = nil
 local refresh
 
 local function applySnapshot(clients, monitors)
@@ -320,7 +323,7 @@ local function commandFailure(command, result)
   return nil
 end
 
-local function completeRefresh(results)
+local function completeRefresh(results, recoveryRevision)
   local failure = commandFailure("hyprctl -j clients", results.clients)
     or commandFailure("hyprctl -j monitors", results.monitors)
   if failure then
@@ -335,15 +338,16 @@ local function completeRefresh(results)
       status.phase = "error"
       status.busy = false
     else
-      if streamStarted then streamError = nil end
+      if recoveryRevision == streamFailureRevision then streamError = nil end
       applySnapshot(clients, monitors)
     end
   end
   refreshing = false
   publish()
   if refreshQueued then
-    refreshQueued = false
-    refresh()
+    local recovery = refreshQueuedRecovery
+    refreshQueued, refreshQueuedRecovery = false, nil
+    refresh(recovery)
   end
 end
 
@@ -361,8 +365,8 @@ local function query(command, callback)
 end
 
 local STREAM_DISCONNECTED = "__sidepad_stream_disconnected__"
-local STREAM_RECONNECTING = "__sidepad_stream_reconnecting__"
-local EVENT_STREAM_COMMAND = [[first=1; while true; do if [ "$first" -eq 0 ]; then printf '%s\n' '__sidepad_stream_reconnecting__'; fi; first=0; socat -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>/dev/null; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
+local STREAM_CONNECTED = "__sidepad_stream_connected__"
+local EVENT_STREAM_COMMAND = [[while true; do socat -d -U - UNIX-CONNECT:"$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/.socket2.sock" 2>&1 | while IFS= read -r line; do case "$line" in *" N successfully connected "*) printf '%s\n' '__sidepad_stream_connected__' ;; *) printf '%s\n' "$line" ;; esac; done; printf '%s\n' '__sidepad_stream_disconnected__'; sleep 1; done]]
 
 local relevantEvents = {
   closewindow = true,
@@ -383,6 +387,7 @@ local relevantEvents = {
 }
 
 local function setStreamError(message)
+  streamFailureRevision = streamFailureRevision + 1
   if streamError == message then return end
   streamError = message
   status.error = message
@@ -392,14 +397,19 @@ end
 
 local function onStreamLine(line)
   if line == STREAM_DISCONNECTED then
+    streamConnected = false
     setStreamError("Hyprland event stream disconnected; reconnecting")
     return
-  elseif line == STREAM_RECONNECTING then
-    refresh()
+  elseif line == STREAM_CONNECTED then
+    if not streamConnected then
+      streamConnected = true
+      refresh(streamError and streamFailureRevision or nil)
+    end
     return
   end
   local event = type(line) == "string" and line:match("^([%w_]+)>>")
   if event and relevantEvents[event] then
+    streamConnected = true
     streamError = nil
     refresh()
   end
@@ -416,10 +426,9 @@ local function ensureEventStream()
     return
   end
   streamStarted = true
-  streamError = nil
 end
 
-refresh = function()
+refresh = function(recoveryRevision)
   if configurationError then
     status.error = configurationError
     status.phase = "error"
@@ -430,6 +439,7 @@ refresh = function()
   ensureEventStream()
   if refreshing then
     refreshQueued = true
+    if recoveryRevision then refreshQueuedRecovery = recoveryRevision end
     return
   end
   if not noctalia.commandExists("hyprctl") then
@@ -448,7 +458,7 @@ refresh = function()
     results[key] = result
     remaining = remaining - 1
     if remaining == 0 then
-      completeRefresh(results)
+      completeRefresh(results, recoveryRevision)
     end
   end
   -- Both queries belong to this refresh cycle; neither is inferred from the
