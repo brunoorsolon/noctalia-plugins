@@ -12,7 +12,13 @@
       "id": "browser",
       "name": "Browser",
       "class": "noctalia-sidepad-browser",
-      "command": ["firefox", "--class", "noctalia-sidepad-browser"]
+      "command": ["firefox", "--no-remote", "--profile", "/ABSOLUTE/PATH/TO/sidepad-data/firefox", "--name", "noctalia-sidepad-browser", "--class", "noctalia-sidepad-browser"]
+    },
+    {
+      "id": "code",
+      "name": "VS Code",
+      "class": "noctalia-sidepad-code",
+      "command": ["code", "--new-window", "--user-data-dir", "/ABSOLUTE/PATH/TO/sidepad-data/code", "--class", "noctalia-sidepad-code", "--ozone-platform=wayland"]
     }
   ]
 }
