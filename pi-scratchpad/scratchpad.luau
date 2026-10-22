@@ -201,6 +201,36 @@ local function dispatch(expression, onDone)
   return accepted
 end
 
+-- Run placement in the same compositor dispatch as reveal: no stale monitor or
+-- window snapshot can move another window after focus changes.
+local function revealExpression(action)
+  local horizontal = ({ left = 0, center = 0.5, right = 1 })[text("horizontal_alignment", "center")] or 0.5
+  local vertical = ({ top = 0, center = 0.5, bottom = 1 })[text("vertical_alignment", "center")] or 0.5
+  local width, height = geometry()
+  return ([=[function()
+    local result = hl.dispatch(%s)
+    if not result.ok then return result end
+    local monitor = hl.get_active_monitor()
+    local special = monitor and monitor.active_special_workspace
+    if not special or special.name ~= %s then return result end
+    local windows = hl.get_windows({ workspace = special, floating = true })
+    if #windows ~= 1 then error("Expected one floating scratchpad window for placement") end
+    local window = windows[1]
+    local mw, mh = monitor.width, monitor.height
+    if monitor.transform %% 2 == 1 then mw, mh = mh, mw end
+    -- Hyprland 0.55 does not expose reserved edges through its Lua API.
+    local edges = monitor.reserved or { left = 0, right = 0, top = 0, bottom = 0 }
+    local width = math.max(1, math.floor(mw / monitor.scale - edges.left - edges.right))
+    local height = math.max(1, math.floor(mh / monitor.scale - edges.top - edges.bottom))
+    result = hl.dispatch(hl.dsp.window.resize({ window = window,
+      x = math.min(%s, width), y = math.min(%s, height) }))
+    if not result.ok then return result end
+    return hl.dispatch(hl.dsp.window.move({ window = window,
+      x = monitor.x + edges.left + math.floor(math.max(0, width - window.size.x) * %s),
+      y = monitor.y + edges.top + math.floor(math.max(0, height - window.size.y) * %s) }))
+  end]=]):format(action, luaQuote("special:" .. workspace()), width, height, horizontal, vertical)
+end
+
 local function compositor(op, onDone)
   local done = onDone or function() end
 
@@ -244,12 +274,12 @@ local function compositor(op, onDone)
   end
 
   if op == "show" then
-    return dispatch("hl.dsp.focus({ workspace = " .. luaQuote("special:" .. workspace()) .. " })", done)
+    return dispatch(revealExpression("hl.dsp.focus({ workspace = " .. luaQuote("special:" .. workspace()) .. " })"), done)
   end
 
   -- toggle_special takes the bare name: it prefixes "special:" itself.
   if op == "toggle" then
-    return dispatch("hl.dsp.workspace.toggle_special(" .. luaQuote(workspace()) .. ")", done)
+    return dispatch(revealExpression("hl.dsp.workspace.toggle_special(" .. luaQuote(workspace()) .. ")"), done)
   end
 
   -- "spawn". exec_cmd runs the command through /bin/sh and its rule table is the
