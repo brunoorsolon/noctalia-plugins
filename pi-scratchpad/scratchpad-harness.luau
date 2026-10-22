@@ -65,6 +65,10 @@ local deferredClients = nil
 local simulateWindows = false
 local mapOnExec = false
 local mapOnMonitorReply = false
+local placementMonitor = nil
+local shownMonitor = nil
+local placementWindows = {}
+local failWindowAction = nil
 
 -- What the compositor would answer for `hyprctl -j monitors`: one monitor whose
 -- specialWorkspace carries the workspace name while it is showing.
@@ -129,8 +133,18 @@ function noctalia.notify(title, body) table.insert(notifications, { title = titl
 -- answers the way a real rejection does instead.
 hl = {
   dispatch = function(dispatcher)
+    if type(dispatcher) == "function" then
+      local ok, result = pcall(dispatcher)
+      return ok and (result or { ok = true }) or { ok = false, error = tostring(result) }
+    end
     assert(type(dispatcher) == "table", "hl.dispatch needs a dispatcher table")
     table.insert(calls, dispatcher)
+    if dispatcher.kind == failWindowAction then return { ok = false, error = "Window action failed" } end
+    if dispatcher.kind == "resize" then
+      dispatcher.window.size = { x = dispatcher.x, y = dispatcher.y }
+    elseif dispatcher.kind == "move" then
+      dispatcher.window.at = { x = dispatcher.x, y = dispatcher.y }
+    end
     if simulateWindows then
       if dispatcher.kind == "exec_cmd" then
         mapped = mapOnExec
@@ -138,11 +152,34 @@ hl = {
       elseif dispatcher.kind == "focus" then
         visible = true
       elseif dispatcher.kind == "toggle_special" then
-        visible = not visible
+        visible = not visible or (placementMonitor ~= nil and shownMonitor ~= placementMonitor)
+      end
+      if placementMonitor and (dispatcher.kind == "focus" or dispatcher.kind == "toggle_special") then
+        shownMonitor = visible and placementMonitor or nil
       end
     end
+    return { ok = true }
+  end,
+  get_active_monitor = function()
+    if placementMonitor then
+      placementMonitor.active_special_workspace = visible and shownMonitor == placementMonitor and { name = "special:" .. CONFIG.workspace:gsub("^special:", "") } or nil
+    end
+    return placementMonitor
+  end,
+  get_windows = function(query)
+    local found = {}
+    for _, window in ipairs(placementWindows) do
+      if window.mapped and window.floating == query.floating and window.workspace == query.workspace.name then
+        table.insert(found, window)
+      end
+    end
+    return found
   end,
   dsp = {
+    window = {
+      resize = function(options) options.kind = "resize"; return options end,
+      move = function(options) options.kind = "move"; return options end,
+    },
     focus = function(options)
       return { kind = "focus", name = options.workspace }
     end,
@@ -202,8 +239,8 @@ function noctalia.runAsync(argv, onResult)
     else
       local chunk, err = loadstring("return hl.dispatch(" .. argv[3] .. ")")
       assert(chunk, "the dispatch argument is not a valid Lua expression: " .. tostring(err))
-      chunk()
-      result.stdout = "ok\n"
+      local dispatched = chunk()
+      result.stdout = dispatched.ok and "ok\n" or ("error: " .. dispatched.error)
     end
   end
   if type(onResult) == "function" then onResult(result) end
@@ -851,6 +888,92 @@ mapped = true
 show(IDLE)
 update()
 check("the current request still completes after a stale callback", 1, #callsOf("focus"))
+
+-- ── Placement through the actual click / IPC boundary ────────────────────────
+
+simulateWindows, mapOnExec = true, true
+placementMonitor = { width = 1920, height = 1080, scale = 1, transform = 0, x = -1920, y = 120,
+  reserved = { left = 10, right = 50, top = 20, bottom = 20 } }
+local pad = { mapped = true, floating = true, workspace = "special:pi", size = { x = 900, y = 600 } }
+local unrelated = { mapped = true, floating = true, workspace = "1", at = { x = 123, y = 456 } }
+placementWindows = { unrelated, pad }
+for _, h in ipairs({ { "left", -1910 }, { "center", -1430 }, { "right", -950 } }) do
+  for _, v in ipairs({ { "top", 140 }, { "center", 360 }, { "bottom", 580 } }) do
+    CONFIG.horizontal_alignment, CONFIG.vertical_alignment = h[1], v[1]
+    show(nil)
+    advance(60000)
+    calls = {}
+    onClick()
+    check("launch horizontal placement: " .. h[1] .. "/" .. v[1], h[2], pad.at.x)
+    check("launch vertical placement: " .. h[1] .. "/" .. v[1], v[2], pad.at.y)
+    check("placement targets only the scratchpad", 123, unrelated.at.x)
+    check("placement does not spawn another session", 1, spawnCount())
+    show(WORKING)
+    update()
+    calls = {}
+    onIpc("toggle")
+    check("hiding does not reposition the scratchpad", 0, #callsOf("move"))
+    check("hiding does not resize the scratchpad", 0, #callsOf("resize"))
+    check("hiding does not spawn", 0, spawnCount())
+  end
+end
+
+-- Existing session crosses to a smaller, scaled, rotated output. The configured
+-- size is capped there, then restored when returning to the larger output.
+placementMonitor = { width = 1800, height = 1200, scale = 1.5, transform = 1, x = 2560, y = -200,
+  reserved = { left = 20, right = 20, top = 40, bottom = 10 } }
+calls = {}
+onIpc("toggle")
+check("a scaled portrait output caps width in logical pixels", 760, pad.size.x)
+check("a scaled portrait output preserves a height that fits", 600, pad.size.y)
+check("right alignment uses the new monitor origin and reservations", 2580, pad.at.x)
+check("bottom alignment uses rotated logical height", 390, pad.at.y)
+check("monitor transfer reuses the session", 0, spawnCount())
+-- Transfer while still visible on the old output, not just hide then show.
+placementMonitor = { width = 2560, height = 1440, scale = 1, transform = 0, x = 0, y = 0 }
+CONFIG.horizontal_alignment, CONFIG.vertical_alignment = nil, nil
+onIpc("toggle")
+check("returning to a large output restores configured width", 900, pad.size.x)
+check("missing horizontal setting defaults to center", 830, pad.at.x)
+check("missing vertical setting defaults to center (0.55 without reserved)", 420, pad.at.y)
+onIpc("toggle")
+CONFIG.horizontal_alignment, CONFIG.vertical_alignment = 'right\"); error("injected")', false
+onClick()
+check("invalid horizontal setting safely defaults to center", 830, pad.at.x)
+check("invalid vertical setting safely defaults to center", 420, pad.at.y)
+onClick()
+placementMonitor.width, placementMonitor.height = 640, 480
+onClick()
+check("small output caps window height", 480, pad.size.y)
+check("small output caps window width", 640, pad.size.x)
+check("oversized centered window stays at the visible left edge", 0, pad.at.x)
+check("oversized centered window stays at the visible top edge", 0, pad.at.y)
+onClick()
+
+calls, notifications = {}, {}
+dispatchReplies = { { exitCode = 0, stdout = "error: Toggle refused" } }
+onClick()
+check("a rejected reveal cannot reposition", 0, #callsOf("move"))
+check("a rejected reveal cannot resize", 0, #callsOf("resize"))
+check("reveal failure is reported", 1, #notifications)
+notifications = {}
+failWindowAction = "resize"
+onClick()
+check("resize refusal is reported", 1, #notifications)
+check("resize refusal prevents a subsequent move", 0, #callsOf("move"))
+failWindowAction = nil
+onClick()
+notifications = {}
+failWindowAction = "move"
+onClick()
+check("move refusal is reported", 1, #notifications)
+failWindowAction = nil
+onClick()
+notifications, calls = {}, {}
+placementWindows = { pad, pad }
+onClick()
+check("ambiguous scratchpad windows are not repositioned", 0, #callsOf("move"))
+check("ambiguous placement is reported", 1, #notifications)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

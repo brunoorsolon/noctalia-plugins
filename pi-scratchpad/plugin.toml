@@ -1,6 +1,6 @@
 id = "magus/pi-scratchpad"
 name = "Pi Scratchpad"
-version = "0.3.1"
+version = "0.4.0"
 plugin_api = 24
 author = "magus"
 license = "MIT"
@@ -43,6 +43,30 @@ type = "string"
 label_key = "settings.geometry.label"
 description_key = "settings.geometry.description"
 default = "900x600"
+
+[[setting]]
+key = "vertical_alignment"
+type = "select"
+label_key = "settings.vertical_alignment.label"
+description_key = "settings.vertical_alignment.description"
+default = "center"
+options = [
+  { value = "top", label_key = "settings.vertical_alignment.top" },
+  { value = "center", label_key = "settings.alignment.center" },
+  { value = "bottom", label_key = "settings.vertical_alignment.bottom" },
+]
+
+[[setting]]
+key = "horizontal_alignment"
+type = "select"
+label_key = "settings.horizontal_alignment.label"
+description_key = "settings.horizontal_alignment.description"
+default = "center"
+options = [
+  { value = "left", label_key = "settings.horizontal_alignment.left" },
+  { value = "center", label_key = "settings.alignment.center" },
+  { value = "right", label_key = "settings.horizontal_alignment.right" },
+]
 
 [[setting]]
 key = "notify"
