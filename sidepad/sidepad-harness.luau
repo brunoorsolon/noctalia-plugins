@@ -197,7 +197,21 @@ noctalia.readFile = function(path)
   return contents
 end
 noctalia.commandExists = function(name) return absentCommands[name] ~= true end
-noctalia.json = { decode = decodeJson }
+-- Preferences are JSON objects; encode every supplied field so accidental
+-- runtime-state persistence is visible to the round-trip assertions below.
+local function encodeJson(value)
+  if type(value) == "string" then
+    return '"' .. value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n") .. '"'
+  elseif type(value) ~= "table" then
+    return tostring(value)
+  end
+  local fields = {}
+  for key, item in pairs(value) do
+    table.insert(fields, encodeJson(tostring(key)) .. ":" .. encodeJson(item))
+  end
+  return "{" .. table.concat(fields, ",") .. "}"
+end
+noctalia.json = { decode = decodeJson, encode = encodeJson }
 
 -- Process commands, queries, files and notifications are recorded separately so
 -- snapshot refreshes can be proved observational rather than mistaken for actions.
@@ -255,7 +269,13 @@ local function nonQueryLaunchCount()
   end
   return count
 end
-noctalia.writeFile = function(path) table.insert(writes, path); return true end
+local writeFailure = nil
+noctalia.writeFile = function(path, contents)
+  table.insert(writes, path)
+  if writeFailure then return false, writeFailure end
+  files[path] = contents
+  return true
+end
 noctalia.notifyError = function(message) table.insert(notifications, message) end
 
 -- A configuration the controller accepts: three pads, one of them without the
@@ -329,9 +349,14 @@ end
 -- Each entry is its own runtime with its own module cache, so shared.luau is
 -- loaded once per entry exactly as the host does it. The accepted nonce lives in
 -- the controller's VM, so the per-VM module instances cannot disagree about it.
+local setPreferences
 local function loadEntry(entry)
   entryShared = assert(loadstring(SOURCES.shared, "shared.luau"))()
-  assert(loadstring(SOURCES[entry], entry .. ".luau"))()
+  -- Expose the controller-local seam only in the harness, without adding a
+  -- public IPC action or making selection imply a partially implemented show.
+  local source = SOURCES[entry] .. (entry == "service" and "\nreturn setPreferences" or "")
+  local result = assert(loadstring(source, entry .. ".luau"))()
+  if entry == "service" then setPreferences = result end
   return entryShared
 end
 
@@ -424,7 +449,7 @@ check("the initial side", "left", initial.side)
 check("the initial width mode", "narrow", initial.widthMode)
 check("the initial busy flag", false, initial.busy)
 check("the initial error", nil, initial.error)
-check("the initial selected pad", nil, initial.selectedPadId)
+check("the initial selected pad", "terminal", initial.selectedPadId)
 check("the snapshot carries the configured pads", 3, #initial.pads)
 check("a configured pad keeps its identity", "terminal", initial.pads[1].id)
 check("a configured pad keeps its name", "Terminal", initial.pads[1].name)
@@ -776,7 +801,7 @@ check("the click names no pad, so the controller applies its own selection", nil
 check("the click takes the next nonce", clickNonce + 1, request().nonce)
 -- The controller answered with its own snapshot, so the bar's next tooltip is a
 -- rendering of what the controller published, not of a fixture.
-check("the bar renders the snapshot the controller publishes", "None selected", tooltipValue("Pad"))
+check("the bar renders the snapshot the controller publishes", "Terminal", tooltipValue("Pad"))
 
 snapshot()
 clickNonce = request().nonce
@@ -824,9 +849,10 @@ check("the panel is asked for once per click", 2, #toggledPanels)
 -- The controller reads the user's definitions once at startup, so every fixture
 -- below is a real startup: the entry is loaded again with only that file on
 -- disk, and the processes and notifications it causes are counted from zero.
-local function startWith(padsJson)
+local function startWith(padsJson, preferencesJson)
   files = {}
   if padsJson ~= nil then files["/data/pads.json"] = padsJson end
+  files["/data/preferences.json"] = preferencesJson
   stateStore, watchers, held = {}, {}, nil
   launches, writes, notifications, compositorQueries = {}, {}, {}, {}
   pendingQueries, streamCallbacks = {}, {}
@@ -1185,6 +1211,83 @@ local empty = startWith('{ "version": 1, "pads": [] }')
 check("an empty pad list starts ready", "ready", empty.phase)
 check("an empty pad list reports no error", nil, empty.error)
 check("an empty pad list publishes no pads", 0, #empty.pads)
+
+-- ── Durable preferences ─────────────────────────────────────────────────────
+
+for _, fixture in ipairs({
+  { name = "absent preferences" },
+  { name = "invalid JSON", raw = "{not json" },
+  { name = "scalar preferences", raw = "false" },
+  { name = "invalid side", raw = '{"selectedPadId":"browser","side":"top"}' },
+  { name = "removed selection", raw = '{"selectedPadId":"removed","side":"right"}' },
+  { name = "missing selection", raw = '{"side":"right"}' },
+  { name = "missing side", raw = '{"selectedPadId":"browser"}' },
+}) do
+  local restored = startWith(VALID_PADS, fixture.raw)
+  check(fixture.name .. ": first valid pad", "terminal", restored.selectedPadId)
+  check(fixture.name .. ": default side", "left", restored.side)
+  check(fixture.name .. ": no startup write", 0, #writes)
+end
+
+local restored = startWith(VALID_PADS, [[
+  {"selectedPadId":"browser","side":"right","busy":true,"widthMode":"wide",
+   "pads":[{"address":"0xdead","running":true,"visible":true,"output":"DP-9","pid":123}]}
+]])
+check("stored selection is restored", "browser", restored.selectedPadId)
+check("stored side is restored", "right", restored.side)
+check("stored width is not runtime truth", "narrow", restored.widthMode)
+check("stored busy is not runtime truth", false, restored.busy)
+check("stored visibility is not runtime truth", false, restored.pads[1].visible)
+check("stored address is not runtime truth", nil, restored.pads[1].address)
+check("stored output is not runtime truth", nil, restored.pads[1].output)
+
+local function checkSaved(name, selectedPadId, side)
+  check(name .. ": data directory path", "/data/preferences.json", writes[#writes])
+  local document = assert(decodeJson(files["/data/preferences.json"]))
+  check(name .. ": full selected pad", selectedPadId, document.selectedPadId)
+  check(name .. ": full side", side, document.side)
+  for key in pairs(document) do
+    checkTrue(name .. ": only approved fields", key == "selectedPadId" or key == "side")
+  end
+  local reloaded = startWith(VALID_PADS, files["/data/preferences.json"])
+  check(name .. ": selection survives reload", selectedPadId, reloaded.selectedPadId)
+  check(name .. ": side survives reload", side, reloaded.side)
+end
+
+check("selection update succeeds", true, setPreferences("notes", "right"))
+check("selection update writes once", 1, #writes)
+checkSaved("selection update", "notes", "right")
+check("side update succeeds", true, setPreferences("notes", "left"))
+check("side update writes once", 1, #writes)
+checkSaved("side update", "notes", "left")
+check("unchanged preferences succeed", true, setPreferences("notes", "left"))
+check("unchanged preferences do not write", 0, #writes)
+
+for _, values in ipairs({ { "removed", "left" }, { "notes", "up" }, { false, "left" } }) do
+  local saved, problem = setPreferences(values[1], values[2])
+  check("invalid preference update fails", nil, saved)
+  checkContains("invalid preference update reports why", "cannot save preferences", problem)
+  check("invalid preference update writes nothing", 0, #writes)
+end
+
+writeFailure = "permission denied"
+local saved, problem = setPreferences("browser", "right")
+check("write failure does not claim success", nil, saved)
+checkContains("write failure names the file", "/data/preferences.json", problem)
+checkContains("write failure reports its cause", "permission denied", problem)
+check("write failure keeps durable selection", "notes", status().selectedPadId)
+check("write failure keeps durable side", "left", status().side)
+writeFailure = nil
+check("failed preference update is retryable", true, setPreferences("browser", "right"))
+checkSaved("write retry", "browser", "right")
+
+startWith('{"version":1,"pads":[]}', '{"selectedPadId":"removed","side":"right"}')
+check("no pads leaves no unusable selection", nil, status().selectedPadId)
+check("no pads and stale selection use left", "left", status().side)
+check("side can be changed without configured pads", true, setPreferences(nil, "right"))
+local noPads = startWith('{"version":1,"pads":[]}', files["/data/preferences.json"])
+check("empty selection survives reload", nil, noPads.selectedPadId)
+check("side survives reload without pads", "right", noPads.side)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.
