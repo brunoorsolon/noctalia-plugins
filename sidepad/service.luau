@@ -714,6 +714,7 @@ local function windowAction(action)
       local geometry, problem = placement(widthMode, pad.output)
       if not geometry then finish(problem); return end
       local window = ("address:%s"):format(pad.address)
+      add(("hl.dsp.window.float({window=%q,action='set'})"):format(window))
       add(("hl.dsp.window.resize({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.width, geometry.height))
       add(("hl.dsp.window.move({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.x, geometry.y))
     elseif hide then

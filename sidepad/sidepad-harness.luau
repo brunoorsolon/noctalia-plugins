@@ -1130,6 +1130,12 @@ do
   outputs = savedOutputs
   focusedOutput = "DP-1"
   modelStart()
+  onIpc("toggle_width")
+  check("width adopts an already-running tiled window as floating", true, windows[1].floating)
+  check("width applies geometry without a prior show", 1200, windows[1].width)
+  check("width does not move the adopted window into another workspace", "1", windows[1].workspace.name)
+  check("width leaves another managed workspace visible", "special:noctalia-sidepad-orphan", monitors[2].specialWorkspace.name)
+  modelStart()
   onIpc("show", "terminal")
   onIpc("hide", "terminal")
   focusedOutput, compositorFocus, focusedWindow = "DP-2", "DP-2", "0x2"
@@ -1137,6 +1143,8 @@ do
   check("IPC without a pad ID toggles selected width", "wide", status().widthMode)
   check("hidden width remains on its owning output", 10, windows[1].x)
   check("hidden pad stays hidden", false, status().pads[1].visible)
+  check("hidden workspace is not revealed on its owner", 0, monitors[1].specialWorkspace.id)
+  check("hidden workspace is not revealed on the focused output", 0, monitors[2].specialWorkspace.id)
   check("hidden toggle does not change focus", "DP-2", compositorFocus)
   check("hidden toggle does not focus its client", "0x2", focusedWindow)
   check("hidden toggle preserves application", 2, #windows)
