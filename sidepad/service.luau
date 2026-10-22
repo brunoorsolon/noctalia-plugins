@@ -643,7 +643,7 @@ local function visibilityAction(action)
       end
       focusMonitor(geometry.name)
       local window = ("address:%s"):format(pad.address)
-      add(("hl.dsp.window.move({window=%q,workspace=%q,silent=true})"):format(window, pad.workspace))
+      add(("hl.dsp.window.move({window=%q,workspace=%q,follow=false})"):format(window, pad.workspace))
       if visibleOn ~= geometry.name then toggle(name) end
       add(("hl.dsp.window.float({window=%q,action='set'})"):format(window))
       add(("hl.dsp.window.resize({window=%q,x=%s,y=%s,relative=false})"):format(window, geometry.width, geometry.height))

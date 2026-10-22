@@ -897,7 +897,16 @@ end
 hl = { dsp = { window = {}, workspace = {} } }
 hl.dsp.focus = function(args)
   return function()
-    if args.monitor then compositorFocus = args.monitor else focusedWindow = windowFor(args.window).address end
+    if args.monitor then
+      compositorFocus = args.monitor
+    else
+      local window = windowFor(args.window)
+      if window.workspace.name:sub(1, 8) == "special:"
+        and monitorFor(compositorFocus).specialWorkspace.name ~= window.workspace.name then
+        hl.dsp.workspace.toggle_special(window.workspace.name:sub(9))()
+      end
+      focusedWindow = window.address
+    end
   end
 end
 hl.dsp.workspace.toggle_special = function(name)
@@ -921,7 +930,19 @@ hl.dsp.window.move = function(args)
   return function()
     local window = windowFor(args.window)
     if args.workspace then
+      if window.workspace.name == args.workspace then return end
+      local owner = monitorFor(compositorFocus)
+      for _, monitor in ipairs(monitors) do
+        if monitor.specialWorkspace.name == args.workspace then owner = monitor; break end
+      end
       window.workspace = { id = -99, name = args.workspace }
+      window.monitor = owner.id
+      -- Hyprland follows workspace moves unless follow=false is supplied.
+      if args.follow ~= false then
+        compositorFocus = owner.name
+        owner.specialWorkspace = { id = -99, name = args.workspace }
+        focusedWindow = window.address
+      end
     else
       check("move coordinates are absolute", false, args.relative)
       window.x, window.y = args.x, args.y
@@ -965,6 +986,17 @@ local function modelStart(preferences)
   modelSnapshots()
   startWith(VALID_PADS, preferences)
 end
+-- A different client can keep the selected pad's workspace on its old output
+-- while the unique selected window itself is on a normal workspace.
+modelStart()
+monitors[2].specialWorkspace = { id = -99, name = "special:noctalia-sidepad-terminal" }
+windows[2].workspace = { id = -99, name = "special:noctalia-sidepad-terminal" }
+modelSnapshots()
+onIpc("refresh")
+onIpc("show", "terminal")
+check("adoption does not follow a retained workspace to its old output", "DP-1", status().pads[1].output)
+check("adoption focuses the unique selected window", "0x1", focusedWindow)
+check("adoption leaves no old-output pad visible", 0, monitors[2].specialWorkspace.id)
 modelStart()
 serviceShared.request("show", "terminal")
 check("show hides an unconfigured reserved workspace on another output", 0, monitors[2].specialWorkspace.id)
