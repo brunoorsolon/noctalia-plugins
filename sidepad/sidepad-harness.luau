@@ -905,6 +905,14 @@ local function monitorFor(name)
   error("output not found")
 end
 hl = { dsp = { window = {}, workspace = {} } }
+hl.get_windows = function(filters)
+  local matches = {}
+  for _, window in ipairs(windows) do
+    if window.class == filters.class then table.insert(matches, window) end
+  end
+  return matches
+end
+hl.dispatch = function(operation) return operation() end
 hl.dsp.focus = function(args)
   return function()
     if args.monitor then
@@ -975,9 +983,9 @@ noctalia.runAsync = function(argv, callback, timeout)
   if mutationDeclined then return false end
   local function complete()
     if mutationFailure then callback(copy(mutationFailure)); return end
-    assert(loadstring("return " .. argv[3]))()()
+    local ok = pcall(assert(loadstring("return " .. argv[3]))())
     modelSnapshots()
-    callback({ exitCode = 0, stdout = "ok\n" })
+    callback({ exitCode = 0, stdout = ok and "ok\n" or "error: changed target" })
   end
   if deferMutation then pendingMutation = complete else complete() end
   return true
@@ -1204,6 +1212,29 @@ modelSnapshots()
 onIpc("show", "terminal")
 check("duplicate mapping recovers after resolving the duplicate", true, status().pads[1].visible)
 check("duplicate recovery does not relaunch", 1, applicationCount())
+
+for _, deliverEvent in ipairs({ true, false }) do
+  stoppedStart()
+  onIpc("toggle")
+  local first = mapTerminal()
+  deferMutation = true
+  streamCallbacks[1]("openwindow>>abc")
+  local second = mapTerminal("0xdef")
+  if deliverEvent then streamCallbacks[1]("openwindow>>def") end
+  deferMutation = false
+  pendingMutation()
+  check("an interleaved duplicate leaves the first match unmoved", "1", first.workspace.name)
+  check("an interleaved duplicate leaves the second match unmoved", "1", second.workspace.name)
+  check("an interleaved duplicate focuses neither match", nil, focusedWindow)
+  check("an interleaved duplicate leaves both matches non-floating", nil, first.floating or second.floating)
+  checkTrue("an interleaved duplicate reports an error", type(status().error) == "string")
+  check("an interleaved duplicate releases busy", false, status().busy)
+  check("an interleaved duplicate does not relaunch", 1, applicationCount())
+  table.remove(windows)
+  modelSnapshots()
+  onIpc("show", "terminal")
+  check("resolving an interleaved duplicate permits a later show", true, status().pads[1].visible)
+end
 
 stoppedStart()
 detachedAccepted = false

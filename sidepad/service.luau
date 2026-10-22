@@ -771,6 +771,14 @@ local function visibilityAction(action)
     local function run(index)
       local expression = commands[index]
       if not expression then finish(); return end
+      -- Recheck inside every queued mutation; a second window may map meanwhile.
+      expression = ([=[function()
+        local windows = hl.get_windows({ class = %q })
+        if #windows ~= 1 or windows[1].address ~= %q then
+          error("Sidepad visibility target changed; resolve duplicate windows, refresh and retry")
+        end
+        return hl.dispatch(%s)
+      end]=]):format(pad.class, pad.address, expression)
       local completed = false
       local function done(result)
         if completed then return end
