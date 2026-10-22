@@ -801,7 +801,7 @@ check("the click names no pad, so the controller applies its own selection", nil
 check("the click takes the next nonce", clickNonce + 1, request().nonce)
 -- The controller answered with its own snapshot, so the bar's next tooltip is a
 -- rendering of what the controller published, not of a fixture.
-check("the bar renders the snapshot the controller publishes", "None selected", tooltipValue("Pad"))
+check("the bar renders the snapshot the controller publishes", "Terminal", tooltipValue("Pad"))
 
 snapshot()
 clickNonce = request().nonce
