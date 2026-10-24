@@ -168,8 +168,14 @@ hl = {
   end,
   get_windows = function(query)
     local found = {}
-    for _, window in ipairs(placementWindows) do
-      if window.mapped and window.floating == query.floating and window.workspace == query.workspace.name then
+    local windows = placementMonitor and placementWindows or {
+      { mapped = mapped, workspace = "special:" .. CONFIG.workspace:gsub("^special:", ""), tags = { "noctalia-pi-companion*" } },
+    }
+    local workspace = type(query.workspace) == "table" and query.workspace.name or query.workspace
+    for _, window in ipairs(windows) do
+      if window.mapped and window.workspace == workspace and
+        (query.floating == nil or window.floating == query.floating) and
+        (query.tag == nil or table.find(window.tags or {}, query.tag)) then
         table.insert(found, window)
       end
     end
@@ -181,7 +187,7 @@ hl = {
       move = function(options) options.kind = "move"; return options end,
     },
     focus = function(options)
-      return { kind = "focus", name = options.workspace }
+      return { kind = "focus", name = options.window and options.window.workspace or options.workspace, window = options.window }
     end,
     exec_cmd = function(command, rules)
       return { kind = "exec_cmd", command = command, rules = rules or {} }
@@ -202,7 +208,7 @@ function noctalia.runAsync(argv, onResult)
       return false
     end
     result.stdout = mapped and ("clients:" .. CONFIG.workspace) or "clients:empty"
-    decoded[result.stdout] = mapped and { { mapped = true, workspace = { name = "special:" .. CONFIG.workspace:gsub("^special:", "") } } } or {}
+    decoded[result.stdout] = mapped and { { mapped = true, workspace = { name = "special:" .. CONFIG.workspace:gsub("^special:", "") }, tags = { "noctalia-pi-companion*" } } } or {}
     if clientReply then result = clientReply end
     if mapOnMonitorReply then
       mapped, visible = true, true
@@ -449,6 +455,8 @@ check("the spawn carries the configured size",
   spawn.rules.size and (spawn.rules.size[1] .. "x" .. spawn.rules.size[2]), "900x600")
 checkTrue("the spawn floats and centres", spawn.rules.float == true and spawn.rules.center == true)
 check("the spawn targets the configured special workspace", spawn.rules.workspace, "special:pi")
+check("the spawn marks its own window", "+noctalia-pi-companion*", spawn.rules.tag)
+checkTrue("launch reveal focuses the identified window", lastCall() and lastCall().window ~= nil)
 check("the spawn reveals the mapped workspace without toggling", lastCall() and lastCall().kind, "focus")
 check("the reveal names the workspace once", lastCall() and lastCall().name, "special:pi")
 -- A quoted "~" never expands under the /bin/sh Hyprland runs, so the working
@@ -894,8 +902,8 @@ check("the current request still completes after a stale callback", 1, #callsOf(
 simulateWindows, mapOnExec = true, true
 placementMonitor = { width = 1920, height = 1080, scale = 1, transform = 0, x = -1920, y = 120,
   reserved = { left = 10, right = 50, top = 20, bottom = 20 } }
-local pad = { mapped = true, floating = true, workspace = "special:pi", size = { x = 900, y = 600 } }
-local unrelated = { mapped = true, floating = true, workspace = "1", at = { x = 123, y = 456 } }
+local pad = { mapped = true, floating = true, workspace = "special:pi", size = { x = 900, y = 600 }, tags = { "noctalia-pi-companion*" } }
+local unrelated = { mapped = true, floating = true, workspace = "special:pi", tags = {}, at = { x = 123, y = 456 }, size = { x = 300, y = 200 } }
 placementWindows = { unrelated, pad }
 for _, h in ipairs({ { "left", -1910 }, { "center", -1430 }, { "right", -950 } }) do
   for _, v in ipairs({ { "top", 140 }, { "center", 360 }, { "bottom", 580 } }) do
@@ -907,6 +915,8 @@ for _, h in ipairs({ { "left", -1910 }, { "center", -1430 }, { "right", -950 } }
     check("launch horizontal placement: " .. h[1] .. "/" .. v[1], h[2], pad.at.x)
     check("launch vertical placement: " .. h[1] .. "/" .. v[1], v[2], pad.at.y)
     check("placement targets only the companion", 123, unrelated.at.x)
+    check("an unrelated window in Pi's workspace is not resized", 300, unrelated.size.x)
+    check("reveal focuses Pi rather than its workspace neighbour", pad, lastCall().window)
     check("placement does not spawn another session", 1, spawnCount())
     show(WORKING)
     update()
@@ -974,6 +984,65 @@ placementWindows = { pad, pad }
 onClick()
 check("ambiguous companion windows are not repositioned", 0, #callsOf("move"))
 check("ambiguous placement is reported", 1, #notifications)
+
+-- A matching workspace alone is not identity, even during startup or shutdown.
+placementMonitor = nil
+placementWindows = {}
+mapped, visible = false, false
+show(nil)
+advance(60000)
+calls, notifications = {}, {}
+decoded["unrelated-in-pi"] = { { mapped = true, workspace = { name = "special:pi" }, tags = { "other-app*" } } }
+clientReply = { exitCode = 0, stdout = "unrelated-in-pi" }
+onClick()
+check("an unrelated window cannot finish launch", 0, #callsOf("focus"))
+show(IDLE)
+update()
+check("even a live Pi status cannot identify an unrelated window", 0, #callsOf("focus"))
+clientReply = nil
+mapped = true
+update()
+check("the tagged window completes the pending launch", 1, #callsOf("focus"))
+
+calls = {}
+clientReply = { exitCode = 0, stdout = "unrelated-in-pi" }
+onClick()
+check("an unrelated window cannot stand in for a closed Pi", 0, #callsOf("toggle_special"))
+check("an unrelated window cannot cause a duplicate live session", 0, spawnCount())
+show(nil)
+update()
+check("shutdown still permits a replacement beside unrelated windows", 1, spawnCount())
+check("the replacement still waits for its own window", 0, #callsOf("focus"))
+
+local tagged = { mapped = true, workspace = { name = "special:pi" }, tags = { "noctalia-pi-companion*" } }
+decoded["two-companions"] = { tagged, tagged }
+clientReply = { exitCode = 0, stdout = "two-companions" }
+update()
+check("ambiguous identity cannot finish startup", 0, #callsOf("focus"))
+decoded["tagged-and-malformed"] = { tagged, false }
+clientReply = { exitCode = 0, stdout = "tagged-and-malformed" }
+update()
+check("a malformed client list cannot finish startup", 0, #callsOf("focus"))
+clientReply = nil
+update()
+show(IDLE)
+update()
+calls, notifications = {}, {}
+clientReply = { exitCode = 0, stdout = "two-companions" }
+onClick()
+check("duplicate tags cannot toggle an arbitrary companion", 0, #callsOf("toggle_special"))
+check("duplicate tags are reported", 1, #notifications)
+clientReply = nil
+
+-- Recheck identity in the compositor, not only in the earlier clients snapshot.
+placementMonitor = { width = 1920, height = 1080, scale = 1, transform = 0, x = 0, y = 0 }
+placementWindows = { unrelated }
+show(MALFORMED)
+calls, notifications = {}, {}
+onClick()
+check("unknown status cannot reveal an untagged window", 0, #callsOf("toggle_special"))
+check("unknown status cannot reposition an untagged window", 0, #callsOf("move"))
+check("missing identity is reported without adopting a neighbour", 1, #notifications)
 
 -- The check has to fail its process, not only print: a caller and any automation
 -- reading the exit status must see a failed run.

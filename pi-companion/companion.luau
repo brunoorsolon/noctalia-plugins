@@ -13,6 +13,8 @@ local icon = require("./icon.luau")
 
 local STATUS_DIR = "pi-hypr-agent-monitor"
 local STATUS_FILE = "status.json"
+-- exec rules create dynamic tags; Hyprland's Lua query matches their '*' suffix exactly.
+local WINDOW_TAG = "noctalia-pi-companion*"
 
 local DEFAULT_WORKSPACE = "pi"
 local DEFAULT_TERMINAL = "foot"
@@ -208,14 +210,15 @@ local function revealExpression(action)
   local vertical = ({ top = 0, center = 0.5, bottom = 1 })[text("vertical_alignment", "center")] or 0.5
   local width, height = geometry()
   return ([=[function()
+    local windows = hl.get_windows({ workspace = %s, tag = %s, mapped = true })
+    if #windows ~= 1 then error("Expected one tagged companion window. Close an older Pi terminal and reopen it with Pi Companion.") end
+    local window = windows[1]
     local result = hl.dispatch(%s)
     if not result.ok then return result end
     local monitor = hl.get_active_monitor()
     local special = monitor and monitor.active_special_workspace
     if not special or special.name ~= %s then return result end
-    local windows = hl.get_windows({ workspace = special, floating = true })
-    if #windows ~= 1 then error("Expected one floating companion window for placement") end
-    local window = windows[1]
+    if not window.floating then error("The companion window must be floating for placement") end
     local mw, mh = monitor.width, monitor.height
     if monitor.transform %% 2 == 1 then mw, mh = mh, mw end
     -- Hyprland 0.55 does not expose reserved edges through its Lua API.
@@ -225,10 +228,13 @@ local function revealExpression(action)
     result = hl.dispatch(hl.dsp.window.resize({ window = window,
       x = math.min(%s, width), y = math.min(%s, height) }))
     if not result.ok then return result end
-    return hl.dispatch(hl.dsp.window.move({ window = window,
+    result = hl.dispatch(hl.dsp.window.move({ window = window,
       x = monitor.x + edges.left + math.floor(math.max(0, width - window.size.x) * %s),
       y = monitor.y + edges.top + math.floor(math.max(0, height - window.size.y) * %s) }))
-  end]=]):format(action, luaQuote("special:" .. workspace()), width, height, horizontal, vertical)
+    if not result.ok then return result end
+    return hl.dispatch(hl.dsp.focus({ window = window }))
+  end]=]):format(luaQuote("special:" .. workspace()), luaQuote(WINDOW_TAG), action,
+    luaQuote("special:" .. workspace()), width, height, horizontal, vertical)
 end
 
 local function compositor(op, onDone)
@@ -259,22 +265,27 @@ local function compositor(op, onDone)
     local accepted = noctalia.runAsync({ "hyprctl", "-j", "clients" }, function(result)
       local clients = type(result) == "table" and result.exitCode == 0 and noctalia.json.decode(result.stdout) or nil
       local valid = type(clients) == "table" and (#clients > 0 or next(clients) == nil)
+      local matches = 0
       for _, client in ipairs(type(clients) == "table" and clients or {}) do
         if type(client) ~= "table" or type(client.mapped) ~= "boolean" or
           type(client.workspace) ~= "table" or type(client.workspace.name) ~= "string" then
           valid = false
         elseif client.mapped and client.workspace.name == "special:" .. workspace() then
-          return done(true, true)
+          if type(client.tags) ~= "table" then
+            valid = false
+          elseif table.find(client.tags, WINDOW_TAG) then
+            matches = matches + 1
+          end
         end
       end
-      done(false, valid)
+      done(matches == 1, valid and matches <= 1)
     end)
     if accepted == false then done(false, false) end
     return accepted
   end
 
   if op == "show" then
-    return dispatch(revealExpression("hl.dsp.focus({ workspace = " .. luaQuote("special:" .. workspace()) .. " })"), done)
+    return dispatch(revealExpression("hl.dsp.focus({ window = window })"), done)
   end
 
   -- toggle_special takes the bare name: it prefixes "special:" itself.
@@ -289,7 +300,8 @@ local function compositor(op, onDone)
   local width, height = geometry()
   local command = "cd " .. shellQuote(absolutePath(text("working_dir", DEFAULT_WORKING_DIR))) ..
     " && PI_HYPR_MONITOR=1 " .. text("terminal", DEFAULT_TERMINAL) .. " " .. text("spawn", DEFAULT_SPAWN)
-  local expression = "hl.dsp.exec_cmd(" .. luaQuote(command) .. ", { float = true, center = true, size = { " ..
+  local expression = "hl.dsp.exec_cmd(" .. luaQuote(command) .. ", { tag = " .. luaQuote("+" .. WINDOW_TAG) ..
+    ", float = true, center = true, size = { " ..
     width .. ", " .. height .. " }, workspace = " .. luaQuote("special:" .. workspace()) .. " })"
   return dispatch(expression, done)
 end
@@ -386,9 +398,9 @@ local function revealSpawn()
   end
   if revealBusy == deadline then return end
   revealBusy = deadline
-  compositor("mapped", function(mapped)
+  compositor("mapped", function(mapped, valid)
     if revealBusy == deadline then revealBusy = 0 end
-    if not mapped or noctalia.state.get(REVEAL_UNTIL) ~= deadline or noctalia.nowMs() >= deadline then return end
+    if not valid or not mapped or noctalia.state.get(REVEAL_UNTIL) ~= deadline or noctalia.nowMs() >= deadline then return end
     -- Consume before dispatch so another placement cannot reveal it twice.
     noctalia.state.set(REVEAL_UNTIL, 0)
     -- Mapping can itself show the workspace. An idempotent focus cannot hide it
@@ -402,7 +414,7 @@ tick = function()
   if reopening > 0 then
     if noctalia.nowMs() >= reopening then
       noctalia.state.set(REOPEN_UNTIL, 0)
-      noctalia.notify("Pi Companion reopen timed out", "Pi did not finish exiting within 20 seconds. A second session was not started.")
+      noctalia.notify("Pi Companion reopen timed out", "Pi is still running but no tagged companion window was found. If it was opened before this update, close its terminal and reopen it with Pi Companion. A second session was not started.")
     elseif readState() == "not_running" then
       noctalia.state.set(REOPEN_UNTIL, 0)
       startSpawn()
@@ -443,7 +455,7 @@ function onClick()
   compositor("mapped", function(mapped, valid)
     if spawnInFlight() then return end
     if not valid then
-      noctalia.notify("Pi Companion window query failed", "Could not read Hyprland clients. Nothing was launched or toggled.")
+      noctalia.notify("Pi Companion window query failed", "Could not read Hyprland clients or found multiple tagged companion windows. Nothing was launched or toggled.")
       return
     end
     if not mapped then
